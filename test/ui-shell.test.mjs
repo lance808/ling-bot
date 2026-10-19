@@ -34,7 +34,7 @@ test('九个页面视图文件都存在', () => {
   }
 });
 
-test('app.mjs 注册了十个页面且都 import 了渲染函数', () => {
+test('app.mjs 注册了十一个页面且都 import 了渲染函数', () => {
   const src = read('ui/src/app.mjs');
   for (const f of ['usage', 'tools', 'plugins']) {
     assert.match(src, new RegExp(`import \\{ render\\w+ \\} from './views/${f}\\.mjs'`), `没 import ${f}`);
@@ -42,8 +42,11 @@ test('app.mjs 注册了十个页面且都 import 了渲染函数', () => {
   // 数一下 PAGES 里的 id 个数
   const pagesBlock = src.slice(src.indexOf('const PAGES'), src.indexOf('];', src.indexOf('const PAGES')));
   const ids = [...pagesBlock.matchAll(/id: '(\w+)'/g)].map((m) => m[1]);
-  assert.equal(ids.length, 10, `页面数应为 10，实际 ${ids.length}`);
+  assert.equal(ids.length, 11, `页面数应为 11，实际 ${ids.length}`);
   assert.ok(ids.includes('tools') && ids.includes('plugins') && ids.includes('usage'));
+  // 思考链路属于「概览」组，且排在会话总览之后
+  assert.ok(ids.includes('thinking'), '缺思考链路页');
+  assert.ok(ids.indexOf('thinking') > ids.indexOf('sessions'), '思考链路应在会话总览之后');
 });
 
 /* --------------------------------------------------- 主题 */

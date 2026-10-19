@@ -216,25 +216,38 @@ export function renderThinkingPanel(snap, ctx = {}) {
   const days = filterDays(data.days, filter, currentConv);
   const shown = countSteps(days);
 
-  // 收起态只剩一条竖边：整条都是"展开"按钮，不用再找小箭头
+  /*
+   * 收起态：只留表头一行。
+   *
+   * 以前这里是「一条竖边」（竖排文字 + 箭头 + 条数），因为面板当时是常驻
+   * 右侧的一列，收起后必须留下够窄又能点开的东西。
+   * 改成页面之后不需要了 —— 页面本来就有导航项和标题，
+   * 收起只应该把正文折掉，表头留着让人知道这里有什么、以及怎么展开。
+   */
   if (folded) {
-    return el('div', { class: 'think-rail' }, [
-      el(
-        'button',
-        {
-          class: 'think-rail-btn',
-          type: 'button',
-          title: '展开思考链路',
-          'aria-label': '展开思考链路',
-          onclick: () => ctx.onCollapse?.(false),
-        },
-        [
-          // 光有竖排文字看不出"这能点"，给一个朝向内容的箭头
-          el('span', { class: 'think-rail-arrow', text: '‹' }),
-          el('span', { class: 'think-rail-text', text: '思考链路' }),
-          el('span', { class: 'think-rail-count', text: shown > 0 ? String(shown) : '·' }),
-        ],
-      ),
+    return el('div', { class: 'think-shell' }, [
+      el('header', { class: 'think-head' }, [
+        el('div', { class: 'think-head-row' }, [
+          el('h2', { class: 'think-title', text: '思考链路' }),
+          el('span', {
+            class: 'think-count',
+            text: shown > 0 ? `${shown} 条` : '空',
+            title: data.total > shown ? `后端共记录 ${data.total} 条，这里显示最近 ${shown} 条` : '',
+          }),
+          el(
+            'button',
+            {
+              class: 'think-fold',
+              type: 'button',
+              title: '展开思考链路',
+              'aria-label': '展开思考链路',
+              onclick: () => ctx.onCollapse?.(false),
+            },
+            [el('span', { text: '‹' })],
+          ),
+        ]),
+        el('div', { class: 'think-folded-hint', text: '已收起，点 ‹ 展开' }),
+      ]),
     ]);
   }
 

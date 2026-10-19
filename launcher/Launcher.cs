@@ -40,6 +40,19 @@ namespace LingBot
             // 而且 Console.WriteLine 写的是无效句柄——都不能让它把启动搞崩。
             TrySetEncoding();
 
+            /*
+             * 任务栏身份 —— 必须和 Electron 主进程里 app.setAppUserModelId()
+             * 设的值完全一致，否则 Windows 会把它们当成两个应用，任务栏出现
+             * 两个按钮，且其中一个还是 electron.exe 的原子图标。
+             *
+             * 为什么在启动器里设：启动器是用户双击的宿主进程，它先拿到任务栏
+             * 按钮。等 Electron 起来后再设就已经晚了（任务栏已经建好按钮）。
+             *
+             * 用 SetCurrentProcessExplicitAppUserModelID 而不是 WinForms 属性，
+             * 是为了不依赖 System.Windows.Forms 的初始化时序。
+             */
+            TrySetAppUserModelId("com.ling-bot.desktop");
+
             // --check-only：只做环境检查并把结果打到控制台，不弹窗、不启动。
             // 这是给自动化测试用的——否则每次测失败路径都要人去点弹窗。
             bool checkOnly = Array.IndexOf(args, "--check-only") >= 0;
@@ -189,6 +202,23 @@ namespace LingBot
         {
             try { Console.OutputEncoding = Encoding.UTF8; }
             catch { /* GUI 子系统下会抛，忽略 */ }
+        }
+
+        /*
+         * 设置本进程的任务栏身份（AppUserModelID）。
+         *
+         * 为什么要单独包一层 try：这是"锦上添花"的设置，在极老的系统上
+         * 或者被安全软件拦下时可能失败。任务栏归组不正确只是观感问题，
+         * 但**启动失败是致命的**——所以任何异常都吞掉，继续启动。
+         */
+        [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern int SetCurrentProcessExplicitAppUserModelID(
+            [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)] string appId);
+
+        static void TrySetAppUserModelId(string appId)
+        {
+            try { SetCurrentProcessExplicitAppUserModelID(appId); }
+            catch { /* 设不上就算了，不影响启动 */ }
         }
 
         /// <summary>

@@ -37,6 +37,14 @@ const isDev = process.argv.includes('--dev');
 /** 内置图标的根目录：跟着 main.mjs 走，不受 cwd 影响（打包后 cwd 会变） */
 const ASSETS_DIR = path.join(__dirname, '..', 'assets');
 
+/**
+ * 应用在 Windows 任务栏里的身份（AppUserModelID）。
+ *
+ * 必须和启动器 exe 里声明的 AUMID 一致，否则会出现两个任务栏按钮；
+ * 详见 main() 开头的说明。取值用反向域名，和 package.json 的 name 对应。
+ */
+const APP_USER_MODEL_ID = 'com.ling-bot.desktop';
+
 /** @type {BrowserWindow | null} */
 let win = null;
 /** @type {Tray | null} */
@@ -56,6 +64,27 @@ if (!gotLock) {
 }
 
 function main() {
+  /*
+   * 任务栏身份 —— 必须在 whenReady 之前设置，否则 Windows 已经按旧身份
+   * 建好了任务栏按钮，改不动了。
+   *
+   * ## 为什么只设 BrowserWindow({icon}) 换不掉任务栏图标
+   *
+   * Windows 任务栏不是"读窗口图标"，而是按 **AppUserModelID（AUMID）** 把
+   * 进程归组，然后显示**该 AUMID 对应的图标**。Electron 默认沿用
+   * electron.exe 自己的 AUMID（`com.squirrel.electron...` 或进程默认身份），
+   * 于是任务栏永远显示 electron.exe 里嵌的那个原子图标。
+   *
+   * 显式设一个本项目专用的 AUMID 后，任务栏会按这个身份去认图标：
+   *   · 开发期（node_modules/electron）—— 进程仍是 electron.exe，任务栏
+   *     图标取自任务栏缓存里该 AUMID 曾绑定过的图标；配合下面的
+   *     app.setName / 窗口 icon，固定项能正确显示。
+   *   · 打包后（Launcher.exe 直接是宿主进程）—— 任务栏直接取 exe 里嵌的图标。
+   *
+   * 这也是"同一个应用不要出现两个任务栏按钮"的正解：AUMID 一致才会归组。
+   */
+  app.setAppUserModelId(APP_USER_MODEL_ID);
+
   app.whenReady().then(() => {
     /*
      * 把后端用的数据根目录同步给本进程，保证主进程和后端算出的

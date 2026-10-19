@@ -600,86 +600,57 @@ select.text-input {
    面板里出现任何硬编码色值，换主题时就会有一块不跟着变。
    ================================================================ */
 
-.think-panel {
-  width: var(--think-w);
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--bg-elev);
-  border-left: 1px solid var(--border);
-  /* 宽度变化给一点过渡：收起/展开是用户主动操作，瞬间跳变显得廉价 */
-  transition: width 0.16s ease;
-  overflow: hidden;
-}
-
-.think-panel.is-collapsed {
-  width: var(--think-w-rail);
-}
-
-/* ---------------------------------------------------------- 收起态竖边 */
-
-.think-rail {
-  display: flex;
-  height: 100%;
-  min-height: 0;
-}
-
-.think-rail-btn {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  padding: 14px 0;
-  border: 0;
-  background: transparent;
-  color: var(--fg-dim);
-  cursor: pointer;
-  font-family: inherit;
-  transition:
-    background-color 0.14s ease,
-    color 0.14s ease;
-}
-
-.think-rail-btn:hover {
-  background: var(--bg-hover);
-  color: var(--fg);
-}
-
-/* 朝向内容的箭头：只写竖排文字的话，用户不确定这块能不能点 */
-.think-rail-arrow {
-  flex: none;
-  font-size: 15px;
-  line-height: 1;
-  color: var(--accent);
-}
-
 /*
- * 竖排文字：横向 34px 放不下"思考链路"四个字。
- * vertical-rl 是唯一能让中文竖着读还符合阅读习惯的写法。
+ * 思考链路是「概览」下的一个页面，不是常驻侧栏。
+ *
+ * 它以前是 .app 网格的第三列，长期占掉 356px 主内容宽度 ——
+ * 而它只在"想追问一次它为什么这么答"时才需要看，
+ * 属于偶尔查一次的诊断视图，不是随时要盯着的面板。
+ * 所以改成页面：进这一页才占地方，其他页面主内容拿回全部宽度。
  */
-.think-rail-text {
-  writing-mode: vertical-rl;
-  font-size: 12px;
-  letter-spacing: 2px;
-  line-height: 1.4;
+.think-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* 页面本身不限高：内容多时让整个 view 滚动，而不是嵌套一层滚动 */
 }
-
-.think-rail-count {
-  font-size: 10px;
-  color: var(--fg-faint);
-  font-variant-numeric: tabular-nums;
-  writing-mode: vertical-rl;
-}
-
-/* ---------------------------------------------------------- 展开态骨架 */
 
 .think-shell {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  width: 100%;
   min-height: 0;
+  /* 给一个舒服的阅读上限：宽屏下满屏拉开的正文很难读 */
+  max-width: 980px;
+  margin: 0 auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
 }
+
+/* 收起态在页面里表现为"只留表头"，不再需要一条竖边 */
+.think-page.is-collapsed .think-shell > .think-scroll {
+  display: none;
+}
+
+/* ---------------------------------------------------------- 收起态 */
+
+/*
+ * 收起后只留表头。
+ *
+ * 原来的「竖边」样式（.think-rail / .think-rail-btn / .think-rail-text 等）
+ * 已随侧栏改页面一并删除 —— 那是为一列 34px 宽的常驻面板设计的，
+ * 页面里的收起只是把正文折掉，不需要竖排文字。
+ */
+
+.think-folded-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--fg-faint);
+}
+
+/* ---------------------------------------------------------- 展开态骨架 */
 
 .think-head {
   flex: none;
@@ -786,6 +757,14 @@ select.text-input {
 .think-scroll {
   flex: 1;
   min-height: 0;
+  /*
+   * 页面形态下必须给一个明确的高度上限，否则 flex:1 会把滚动区
+   * 压成内容高度、overflow 永远不触发（表现为"滚动保护测不出滚动"）。
+   *
+   * 侧栏时代它靠 height:100% 撑满一列；现在外层是随内容长的页面，
+   * 只有显式限高才能让它内部滚动、把表头钉在上面。
+   */
+  max-height: calc(100vh - 190px);
   overflow-y: auto;
   overflow-x: hidden;
   padding: 9px 12px 18px;

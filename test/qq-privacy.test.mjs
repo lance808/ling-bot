@@ -136,7 +136,15 @@ test('★ 这里的规则和 scan-secrets.mjs 的完全一致（改一边必须�
   }
 
   // looksFakeQQ 的关键判定要都在
-  const fake = src.slice(src.indexOf('function looksFakeQQ'), src.indexOf('function looksFakeQQ') + 800);
+  /*
+ * 取 looksFakeQQ 的函数体。
+ *
+ * 原来写死 800 字符窗口 —— 函数里多写两行注释，后面的判定就被挤出窗口，
+ * 测试会误报"少了判定"。这不稳定，改成截到下一个顶层 function 为止。
+ */
+const fakeStart = src.indexOf('function looksFakeQQ');
+const fakeEnd = src.indexOf('\nfunction ', fakeStart + 10);
+const fake = src.slice(fakeStart, fakeEnd > 0 ? fakeEnd : fakeStart + 2000);
   for (const marker of ['(.)\\1+', '0+', 'asc || desc']) {
     assert.ok(fake.includes(marker), `looksFakeQQ 少了判定：${marker}`);
   }

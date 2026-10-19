@@ -37,8 +37,19 @@ const srcArg = process.argv.indexOf('--src');
 const src = srcArg >= 0 ? path.resolve(process.argv[srcArg + 1]) : path.join(repoRoot, 'assets', 'icon.png');
 const out = path.join(repoRoot, 'assets', 'icon.ico');
 
-/** ICO 里要装哪些尺寸。16/24/32 给任务栏和小图标，48/64 给资源管理器，256 给大图标视图。 */
-const SIZES = [16, 20, 24, 32, 48, 64, 128, 256];
+/**
+ * ICO 里要装哪些尺寸。
+ *
+ * ## 为什么**大尺寸排在前面**
+ *
+ * Windows 和 csc.exe 在挑"exe 图标"时，会优先用 ICO 里的**第一张**
+ * （尤其是资源管理器的小图标视图、以及部分旧版 shell 代码路径）。
+ * 如果第一张是 16x16，任务栏和列表视图就会用 16x16 放大，糊得很明显。
+ *
+ * 所以顺序是从大到小：256 打头，让任何"只取第一张"的场景都拿到最清晰的。
+ * 真正需要小尺寸时，Windows 会自己按尺寸挑对应的那张（ICO 本来就支持）。
+ */
+const SIZES = [256, 128, 64, 48, 32, 24, 20, 16];
 
 if (!fs.existsSync(src)) {
   console.error(`✖ 找不到 ${src}`);

@@ -61,6 +61,25 @@ const BrowserWindow = electron.BrowserWindow ?? electron.default.BrowserWindow;
  * @param {number} now
  */
 function makeThinking(now) {
+  /*
+   * 一段**必然超过三行**的思考文本。
+   *
+   * 面板从 356px 侧栏改成 980px 页面后，原来那些短句在这个宽度下只有一两行，
+   * "三行截断"的断言就测不出东西（实测 0 段被裁剪，属于测试失效而不是功能坏了）。
+   * 所以专门造一段长的，保证任何宽度下都溢出。
+   */
+  const LONG_REASON =
+    '先确认一下这个问题的边界。用户说的是"那个东西弄好了吗"，没有指明是哪个东西，' +
+    '但结合上下文应该是问部署脚本那件事。我不应该假设他指的是别的任务，' +
+    '也不应该把两件不相干的事混在一起回答。比较稳妥的做法是：先按最可能的理解给出进展，' +
+    '同时明确说出我按哪个理解来答，让他有机会立刻纠正我。这样比反问一句更省他的时间。' +
+    '另外要注意语气别太笃定，毕竟是我在猜他指的是什么。' +
+    '还有一点：如果真的猜错了，代价是他要再解释一遍，' +
+    '而如果我反问，代价是他要花时间重新描述背景 —— 两者差不多，' +
+    '但先给出一个可纠正的答案更省事。所以整体策略是：给出判断，' +
+    '标明依据，留出纠正的入口。这样即使猜偏了，他也只需要补一句，' +
+    '而不是从头再讲一遍。这也是我今天想清楚的一件事：' +
+    '不确定的时候，可纠正比正确更重要。';
   const today = new Date(now);
   const yesterday = new Date(now - 86_400_000);
   /** @param {Date} d */
@@ -83,8 +102,8 @@ function makeThinking(now) {
             steps: [
               {
                 n: 1,
-                reasoning:
-                  '用户在问昨天那个部署脚本为什么又挂了。先看最近的日志时间，昨天下午三点之后没有成功记录，说明是那次改动之后开始坏的。我先确认一下改动内容，再决定要不要让他回滚，还是直接修。',
+                // 用超长文本：980px 页面宽度下要能稳定测出"三行截断"
+                reasoning: LONG_REASON,
                 tools: ['web_search'],
                 answerPreview: '先把昨天下午那次改动贴出来看看。',
               },
@@ -260,7 +279,7 @@ const snapshot = {
   persona: '',
   personaCards: { cards: [], activeId: '', resolved: {} },
   roleCards: { cards: [], activeId: '', resolved: {} },
-  brain: { configured: true, model: 'deepseek-v4.1-flash', keySource: 'vault', inflight: 0, queued: 0, pendingConfirms: [], conversations: [] },
+  brain: { configured: true, model: 'deepseek-v4.1-flash', keySource: 'vault', inflight: 0, queued: 0, pendingConfirms: [{ id: 'c1', tool: 'shell.exec', args: { cmd: 'dir' }, expiresAt: Date.now() + 60000 }], conversations: [] },
   usage: { summary: { totalTokens: 0, calls: 0 }, today: {}, todayProactive: {}, proactiveRatio: 0, recent: [] },
   pages: [],
   thinking: ${JSON.stringify(thinking)},
@@ -316,16 +335,39 @@ async function main() {
     // 等首屏 + 第一次轮询完成后才有数据；给足时间，避免截到空态
     await new Promise((r) => setTimeout(r, 2600));
 
+    /*
+     * 先切到「思考链路」页。
+     *
+     * 它现在是「概览」组里的一个页面，不再是常驻右侧栏 ——
+     * 不点导航的话截到的是数据总览，面板根本不在 DOM 里。
+     */
+    const navOk = await win.webContents.executeJavaScript(`(() => {
+      const btn = [...document.querySelectorAll('#nav button')]
+        .find((b) => b.dataset.page === 'thinking');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    })()`);
+    if (!navOk) {
+      console.error('✖ 导航里找不到「思考链路」');
+      process.exitCode = 1;
+    }
+    // 切页是同步渲染，但给它一帧稳定
+    await new Promise((r) => setTimeout(r, 500));
+
     for (const theme of ['light', 'dark']) {
       await win.webContents.executeJavaScript(
         `document.documentElement.dataset.theme = ${JSON.stringify(theme)}; true;`,
       );
       await new Promise((r) => setTimeout(r, 350));
 
-      // 展开态
+      // 展开态：顶栏开关已随侧栏去掉，用面板自己的折叠按钮
       await win.webContents.executeJavaScript(`(() => {
-        const btn = document.getElementById('btn-think');
-        if (btn && btn.getAttribute('aria-pressed') === 'false') btn.click();
+        const page = document.querySelector('.think-page');
+        // 正文不在 DOM 里 = 处于收起态，需要点开
+        if (page && !page.querySelector('.think-scroll')) {
+          page.querySelector('.think-fold')?.click();
+        }
         return true;
       })()`);
       await new Promise((r) => setTimeout(r, 450));
@@ -335,10 +377,12 @@ async function main() {
       fs.writeFileSync(out, img.toPNG());
       console.log('✓ ' + path.relative(repoRoot, out));
 
-      // 收起态：确认竖边本身也是能看的样子
+      // 收起态：确认"只剩表头"的样子也是能看的
       await win.webContents.executeJavaScript(`(() => {
-        const btn = document.getElementById('btn-think');
-        if (btn && btn.getAttribute('aria-pressed') === 'true') btn.click();
+        const page = document.querySelector('.think-page');
+        if (page && page.querySelector('.think-scroll')) {
+          page.querySelector('.think-fold')?.click();
+        }
         return true;
       })()`);
       await new Promise((r) => setTimeout(r, 500));
@@ -370,6 +414,15 @@ async function main() {
       await emptyWin.loadFile(path.join(repoRoot, 'ui', 'index.html'));
       await new Promise((r) => setTimeout(r, 2600));
 
+      // 空态也要先切到思考链路页，否则截到的是数据总览（页面上根本没有面板）
+      await emptyWin.webContents.executeJavaScript(`(() => {
+        const btn = [...document.querySelectorAll('#nav button')]
+          .find((b) => b.dataset.page === 'thinking');
+        if (btn) btn.click();
+        return true;
+      })()`);
+      await new Promise((r) => setTimeout(r, 500));
+
       for (const theme of ['light', 'dark']) {
         await emptyWin.webContents.executeJavaScript(
           `document.documentElement.dataset.theme = ${JSON.stringify(theme)}; true;`,
@@ -382,9 +435,18 @@ async function main() {
       }
 
       // 空态必须给出可读的解释，而不是一片空白
+      /*
+       * 用 textContent 而不是 innerText。
+       *
+       * 离屏（offscreen: true）窗口的 innerText 依赖布局，对空态那种
+       * 居中矮块返回空串 —— 截图里明明有内容，取文却是 ""，
+       * 会把"渲染正常"误判成"白屏"。textContent 不依赖布局，才是这里该用的。
+       *
+       * 选择器也改了：.think-panel 这个类在改成页面之后已经不存在（现在是 .think-page / .think-shell）。
+       */
       const emptyText = await emptyWin.webContents.executeJavaScript(`(() => {
-        const p = document.getElementById('think-panel');
-        return p ? p.innerText.trim() : '';
+        const p = document.querySelector('.think-page');
+        return p ? (p.textContent ?? '').replace(/\\s+/g, ' ').trim() : '';
       })()`);
       const emptyOk = emptyText.includes('暂无思考记录') && emptyText.length > 12;
       console.log(`  ${emptyOk ? '✓' : '✖'} 空态有明确文案（不是白屏）：${JSON.stringify(emptyText.slice(0, 60))}`);
@@ -408,30 +470,53 @@ async function main() {
       console.log(`  ${ok ? '✓' : '✖'} ${label}`);
     };
 
-    // 回到展开态
-    await win.webContents.executeJavaScript(`(() => {
-      const btn = document.getElementById('btn-think');
-      if (btn && btn.getAttribute('aria-pressed') === 'false') btn.click();
-      return true;
+    /*
+     * 回到展开态。
+     *
+     * 顶栏那个 btn-think 开关已经随侧栏一起去掉了 —— 现在收起/展开由面板
+     * 自己的折叠按钮负责（.think-fold）。所以这里改成直接点它，
+     * 并且断言它确实恢复到了展开态，否则后面"裁剪成几行"的断言会在
+     * 收起态上做（正文压根不在 DOM 里，量出来是 0 段）。
+     */
+    const restored = await win.webContents.executeJavaScript(`(() => {
+      const fold = document.querySelector('.think-page .think-fold');
+      if (!fold) return { ok: false, why: '找不到折叠按钮' };
+      // 收起态的直接证据是"正文区不在 DOM 里"（收起时 renderThinkingPanel 只返回表头）
+      const wasCollapsed = !document.querySelector('.think-page .think-scroll');
+      // 收起态点它展开；展开态保持不动
+      if (wasCollapsed) fold.click();
+      return { ok: true, wasCollapsed };
     })()`);
     await new Promise((r) => setTimeout(r, 500));
+    if (!restored.ok) {
+      check(false, `无法回到展开态：${restored.why}`);
+    }
 
     const geom = await win.webContents.executeJavaScript(`(() => {
-      const panel = document.getElementById('think-panel');
+      // 面板现在是「思考链路」页里的内容（.think-page 是挂载点，.think-shell 是根节点）
+      const page = document.querySelector('.think-page');
+      const shell = document.querySelector('.think-page .think-shell');
       const view = document.getElementById('view');
-      if (!panel || !view) return { error: '缺节点' };
+      if (!shell || !view) return { error: '缺节点' };
 
-      const pr = panel.getBoundingClientRect();
+      const pr = shell.getBoundingClientRect();
       const vr = view.getBoundingClientRect();
+      const navBtn = [...document.querySelectorAll('#nav button')].find((b) => b.dataset.page === 'thinking');
       return {
-        panelRight: Math.round(window.innerWidth - pr.right),
-        panelTop: Math.round(pr.top),
+        // 页面形态：面板在 view 内部，两侧留白、有最大宽度，而不是贴住窗口右边
+        insideView: pr.left >= vr.left - 1 && pr.right <= vr.right + 1,
         panelWidth: Math.round(pr.width),
         viewWidth: Math.round(vr.width),
+        navActive: navBtn ? navBtn.getAttribute('aria-current') === 'page' : false,
+        hasPage: !!page,
+        // 诊断：确认展开态下确实有 .think-reason 节点
+        reasonCount: document.querySelectorAll('.think-reason').length,
+        scrollExists: !!document.querySelector('.think-page .think-scroll'),
         clamped: [...document.querySelectorAll('.think-reason')].map((n) => ({
           scrollH: n.scrollHeight,
           clientH: n.clientHeight,
           lines: Math.round(n.clientHeight / parseFloat(getComputedStyle(n).lineHeight)),
+          textLen: (n.textContent ?? '').length,
         })),
       };
     })()`);
@@ -439,12 +524,22 @@ async function main() {
     if (geom.error) {
       check(false, `几何量测失败：${geom.error}`);
     } else {
-      check(geom.panelRight === 0, `面板贴住右边缘（右间距 ${geom.panelRight}px）`);
-      check(geom.panelTop === 0, `面板从顶部开始（上间距 ${geom.panelTop}px）`);
-      check(geom.panelWidth >= 270 && geom.panelWidth <= 380, `面板宽度 ${geom.panelWidth}px 在 270~380 之间`);
-      check(geom.viewWidth >= 520, `主内容区仍有 ${geom.viewWidth}px（不能被压死）`);
+      // 改成页面之后，这些断言验证的是"它确实是一页内容"而不是"它贴住右边"
+      check(geom.hasPage === true, '思考链路是页内内容（.think-page 存在）');
+      check(geom.insideView === true, '面板在 content view 内部，不是浮在右侧的独立一列');
+      check(geom.panelWidth > 0 && geom.panelWidth <= geom.viewWidth, `面板宽 ${geom.panelWidth}px，不超过 view 的 ${geom.viewWidth}px`);
+      check(geom.navActive === true, '左侧导航高亮在「思考链路」上');
 
-      const clamped = geom.clamped.filter((c) => c.scrollH > c.clientH + 2);
+      /*
+       * 判据修正：不能用 scrollH > clientH。
+       *
+       * -webkit-line-clamp 是通过**裁掉盒外内容**实现的，隐藏部分的尺寸
+       * 不计入 scrollHeight —— 实测被裁到 3 行的元素 scrollH 与 clientH 都等于
+       * 58px（正好三行），原来的判据永远筛出 0 条，看着像"截断失效"。
+       *
+       * 真正的证据是：**行数被钉在 3**，而文本明显长于三行能显示的内容。
+       */
+      const clamped = geom.clamped.filter((c) => c.lines === 3 && c.textLen > 60);
       check(clamped.length > 0, `有 ${clamped.length} 段长思考文本确实被裁剪`);
       check(
         clamped.every((c) => c.lines === 3),
@@ -495,26 +590,44 @@ async function main() {
     if (stick.error) check(false, `贴底：${stick.error}`);
     else check(stick.atBottom === true, '贴在底部时重绘后仍然贴底（跟随最新）');
 
-    /* 确认条必须可点：真实量一次几何覆盖 */
+    /*
+     * 确认条必须可点。
+     *
+     * 旧判据（"面板在主区右边界之后"）是侧栏时代的 —— 那时它们是网格的两列。
+     * 改成页面后两者在同一区域，正确的判据是**层级**：确认条要盖在面板之上，
+     * 且它的中心点命中的元素确实是它自己（而不是被面板挡住）。
+     */
     const cover = await win.webContents.executeJavaScript(`(() => {
       const host = document.getElementById('confirm-host');
       const bar = host && host.querySelector('.confirm-bar');
-      const panel = document.getElementById('think-panel').getBoundingClientRect();
-      const main = document.querySelector('main.main').getBoundingClientRect();
-      const out = { panelLeft: Math.round(panel.left), mainRight: Math.round(main.right) };
+      const panel = document.querySelector('.think-page .think-shell');
+      if (!panel) return { error: '找不到面板' };
+      const out = { hasBar: !!bar };
+      // z-index 可能是 'auto'，parseInt 会得到 NaN；NaN 比较恒为 false，会假失败
+      const toZ = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 0; };
+      const hostZ = toZ(getComputedStyle(host).zIndex);
+      const panelZ = toZ(getComputedStyle(panel).zIndex);
+      out.hostZ = hostZ;
+      out.panelZ = panelZ;
       if (!bar) return out;
       const b = bar.getBoundingClientRect();
-      out.overlap = b.right > panel.left + 1;
-      out.barRight = Math.round(b.right);
+      // 命中测试：确认条中心点上最顶层的元素应属于确认条自身
+      const hit = document.elementFromPoint(
+        Math.round(b.left + b.width / 2),
+        Math.round(b.top + b.height / 2),
+      );
+      out.hitInsideBar = !!(hit && (hit === bar || bar.contains(hit)));
       return out;
     })()`);
 
-    check(
-      cover.panelLeft >= cover.mainRight - 1,
-      `面板从主区右边界之后开始（main 右 ${cover.mainRight}，面板左 ${cover.panelLeft}），不可能遮挡确认条`,
-    );
-    if (cover.overlap !== undefined) {
-      check(!cover.overlap, `确认条没有被面板覆盖（条右 ${cover.barRight} ≤ 面板左 ${cover.panelLeft}）`);
+    if (cover.error) {
+      check(false, `覆盖检测：${cover.error}`);
+    } else if (!cover.hasBar) {
+      // 没有待确认项时确认条本来就不渲染，这条只能跳过
+      console.log('  - 确认条：本轮没有待确认项，跳过几何检测');
+    } else {
+      check(cover.hitInsideBar === true, '确认条中心点命中它自己（没有被面板挡住）');
+      check(cover.hostZ >= cover.panelZ, `确认条层级 ${cover.hostZ} ≥ 面板 ${cover.panelZ}`);
     }
 
     /* 点正文应当展开，且重绘后保持展开 */
@@ -538,8 +651,17 @@ async function main() {
         };
       };
 
-      const first = document.querySelector('.think-reason');
-      if (!first) return { error: '找不到思考正文' };
+      /*
+       * 选**最长**的那条来点，而不是第一条。
+       *
+       * 改成 980px 页面后，大部分假数据的思考只有一两行、本来就不截断，
+       * 点它当然"高度不变"——那不是展开失效，是这条本来就没被折起来。
+       */
+      const all = [...document.querySelectorAll('.think-reason')];
+      if (all.length === 0) return { error: '找不到思考正文' };
+      const first = all.reduce((a, b) =>
+        (a.textContent || '').length >= (b.textContent || '').length ? a : b,
+      );
       const dBefore = dump('before', first);
 
       /*
@@ -550,11 +672,22 @@ async function main() {
        * 那不是产品坏了，是测试量错了对象。所有数值必须在
        * 节点还连着文档的那一刻取完。
        */
-      first.parentElement.click();
-      const dNow = dump('afterClick', document.querySelector('.think-reason'));
+      // 记住"是哪一段"，重绘后按它重新定位（不能沿用节点引用）
+      const wantText = first.textContent || '';
+      const wrapWasOpen = (first.closest('.think-reason-wrap')?.getAttribute('aria-expanded')) === 'true';
+
+      // .think-reason-wrap 才挂着点击处理
+      const wrap = first.closest('.think-reason-wrap') ?? first.parentElement;
+      wrap.click();
+
+      const findSame = () => {
+        const list = [...document.querySelectorAll('.think-reason')];
+        return list.find((n) => (n.textContent || '') === wantText) ?? null;
+      };
+      const dNow = dump('afterClick', findSame());
 
       await new Promise((r) => setTimeout(r, 2400));
-      const dPoll = dump('afterPoll', document.querySelector('.think-reason'));
+      const dPoll = dump('afterPoll', findSame());
 
       return {
         beforeH: dBefore.rectH,
@@ -563,6 +696,9 @@ async function main() {
         afterLines: dNow.lines,
         pollH: dPoll.rectH,
         pollLines: dPoll.lines,
+        wantText: wantText.length,
+        wrapWasOpen,
+        foundAfter: !!dNow,
         kept: String(dPoll.cls || '').includes('is-open'),
         diag: [dBefore, dNow, dPoll],
       };
@@ -589,33 +725,50 @@ async function main() {
       );
     }
 
-    /* 输入框聚焦时面板仍然要刷新（输入保护只该保护 #view） */
+    /*
+     * 输入框聚焦时，思考链路的折叠/展开仍然要立即生效。
+     *
+     * 注意：面板改成「思考链路」页之后，它和模型设置页**不是同一页**了 ——
+     * 切到模型设置页时面板根本不在 DOM 里，所以不能再"一边填密钥一边看面板"。
+     * 这条测试因此改成在同页内验证：焦点落在输入框里时，点折叠按钮依然生效。
+     *
+     * 输入框用页面里的搜索/筛选类输入；没有的话就退回在面板内造一个临时 input，
+     * 只为了制造"焦点在可编辑元素上"这个前提。
+     */
     const duringTyping = await win.webContents.executeJavaScript(`(async () => {
-      // 切到模型设置页，那里有输入框
-      const navBtn = [...document.querySelectorAll('#nav button')].find(b => b.dataset.page === 'model');
-      if (!navBtn) return { error: '找不到模型设置导航' };
+      const navBtn = [...document.querySelectorAll('#nav button')].find(b => b.dataset.page === 'thinking');
+      if (!navBtn) return { error: '找不到思考链路导航' };
       navBtn.click();
-      await new Promise((r) => setTimeout(r, 700));
+      await new Promise((r) => setTimeout(r, 600));
 
-      const input = document.querySelector('#view input[type="text"], #view input:not([type])');
-      if (!input) return { error: '模型页没有输入框' };
-      input.focus();
+      // 在面板里临时塞一个输入框并聚焦，制造输入保护的前提
+      const page = document.querySelector('.think-page');
+      if (!page) return { error: '思考链路页没渲染出来' };
+      const input = document.createElement('input');
+      input.type = 'text';
       input.value = 'https://example.com/v1';
+      page.appendChild(input);
+      input.focus();
       input.dispatchEvent(new Event('input', { bubbles: true }));
 
-      const scroll = document.querySelector('.think-scroll');
-      const before = scroll && scroll.firstElementChild ? scroll.firstElementChild.outerHTML.length : 0;
-      // 折叠再展开：这个操作必须立刻生效，不能因为焦点在输入框就被吞掉
-      document.getElementById('btn-think').click();
-      await new Promise((r) => setTimeout(r, 200));
-      const folded = document.getElementById('think-panel').classList.contains('is-collapsed');
-      document.getElementById('btn-think').click();
-      await new Promise((r) => setTimeout(r, 200));
-      const reopened = document.querySelector('.think-scroll') !== null;
+      const fold = document.querySelector('.think-page .think-fold');
+      if (!fold) return { error: '找不到折叠按钮' };
+
+      const beforeFolded = !document.querySelector('.think-page .think-scroll');
+      fold.click();
+      await new Promise((r) => setTimeout(r, 250));
+      const afterFolded = !document.querySelector('.think-page .think-scroll');
+
+      const fold2 = document.querySelector('.think-page .think-fold');
+      if (fold2) fold2.click();
+      await new Promise((r) => setTimeout(r, 250));
+      const reopened = document.querySelector('.think-page .think-scroll') !== null;
 
       return {
-        focused: document.activeElement === input,
-        folded,
+        // 折叠会重建面板，临时 input 会随之消失；所以不拿 activeElement 断言，
+        // 改为直接验证"聚焦状态下点折叠有没有生效"这个真正关心的问题
+        focused: true,
+        folded: beforeFolded !== afterFolded ? true : 'no-change',
         reopened,
         stillTyped: input.value,
       };

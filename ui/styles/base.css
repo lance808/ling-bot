@@ -203,16 +203,15 @@ body {
 .app {
   display: grid;
   /*
-   * 三列：侧栏 / 主区 / 右侧思考面板。
+   * 两列：侧栏 / 主区。
    *
-   * 第三列用 auto：面板的宽度由它自己的 CSS 决定（展开 --think-w、
-   * 收起 --think-w-rail），中间那列就可以吃掉剩下的全部空间。
-   * 如果这里写死 336px，面板收起后中间会留一道 300px 的空洞。
+   * 思考链路原本是这里的第三列（常驻右侧面板），后来改成「概览」下的
+   * 一个页面 —— 它属于偶尔查一次的诊断视图，不该长期占掉主内容宽度。
    *
    * 中间列用 minmax(0, 1fr) 而不是 1fr：1fr 的最小尺寸是内容的
-   * min-content，表格一宽就会把面板挤出屏幕。
+   * min-content，表格一宽就会把主区撑破屏幕。
    */
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) auto;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
 }

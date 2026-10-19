@@ -74,6 +74,31 @@ function main() {
   /** 启动器 exe 要嵌的图标（没有就跳过，不影响编译） */
   const icoPath = path.join(repoRoot, 'assets', 'icon.ico');
 
+  /*
+   * 图标不存在时**自动生成一张**，而不是静默跳过。
+   *
+   * 静默跳过的后果很难发现：exe 编译成功、能跑，但图标是系统默认的
+   * 空白窗口图案，看上去像"改了没生效"。既然 assets/icon.png 在，
+   * 就顺手把它转成 .ico —— 这一步只需要 Windows 自带的 System.Drawing。
+   *
+   * 只有连源 PNG 都没有时才真的跳过（那种情况确实无从生成）。
+   */
+  if (!fs.existsSync(icoPath)) {
+    const pngPath = path.join(repoRoot, 'assets', 'icon.png');
+    if (fs.existsSync(pngPath)) {
+      console.log('图标：assets/icon.ico 不存在，从 icon.png 自动生成…');
+      const r = spawnSync(process.execPath, [path.join(repoRoot, 'scripts', 'make-ico.mjs')], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      });
+      if (r.status !== 0) {
+        console.warn(`⚠ 自动生成 .ico 失败，本次 exe 将使用系统默认图标：\n${(r.stdout || '') + (r.stderr || '')}`);
+      }
+    } else {
+      console.warn('⚠ 既没有 assets/icon.ico 也没有 assets/icon.png，本次 exe 将使用系统默认图标');
+    }
+  }
+
   const args = [
     '/nologo',
     consoleMode ? '/target:exe' : '/target:winexe',
@@ -90,9 +115,9 @@ function main() {
      * 显示的是 **exe 里嵌的图标**，不是 Electron 窗口的 icon。
      * 只设 BrowserWindow({icon}) 的话，任务栏图标换不掉。
      *
-     * .ico 由 scripts/make-ico.mjs 从 assets/icon.png 生成（多尺寸）。
-     * 文件不存在时不加这个参数 —— 编译仍然成功，只是图标是系统默认的，
-     * 不能让"少一个图标文件"阻断整个构建。
+     * .ico 由 scripts/make-ico.mjs 从 assets/icon.png 生成（多尺寸，
+     * 256 排第一，避免 shell 只取首张时拿到 16x16 的糊图）。
+     * 两个版本都嵌 —— console 版也是用户能双击到的文件，图标不该是空白的。
      */
     ...(fs.existsSync(icoPath) ? [`/win32icon:${icoPath}`] : []),
     ...(consoleMode ? [] : ['/define:QUIET']),

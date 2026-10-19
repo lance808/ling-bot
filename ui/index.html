@@ -39,20 +39,6 @@
             <div class="topbar-sub" id="page-sub"></div>
           </div>
           <div class="topbar-actions">
-            <!--
-              思考链路的开关放顶栏而不是面板里：面板收起后只剩一条竖边，
-              那时唯一能点的就是竖边本身；但它被收起来时也最容易"找不到在哪展开"。
-              顶栏这个按钮始终在原位，收起/展开都能点到。
-            -->
-            <button
-              id="btn-think"
-              class="btn btn-sm"
-              type="button"
-              aria-pressed="true"
-              title="显示 / 收起右侧思考链路面板"
-            >
-              思考链路
-            </button>
             <div class="theme-switch" id="theme-switch" role="group" aria-label="主题">
               <button type="button" data-theme-set="light">亮</button>
               <button type="button" data-theme-set="dark">暗</button>
@@ -63,15 +49,6 @@
         <div id="confirm-host"></div>
         <div id="toast" class="toast" hidden></div>
       </main>
-
-      <!--
-        右侧思考面板是 .main 的兄弟节点而不是子节点。
-
-        理由：确认条挂在 .main 里，如果面板也在 .main 内，两者会抢同一块
-        绝对定位的坐标空间（确认条 absolute 相对 .main）。放到网格的第三列后，
-        确认条在物理上根本不可能被面板覆盖 —— 高风险工具的确认永远点得到。
-      -->
-      <aside id="think-panel" class="think-panel" aria-label="思考链路"></aside>
     </div>
     <script type="module" src="./src/app.mjs"></script>
   </body>

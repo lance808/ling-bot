@@ -42,6 +42,9 @@ import { renderThinkingPanel } from './views/thinking.mjs';
 const PAGES = [
   { id: 'overview', group: '概览', label: '数据总览', sub: '连接、模型、账号与今日消耗', render: (s, ctx) => renderOverview(s, ctx) },
   { id: 'sessions', group: '概览', label: '会话总览', sub: '群聊与私聊的对话历史，可直接手动发送', render: (s, ctx) => renderSessions(s, ctx.sessions) },
+  // 思考链路是「概览」下的第三个页面，不是常驻侧栏 —— 它属于"看数据"这一类，
+  // 和前后台运行状态无关，长期占着右侧会一直挤压主内容区。
+  { id: 'thinking', group: '概览', label: '思考链路', sub: '每个会话近期的思考过程，按日归档', render: () => el('div', { class: 'think-page' }) },
 
   { id: 'model', group: '配置', label: '模型设置', sub: '提供商、密钥、模型列表与能力探测', render: (s, ctx) => renderModelSettings(s, ctx.model) },
   { id: 'persona', group: '配置', label: '人物设置', sub: '人格 = 它是谁；角色 = 它在什么场景扮演什么', render: (s, ctx) => el('div', {}, [renderPersona(s, { persona: ctx.persona, role: ctx.role, tab: ctx.tab, onTab: ctx.onTab }), el('div', { class: 'spacer-12' }), renderBehaviorLayer()]) },
@@ -113,11 +116,28 @@ const toastEl = /** @type {HTMLElement} */ (document.getElementById('toast'));
 /** 确认条挂载点：独立于页面内容，切页不消失 */
 const confirmHost = /** @type {HTMLElement} */ (document.getElementById('confirm-host'));
 
-/** 右侧思考面板挂载点（它是 .app 的第三列，不在 .main 里） */
-const thinkPanel = /** @type {HTMLElement} */ (document.getElementById('think-panel'));
+/**
+ * 右侧思考面板挂载点。
+ *
+ * **只在「思考链路」页存在** —— 它是页面内容，不是常驻侧栏。
+ * 其他页面下它是 null，所有调用点都必须容忍这一点（paintThinkPanel 会直接返回）。
+ *
+ * @type {HTMLElement | null}
+ */
+let thinkPanel = /** @type {HTMLElement | null} */ (null);
 
-/** 顶栏的开启/收起按钮 */
-const thinkToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById('btn-think'));
+/**
+ * 顶栏的开启/收起按钮。
+ *
+ * 改成页面之后不再需要它：思考链路已经是导航里的一项，
+ * 而"收起"在页面内由面板自己的折叠按钮负责。
+ *
+ * 保留这个变量（恒为 null）是为了让 syncThinkToggle 不必到处判空，
+ * 也方便将来真要加回顶栏开关时只改这一处。
+ *
+ * @type {HTMLButtonElement | null}
+ */
+const thinkToggle = /** @type {HTMLButtonElement | null} */ (null);
 
 /* ---------------------------------------------------------------- 主题 */
 
@@ -192,6 +212,38 @@ function currentConvOf(state) {
 }
 
 /**
+ * 面板在清空 view 之前采到的滚动状态。
+ *
+ * 为什么需要这个变量：页面形态下面板会随 view 一起被销毁重建，
+ * 等到 paintThinkPanel 执行时旧节点已经没了，读不到用户的滚动位置。
+ * 所以必须在 render() 里、clear(view) 之前先把位置存下来。
+ */
+let capturedThinkScroll = /** @type {{top: number, height: number, client: number} | null} */ (null);
+
+/** 清空后旧节点已脱离文档，恢复焦点时要用它兜底 */
+let capturedShell = /** @type {HTMLElement | null} */ (null);
+
+/**
+ * 在销毁旧 DOM 之前采集滚动状态。
+ *
+ * 只在「思考链路」页调用；其他页面没有面板，采集了也没意义。
+ */
+function captureThinkScroll() {
+  const shell = view.querySelector('.think-page .think-scroll');
+  if (!shell) {
+    capturedThinkScroll = null;
+    capturedShell = null;
+    return;
+  }
+  capturedThinkScroll = {
+    top: shell.scrollTop,
+    height: shell.scrollHeight,
+    client: shell.clientHeight,
+  };
+  capturedShell = shell;
+}
+
+/**
  * 挂载/刷新右侧思考面板。
  *
  * ## 滚动位置保护（这里是整个面板最容易做错的地方）
@@ -209,12 +261,37 @@ function currentConvOf(state) {
 function paintThinkPanel(state) {
   if (!thinkPanel) return;
 
-  const shell = thinkPanel.querySelector('.think-scroll');
-  const prevTop = shell ? shell.scrollTop : 0;
-  const prevHeight = shell ? shell.scrollHeight : 0;
-  const prevClient = shell ? shell.clientHeight : 0;
+  /*
+   * 滚动位置从**旧 DOM** 上取。
+   *
+   * 页面形态下 render() 会先 clear(view) 再重建，此时传进来的 thinkPanel
+   * 是一个全新的空节点，它的 scrollTop 恒为 0 —— 拿它判断"是否贴底"
+   * 会永远得到"贴底"，于是用户每次往上翻都被下一轮轮询拽回底部。
+   *
+   * 所以优先用清空之前采集到的那份（capturedThinkScroll），
+   * 只有在没有采集值时才退回读当前节点（比如纯面板内交互、没走清空）。
+   */
+  const shell = thinkPanel.querySelector('.think-scroll') ?? capturedShell;
+  const prevTop = capturedThinkScroll
+    ? capturedThinkScroll.top
+    : shell
+      ? shell.scrollTop
+      : 0;
+  const prevHeight = capturedThinkScroll
+    ? capturedThinkScroll.height
+    : shell
+      ? shell.scrollHeight
+      : 0;
+  const prevClient = capturedThinkScroll
+    ? capturedThinkScroll.client
+    : shell
+      ? shell.clientHeight
+      : 0;
   // 贴底判定留 24px 容差：分数像素和滚动条圆角会让 exact 比较永远为 false
   const wasAtBottom = prevHeight <= prevClient + 24 || prevTop + prevClient >= prevHeight - 24;
+
+  // 有没有真的采到过位置：用来区分"用户翻到过这里"和"这是第一次渲染"
+  const capturedForRestore = capturedThinkScroll !== null;
 
   /*
    * 记住焦点在哪一条。
@@ -270,14 +347,34 @@ function paintThinkPanel(state) {
    */
   const next = thinkPanel.querySelector('.think-scroll');
   if (next) {
-    if (wasAtBottom) next.scrollTop = next.scrollHeight;
-    else next.scrollTop = prevTop;
+    /*
+     * 首帧（没有采集值）要**停在顶部**，不要贴底。
+     *
+     * 侧栏时代贴底是对的 —— 面板一直在、新内容从底部追加，用户想看最新的。
+     * 但改成页面之后，每次进入这一页都是全新重建：没有采集值时三个数都是 0，
+     * `0 <= 0 + 24` 恒成立，会被判成"贴底"然后滚到底 —— 打开页面直接落在
+     * 中间，连"今天"的日期头都看不见。
+     *
+     * 所以只有**确实采到过位置**时才恢复；没采到就停在顶部，让人从头看。
+     */
+    if (!capturedForRestore) {
+      next.scrollTop = 0;
+    } else if (wasAtBottom) {
+      next.scrollTop = next.scrollHeight;
+    } else {
+      next.scrollTop = prevTop;
+    }
   }
 
   if (focusKey) {
     const again = next?.querySelector(`[data-think-key="${cssEscape(focusKey)}"]`);
     again?.focus?.();
   }
+
+  // 采集值只对紧接这一次重建有效：留着会让下一次（纯面板内交互）
+  // 误用上一次的位置，表现成"点展开后滚到别处去"
+  capturedThinkScroll = null;
+  capturedShell = null;
 }
 
 /**
@@ -303,17 +400,6 @@ function syncThinkToggle() {
   if (!thinkToggle) return;
   thinkToggle.setAttribute('aria-pressed', local.think.collapsed === true ? 'false' : 'true');
 }
-
-/**
- * 顶栏开关。
- *
- * 用的是"当前状态取反"而不是读 aria-pressed：aria 是渲染产物，
- * 在重绘之间可能与 local 短暂不一致，拿它当输入会让连点两下卡住。
- */
-thinkToggle?.addEventListener('click', () => {
-  setThinkCollapsed(!local.think.collapsed);
-});
-
 /* ---------------------------------------------------------------- 导航 */
 
 // 按 group 分组渲染，组的顺序按 PAGES 里第一次出现的顺序
@@ -873,6 +959,9 @@ function render() {
     },
   };
 
+  // 必须在 clear(view) 之前采：清空之后旧节点就没了，读不到用户的滚动位置
+  captureThinkScroll();
+
   clear(view);
   try {
     view.append(page.render(s.snapshot, ctx));
@@ -883,6 +972,25 @@ function render() {
         el('div', { class: 'muted', text: String(err) }),
       ]),
     );
+  }
+
+  /*
+   * 思考链路页：把面板挂进刚渲染出来的容器里。
+   *
+   * 它是**页面内容**而不是常驻侧栏 —— 其他页面下 thinkPanel 一律为 null，
+   * paintThinkPanel 会直接返回，这样轮询重绘不会去碰不存在的节点。
+   *
+   * 顺序很重要：先让 page.render 建出 .think-page 容器，再往里 append，
+   * 否则拿不到挂载点（踩过）。
+   */
+  if (page.id === 'thinking') {
+    thinkPanel = /** @type {HTMLElement | null} */ (view.querySelector('.think-page'));
+    if (thinkPanel) {
+      thinkPanel.classList.toggle('is-collapsed', local.think.collapsed === true);
+      paintThinkPanel(s);
+    }
+  } else {
+    thinkPanel = null;
   }
 
   // 流式区块：只在有在途回合时出现
@@ -918,11 +1026,6 @@ function render() {
     toastEl.hidden = true;
   }
 
-  /*
-   * 思考面板在确认条之后挂载：两者是不同网格列，互不遮挡；
-   * 顺序只影响"先算谁"，放后面是为了让主视图先出现在屏幕上。
-   */
-  paintThinkPanel(s);
   syncThinkToggle();
 
   syncThemeButtons();

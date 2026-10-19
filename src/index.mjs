@@ -181,6 +181,19 @@ async function boot() {
     timeoutMs: config.llm.timeoutMs,
   });
   usageLedger = new UsageLedger({ filePath: `${paths.stateDir}/usage.jsonl` });
+  /*
+   * 把历史用量读回来。
+   *
+   * 不做这一步的话，record() 一直在追加写、却从来没人读，
+   * 每次打开应用「今日消耗」都会归零 —— 落盘等于白存。
+   * 失败不影响启动（统计缺失远小于起不来）。
+   */
+  {
+    const restored = await usageLedger.load();
+    if (restored.loaded > 0) {
+      log.info('已恢复历史用量', { 最近记录: restored.loaded, 今日调用: restored.today });
+    }
+  }
 
   // 骨架装配：先注册动作与工具，再打印清单（让人一眼看到能做什么）
   registerAllActions();

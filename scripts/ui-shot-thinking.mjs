@@ -280,7 +280,7 @@ const snapshot = {
   personaCards: { cards: [], activeId: '', resolved: {} },
   roleCards: { cards: [], activeId: '', resolved: {} },
   brain: { configured: true, model: 'deepseek-v4.1-flash', keySource: 'vault', inflight: 0, queued: 0, pendingConfirms: [{ id: 'c1', tool: 'shell.exec', args: { cmd: 'dir' }, expiresAt: Date.now() + 60000 }], conversations: [] },
-  usage: { summary: { totalTokens: 0, calls: 0 }, today: {}, todayProactive: {}, proactiveRatio: 0, recent: [] },
+  usage: { summary: { totalTokens: 13331, calls: 16 }, today: { calls: 16, promptTokens: 12979, completionTokens: 352, totalTokens: 13331, estimatedCalls: 0 }, todayProactive: { calls: 3, promptTokens: 1322, completionTokens: 83, totalTokens: 1405, estimatedCalls: 0 }, proactiveRatio: 11, recent: [] },
   pages: [],
   thinking: ${JSON.stringify(thinking)},
 };
@@ -784,6 +784,35 @@ async function main() {
     }
 
     const failed = results.filter((r) => !r.ok).length;
+    /*
+     * 额外截一张「数据总览」。
+     *
+     * 这张是为了回答"重启之后今日消耗还显不显示数字"——后端已经把
+     * usage.jsonl 读回来了，这里确认界面那一侧确实把它画出来了。
+     */
+    {
+      await win.webContents.executeJavaScript(`(() => {
+        const btn = [...document.querySelectorAll('#nav button')].find((b) => b.dataset.page === 'overview');
+        if (btn) btn.click();
+        return true;
+      })()`);
+      await new Promise((r) => setTimeout(r, 700));
+      const img = await win.webContents.capturePage();
+      const out4 = path.join(outDir, 'usage-overview.png');
+      fs.writeFileSync(out4, img.toPNG());
+      console.log('✓ ' + path.relative(repoRoot, out4));
+
+      // 今日消耗卡片上必须出现非零数字
+      const usageText = await win.webContents.executeJavaScript(`(() => {
+        const cards = [...document.querySelectorAll('#view .card')];
+        const card = cards.find((c) => (c.textContent || '').includes('今日消耗'));
+        return card ? (card.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+      })()`);
+      const hasNumber = /13331|12979|352|16/.test(usageText);
+      console.log(`  ${hasNumber ? '✓' : '✖'} 今日消耗显示了恢复后的数字：${JSON.stringify(usageText.slice(0, 90))}`);
+      if (!hasNumber) process.exitCode = 1;
+    }
+
     console.log(`\n${failed === 0 ? '✓ 面板运行时行为全部通过' : `✖ ${failed} 项失败`}（共 ${results.length} 项）`);
 
     win.destroy();

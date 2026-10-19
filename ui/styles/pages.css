@@ -1,0 +1,587 @@
+/* 各页面专属样式；通用组件都在 base.css */
+
+.cols {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 1080px) {
+  .cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+.conv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.conv-item {
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  cursor: pointer;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.conv-item:hover {
+  background: var(--bg-hover);
+}
+
+.conv-item[aria-selected='true'] {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 380px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.log-tail {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  max-height: 380px;
+  overflow: auto;
+  color: var(--fg-dim);
+}
+
+.persona-editor {
+  display: grid;
+  grid-template-columns: 1fr 220px;
+  gap: var(--gap);
+}
+
+@media (max-width: 900px) {
+  .persona-editor {
+    grid-template-columns: 1fr;
+  }
+}
+
+.counter {
+  font-variant-numeric: tabular-nums;
+}
+
+.counter.over {
+  color: var(--err);
+}
+
+.tool-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.taglist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tool-tag {
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+}
+
+/* 确认弹条：固定底部，避免被内容挤走 */
+.confirm-bar {
+  position: absolute;
+  left: 20px;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 30;
+}
+
+.confirm-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+.confirm-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.confirm-args {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  max-height: 140px;
+  overflow: auto;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 回合进行中的流式提示 */
+.turn-stream {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-top: 10px;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.turn-stream .head {
+  font-size: 11px;
+  color: var(--fg-faint);
+  margin-bottom: 4px;
+}
+
+/* 人物页：从上到下，不用左右分栏 */
+.persona-stack {
+  max-width: 760px;
+}
+
+.persona-header {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 人格 / 角色 的分段控件 */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-inset);
+  align-self: flex-start;
+}
+
+.seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  padding: 6px 18px;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.seg-btn:hover {
+  color: var(--fg);
+}
+
+.seg-btn.active {
+  background: var(--bg);
+  color: var(--fg);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* 人格卡列表 */
+.persona-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.persona-pick {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+}
+
+.persona-pick:hover {
+  border-color: var(--fg-faint);
+}
+
+.persona-pick.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+}
+
+.persona-pick .name {
+  font-weight: 600;
+  /*
+   * 名字必须能收缩 + 省略。
+   *
+   * 这一行现在有三段（名字、范围标签、字数），侧栏只有 300 来像素。
+   * 不给 name 加 min-width: 0 的话，flex 项的默认最小尺寸是内容宽度，
+   * 结果每段都保持自己的宽度，整个盒子被撑爆 —— 表现就是
+   * "默认人格"四个字竖着排成一列。
+   */
+  flex: 1;
+  min-width: 0;
+  /* 名字太长就换行，别裁 —— 裁掉之后用户分不清哪张是哪张 */
+  overflow-wrap: anywhere;
+}
+
+/* 标签和字数不参与压缩，永远保持一行 */
+.persona-pick .tag,
+.persona-pick .muted {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* 行尾的「副本」「删除」也不许被挤成两行 */
+.persona-row > .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.btn-ghost:hover {
+  color: var(--fg);
+  border-color: var(--fg-faint);
+}
+
+.btn-danger:hover {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+/* API Key 编辑器 */
+.key-editor .text-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.key-editor .text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.key-editor .row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.key-editor .small {
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+/* 模型设置页：字段行 */
+.field-row {
+  margin-bottom: 14px;
+}
+
+.field-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  margin-bottom: 5px;
+}
+
+.field-control .text-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.field-control .text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 说明文字：写"填错会怎样"，比 placeholder 有用 */
+.field-hint {
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--fg-faint);
+  white-space: pre-wrap;
+}
+
+.field-control .row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.ok {
+  color: var(--ok);
+}
+
+.err {
+  color: var(--err);
+}
+
+/* 向导式区块标题 */
+.step-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 8px;
+  letter-spacing: 0.3px;
+}
+
+.step-gap {
+  height: 18px;
+  border-top: 1px dashed var(--border);
+  margin: 14px 0 12px;
+}
+
+/* 下拉框长得像输入框 */
+select.text-input {
+  appearance: none;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg-dim) 50%),
+    linear-gradient(135deg, var(--fg-dim) 50%, transparent 50%);
+  background-position: calc(100% - 16px) calc(50% + 1px), calc(100% - 11px) calc(50% + 1px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 28px;
+}
+
+/* 提供商卡片切换 */
+.provider-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.provider-card {
+  display: block;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.provider-card:hover {
+  border-color: var(--fg-faint);
+}
+
+/* 选中态用边框 + 左侧色条，不只靠颜色差：
+   只靠背景色差在低对比度下看不出来 */
+.provider-card.active {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+}
+
+.provider-card-name {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.provider-card-url {
+  font-size: 10px;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-card-note {
+  font-size: 10px;
+  color: var(--fg-faint);
+  margin-top: 3px;
+}
+
+/* 卡片下面紧随的字段，缩进一点表示从属关系 */
+.step-inner {
+  margin-top: 12px;
+}
+
+/* DSH 接入页：说明块 */
+.dsh-note {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--bg);
+}
+
+.dsh-note-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+
+.dsh-note-line {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--fg);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 带复选框的一行 */
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.check-line input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+
+/* ================================================================
+   新增页面样式（数据总览 / 词元消耗 / 工具记忆 / 插件设置）
+   ================================================================ */
+
+/* 词元消耗：表格里的数字列不必换行 */
+.mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 数据总览：状态卡里的药丸之间要有呼吸，别贴在一起 */
+.metric .row.wrap {
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+/* 工具记忆：工具名 + 描述两行，描述要压住行高 */
+.card table td .field-hint {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+/* 插件设置：每行是个卡片式条目，按钮不要被文字挤走 */
+.card .msg .row-between {
+  align-items: center;
+}
+
+.card .msg .row-between > .grow {
+  min-width: 0;
+}
+
+/* 会话总览：左侧会话列表限高，避免长列表把整页撑开 */
+.split .card .list {
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+/* 词元消耗：时间范围按钮在窄屏要能换行 */
+.segmented {
+  flex-wrap: wrap;
+}
+
+/* 通用：表格在小屏可横向滚动，别把字挤成竖排 */
+.card {
+  overflow-x: auto;
+}
+
+/* 应用图标卡片 */
+.icon-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.icon-row:last-of-type {
+  border-bottom: none;
+}
+
+.icon-row-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.icon-row > .row {
+  flex: none;
+}
+
+/* 尺寸要求行：名称 + 规格说明 */
+.spec-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.spec-label {
+  flex: none;
+  width: 96px;
+  color: var(--fg-dim);
+}
+
+.spec-value {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

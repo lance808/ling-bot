@@ -1,0 +1,73 @@
+# 依赖与构建产物
+node_modules/
+dist/
+release/
+out/
+
+# 运行期数据（**绝不上传**）
+data/
+*.log
+*.tmp
+logs/
+
+# 本机配置与凭据 —— 永远不要提交
+# 注意：真实配置在 userData 目录（%APPDATA%\Ling-bot），本不该出现在仓库里；
+# 这几行是纵深防御：万一有人把配置拷进仓库，git 会直接忽略。
+config.json
+secrets.json
+*.secret
+.env
+.env.*
+state/
+usage.jsonl
+persona.json
+
+# 编辑器与本机杂项
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 开发文档：设计过程与决策记录，只留在本地，不进公开仓库。
+#
+# 为什么整目录排除而不是挑几份：
+#   · 它记录的是"我当时怎么想的"，包括踩过的坑和走过的弯路；
+#   · 里面必然出现本机路径、真实环境细节、以及对外部项目的评价；
+#   · 逐一脱敏的成本远高于它的公开价值 —— 而这些内容对作者本人的价值
+#     又是最高的，所以删掉更不对。结论：留本地。
+#
+# 注意：这一整目录被排除后，仍**必须**保证仓库里没有任何地方引用它，
+# 否则 README 会指向不存在的文件（check.mjs 会因此变红）。
+开发文档/
+
+# 私人笔记（历史上从未入库，这里再挡一层）
+开发文档/参考项目.txt
+开发文档/用户的突发奇想.txt
+开发文档/*.txt
+
+# 构建产物：可随时用 npm run build:exe 重新生成，不进仓库。
+#
+# 用 *.exe 通配而不是逐个列：列名字总会漏（上次就漏了 Ling-bot-console.exe）。
+# launcher/ 下是 C# 源码，不是产物，不要被这条误伤。
+build/
+*.exe
+!launcher/**
+launcher-error.log
+
+# 凭据保险箱（DPAPI 密文，换账户就废，但也不该进仓库）
+secret.vault
+*.vault
+
+# 界面截图（写 review 用，不是产物）
+.shots/
+
+# 临时产物（启动日志、图标比对、探针脚本等，一律不留）
+.tmp-start.*
+.tmp-*/
+.tmp-*
+!role.json
+
+# 图标生成的中间产物（脚本可随时重跑，只保留 assets/ 下的成品）
+assets/*-report.txt
+assets/*-x[0-9]*.png
+

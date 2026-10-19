@@ -1,0 +1,40 @@
+{
+  "onebot": {
+    "wsUrl": "ws://127.0.0.1:3001",
+    "accessToken": "",
+    "followDiscoveredEndpoint": true
+  },
+  "llm": {
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "apiKey": "",
+    "timeoutMs": 120000
+  },
+  "allow": {
+    "groups": [],
+    "private": []
+  },
+  "deny": {
+    "groups": [],
+    "private": []
+  },
+  "allowAllWhenEmpty": false,
+  "limits": {
+    "maxSendPerMinute": 8,
+    "maxSendPerHour": 60
+  },
+  "proactive": {
+    "enabled": true,
+    "probability": 0.1,
+    "minIntervalMs": 1800000,
+    "activeWindowMs": 1800000
+  },
+  "tools": {
+    "roots": [],
+    "allowR3": false
+  },
+  "ui": {
+    "language": "zh-CN",
+    "minimizeToTray": true
+  }
+}

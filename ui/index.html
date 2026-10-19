@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self';"
+    />
+    <title>Ling-bot</title>
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/pages.css" />
+    <script src="./src/theme-boot.js"></script>
+  </head>
+  <body>
+    <div id="app" class="app">
+      <aside class="sidebar">
+        <div class="brand">Ling-bot</div>
+        <nav id="nav" class="nav"></nav>
+        <div class="sidebar-foot">
+          <!--
+            「重连 QQ / 重启后端」放左下角，主题切换移到顶栏。
+
+            理由：这两个是"救场"按钮，出问题时才点，属于全局操作而不是
+            当前页面的操作，放侧栏底部比挤在顶栏右边更不容易误点；
+            主题切换则是随时想切就切，放顶栏更顺手。
+          -->
+          <div class="sidebar-actions">
+            <button id="btn-reconnect" class="btn btn-sm" type="button">重连 QQ</button>
+            <button id="btn-restart" class="btn btn-sm" type="button">重启后端</button>
+          </div>
+          <div class="env-info" id="env-info"></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="grow">
+            <h1 id="page-title">数据总览</h1>
+            <div class="topbar-sub" id="page-sub"></div>
+          </div>
+          <div class="topbar-actions">
+            <div class="theme-switch" id="theme-switch" role="group" aria-label="主题">
+              <button type="button" data-theme-set="light">亮</button>
+              <button type="button" data-theme-set="dark">暗</button>
+            </div>
+          </div>
+        </header>
+        <section id="view" class="view"></section>
+        <div id="confirm-host"></div>
+        <div id="toast" class="toast" hidden></div>
+      </main>
+    </div>
+    <script type="module" src="./src/app.mjs"></script>
+  </body>
+</html>

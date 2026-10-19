@@ -1,0 +1,27 @@
+# dsh-qq-bridge bundle patch.
+#
+# 一条 insert 把 host 半身挂进 profile。
+#
+# ⚠️ entry 的 **id 必须是 `dsh-qq-bridge`**（= 包名 = settings 命名空间名），
+# 不是别的写法。DSH 0.2.0 起命名空间完全由 loader entry 的 id 推导
+# （dsh-settings 的 configEditor.entries().find(row => row.options.id === ns)），
+# 写成别的会让 settings.update({ns:'dsh-qq-bridge'}) 永远抛
+# `No configurable plugin entry "dsh-qq-bridge"`。
+#
+# 所有字段留空 = 未设置 = 不启用对应能力。
+# 这样「没装这个插件」和「装了但没配」的行为完全一致，功能是纯增量的。
+- insert:
+    - id: dsh-qq-bridge
+      name: dsh-qq-bridge
+      config:
+        # 桥进程的 HTTP 地址（Ling-bot 侧往这里送指令、收审批结果）
+        bridgeUrl: ''
+        # 与桥进程约定的共享令牌。空 = 不启动桥连接（插件静默待命）
+        bridgeToken: ''
+        # 允许通过 QQ 控制 DSH 的管理员 QQ 号（逗号分隔）。空 = 一个都不允许
+        admins: ''
+        # 是否把工具审批请求推到 QQ。false = 完全不接管审批（走 DSH 默认）
+        relayApprovals: false
+        # QQ 不可达时：'delegate' 立刻交还默认处理（推荐，fail-open 到 DSH 自己的策略）
+        #             'deny' 直接判拒绝（更严，但 QQ 掉线会让你做不了事）
+        onUnreachable: ''

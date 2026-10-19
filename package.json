@@ -1,0 +1,32 @@
+{
+  "name": "ling-bot",
+  "version": "0.1.0-p0",
+  "private": true,
+  "description": "Ling-bot —— 独立的 QQ 机器人桌面端（只借 SnowLuma 的 OneBot 接入面）",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "engines": {
+    "node": ">=24.22.0 <25"
+  },
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "dev": "node scripts/start.mjs --dev",
+    "backend": "node src/index.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "e2e:llm": "node scripts/llm-e2e.mjs",
+    "e2e:real": "node scripts/e2e-real.mjs",
+    "e2e:ui": "node scripts/ui-e2e.mjs",
+    "live": "node scripts/live-probe.mjs",
+    "live:llm": "node scripts/live-llm.mjs",
+    "scan:secrets": "node scripts/scan-secrets.mjs",
+    "preflight": "node scripts/preflight.mjs",
+    "build:exe": "node scripts/build-launcher.mjs",
+    "test:exe": "node scripts/test-launcher.mjs",
+    "verify:node": "node scripts/verify-node.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.9.0"
+  }
+}

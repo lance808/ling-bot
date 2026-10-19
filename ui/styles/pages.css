@@ -585,3 +585,431 @@ select.text-input {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+
+/* ================================================================
+   右侧「思考链路」面板
+   ================================================================
+
+   面板是 .app 网格的第三列（不是绝对定位），所以它永远不会压到
+   #confirm-host 上 —— 高风险工具的确认条必须永远点得到。
+   这一点不能只靠 z-index：z-index 是"谁画在上面"，而不同列是
+   "根本不在同一块地方"，后者才是不会翻车的保证。
+
+   配色只用 var(--...)：亮暗两套主题都是同一组语义令牌，
+   面板里出现任何硬编码色值，换主题时就会有一块不跟着变。
+   ================================================================ */
+
+.think-panel {
+  width: var(--think-w);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev);
+  border-left: 1px solid var(--border);
+  /* 宽度变化给一点过渡：收起/展开是用户主动操作，瞬间跳变显得廉价 */
+  transition: width 0.16s ease;
+  overflow: hidden;
+}
+
+.think-panel.is-collapsed {
+  width: var(--think-w-rail);
+}
+
+/* ---------------------------------------------------------- 收起态竖边 */
+
+.think-rail {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.think-rail-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-family: inherit;
+  transition:
+    background-color 0.14s ease,
+    color 0.14s ease;
+}
+
+.think-rail-btn:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+/* 朝向内容的箭头：只写竖排文字的话，用户不确定这块能不能点 */
+.think-rail-arrow {
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+/*
+ * 竖排文字：横向 34px 放不下"思考链路"四个字。
+ * vertical-rl 是唯一能让中文竖着读还符合阅读习惯的写法。
+ */
+.think-rail-text {
+  writing-mode: vertical-rl;
+  font-size: 12px;
+  letter-spacing: 2px;
+  line-height: 1.4;
+}
+
+.think-rail-count {
+  font-size: 10px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+  writing-mode: vertical-rl;
+}
+
+/* ---------------------------------------------------------- 展开态骨架 */
+
+.think-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.think-head {
+  flex: none;
+  padding: 13px 13px 11px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.think-head-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.think-title {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.3px;
+  color: var(--fg);
+}
+
+.think-count {
+  flex: none;
+  font-size: 11px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.think-fold {
+  flex: none;
+  width: 21px;
+  height: 21px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-faint);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+.think-fold:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+/* 会话筛选：两个短标签，不用下拉 —— 只有两个选项时下拉要多点一次 */
+.think-seg {
+  display: flex;
+  gap: 3px;
+  margin-top: 9px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+}
+
+.think-seg button {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+.think-seg button:hover:not(:disabled) {
+  color: var(--fg);
+}
+
+.think-seg button[aria-pressed='true'] {
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+.think-seg button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---------------------------------------------------------- 滚动区 */
+
+.think-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 9px 12px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+/* 细滚动条：整条 10px 宽在这么窄的面板里会吃掉 1/3 的正文宽度 */
+.think-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.think-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 0;
+  border-radius: 999px;
+}
+
+.think-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-faint);
+}
+
+/* ---------------------------------------------------------- 日期分组 */
+
+.think-day {
+  display: flex;
+  flex-direction: column;
+}
+
+.think-day-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 2px 2px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-faint);
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.6px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.think-day-head:hover {
+  color: var(--fg-dim);
+}
+
+.think-day-arrow {
+  flex: none;
+  width: 9px;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.think-day-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.think-day-count {
+  flex: none;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.think-day-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ---------------------------------------------------------- 回合条目 */
+
+.think-entry {
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+}
+
+.think-entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.think-time {
+  flex: none;
+  font-size: 11px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 会话名要给 time 让位：群号很长时宁可省略，也别把时间挤成两行 */
+.think-conv {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------- 单步思考 */
+
+.think-step + .think-step {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.think-step-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+
+.think-step-n {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.think-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.think-tool {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg-faint);
+  font-family: 'Cascadia Code', 'Consolas', 'SF Mono', monospace;
+  font-size: 10px;
+  line-height: 1.55;
+  white-space: nowrap;
+}
+
+/* 点正文展开全文。用 role=button + tabindex，键盘也能操作 */
+.think-reason-wrap {
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.think-reason-wrap:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
+ * 默认三行截断。
+ *
+ * -webkit-line-clamp 需要配合 display:-webkit-box 才生效。
+ * 客户端固定是 Chromium，不需要考虑前缀之外的情况。
+ */
+.think-reason {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.62;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  transition: color 0.12s ease;
+}
+
+.think-reason-wrap:hover .think-reason {
+  color: var(--fg);
+}
+
+/* 展开后要恢复正常流式布局，否则 pre-wrap 的换行会被 -webkit-box 吃掉 */
+.think-reason.is-open {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+}
+
+.think-answer {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--fg-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------- 空态 */
+
+.think-empty {
+  margin-top: 6px;
+  padding: 20px 13px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+}
+
+.think-empty-title {
+  margin-bottom: 5px;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+.think-empty-hint {
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--fg-faint);
+  text-align: left;
+}

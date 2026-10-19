@@ -27,6 +27,7 @@ import { renderDsh } from './views/dsh.mjs';
 import { renderUsage } from './views/usage.mjs';
 import { renderTools } from './views/tools.mjs';
 import { renderPlugins } from './views/plugins.mjs';
+import { renderThinkingPanel } from './views/thinking.mjs';
 
 /**
  * @typedef {object} Page
@@ -78,6 +79,29 @@ const local = {
   lastTurnError: null,
   /** 词元页的时间范围选择 */
   usageRange: '24h',
+  /*
+   * 右侧思考面板的界面状态。
+   *
+   * 必须活在模块作用域：快照每 2 秒轮询并整页重建 DOM，
+   * 任何存在 DOM 上的状态（class / dataset / 展开的正文）都会在两秒后
+   * 被打回原样 —— 表现成"刚展开，它自己折回去了"。
+   *
+   *   collapsed   整块面板是否收起（只剩一条竖边）
+   *   filter      'all' | 'current'：看全部会话还是只看当前会话
+   *   expanded    展开全文的步骤 key 集合（key 形如 "<at>#<convKey>#<n>"）
+   *   closedDays  被折起来的日期分组（默认全展开，所以记"关掉的"更省）
+   *
+   * 滚动位置**不在这里**：它必须每一帧从真实 DOM 上现取，
+   * 存成模块状态反而会拿到上一次的值（见 paintThinkPanel）。
+   */
+  think: {
+    collapsed: false,
+    filter: 'all',
+    /** @type {Set<string>} */
+    expanded: new Set(),
+    /** @type {Set<string>} */
+    closedDays: new Set(),
+  },
 };
 
 const nav = /** @type {HTMLElement} */ (document.getElementById('nav'));
@@ -88,6 +112,12 @@ const toastEl = /** @type {HTMLElement} */ (document.getElementById('toast'));
 
 /** 确认条挂载点：独立于页面内容，切页不消失 */
 const confirmHost = /** @type {HTMLElement} */ (document.getElementById('confirm-host'));
+
+/** 右侧思考面板挂载点（它是 .app 的第三列，不在 .main 里） */
+const thinkPanel = /** @type {HTMLElement} */ (document.getElementById('think-panel'));
+
+/** 顶栏的开启/收起按钮 */
+const thinkToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById('btn-think'));
 
 /* ---------------------------------------------------------------- 主题 */
 
@@ -110,6 +140,179 @@ for (const btn of document.querySelectorAll('#theme-switch button')) {
   });
 }
 syncThemeButtons();
+
+/* ---------------------------------------------------------------- 思考面板 */
+
+/**
+ * 面板收起/展开。
+ *
+ * 顶栏按钮和面板自己的折叠按钮都走这里，两条入口必须同步 ——
+ * 否则会出现"面板已经收起了，顶栏按钮还亮着"的错位。
+ *
+ * @param {boolean} collapsed
+ */
+function setThinkCollapsed(collapsed) {
+  local.think.collapsed = collapsed === true;
+  // 收起时把展开的正文留在 expanded 里：用户再展开时还能接着看
+  refreshThinkOnly();
+}
+
+/**
+ * 只刷新右侧面板，不动页面内容。
+ *
+ * ## 为什么不能直接调 render()
+ *
+ * render() 有输入保护：用户正在页面里打字的时侯它整页跳过，
+ * 面板就跟着一起冻住 —— 表现成"我在填密钥，右边思考链路不更新了"，
+ * 以及更糟的一种"点了展开没反应"。
+ *
+ * 面板和页面是两块独立的区域：页面的输入状态不该限制面板重绘。
+ * 所以面板自己的交互 + 每轮轮询都走这个入口。
+ */
+function refreshThinkOnly() {
+  paintThinkPanel(getState());
+  syncThinkToggle();
+}
+
+/**
+ * 当前会话。
+ *
+ * 优先级：会话总览里选中的那个 > 正在进行的回合 > 没有。
+ * 用"选中的"优先是因为用户点了某个会话就是在看它，
+ * 此时在途回合很可能是别的群来的消息。
+ *
+ * @param {any} state
+ * @returns {string}
+ */
+function currentConvOf(state) {
+  const selected = state.selectedConv;
+  if (typeof selected === 'string' && selected) return selected;
+  if (local.turn && typeof local.turn.convKey === 'string') return local.turn.convKey;
+  return '';
+}
+
+/**
+ * 挂载/刷新右侧思考面板。
+ *
+ * ## 滚动位置保护（这里是整个面板最容易做错的地方）
+ *
+ * 快照每 2 秒回来一次，面板会被整块重建。如果不做保护：
+ *   - 用户正读到中间，两秒后 DOM 被换掉，scrollTop 归零 → 跳回顶部
+ *   - 想"跟随最新"就一律滚到底，于是用户往上翻的时候被强行拽回去
+ *
+ * 做法：**重建前**从旧 DOM 上读 scrollTop / scrollHeight，
+ * 判断此刻是不是"贴着底"（用户没有手动上翻），重建后再恢复。
+ *
+ * 为什么不能把 scrollTop 存进 local：轮询发生在任意时刻，
+ * 存下来的值会晚一拍，滚动期间会累积偏差。
+ */
+function paintThinkPanel(state) {
+  if (!thinkPanel) return;
+
+  const shell = thinkPanel.querySelector('.think-scroll');
+  const prevTop = shell ? shell.scrollTop : 0;
+  const prevHeight = shell ? shell.scrollHeight : 0;
+  const prevClient = shell ? shell.clientHeight : 0;
+  // 贴底判定留 24px 容差：分数像素和滚动条圆角会让 exact 比较永远为 false
+  const wasAtBottom = prevHeight <= prevClient + 24 || prevTop + prevClient >= prevHeight - 24;
+
+  /*
+   * 记住焦点在哪一条。
+   *
+   * 面板里的正文是可聚焦的（tabindex=0），重建会把焦点节点一起丢掉。
+   * 不恢复的话，键盘用户按一次回车展开、焦点就掉回 body，
+   * 再按 Tab 要重新从侧栏走一遍 —— 用起来非常难受。
+   */
+  const active = document.activeElement;
+  const focusKey =
+    active instanceof HTMLElement && thinkPanel.contains(active)
+      ? (active.dataset?.thinkKey ?? (active.dataset?.thinkDay ? `day:${active.dataset.thinkDay}` : ''))
+      : '';
+
+  clear(thinkPanel);
+  thinkPanel.classList.toggle('is-collapsed', local.think.collapsed === true);
+
+  const node = renderThinkingPanel(state.snapshot, {
+    currentConv: currentConvOf(state),
+    ui: local.think,
+    onCollapse: (v) => setThinkCollapsed(v),
+    onFilter: (f) => {
+      local.think.filter = f;
+      refreshThinkOnly();
+    },
+    onToggleStep: (key) => {
+      if (!(local.think.expanded instanceof Set)) local.think.expanded = new Set();
+      if (local.think.expanded.has(key)) local.think.expanded.delete(key);
+      else local.think.expanded.add(key);
+      refreshThinkOnly();
+    },
+    onToggleDay: (date) => {
+      if (!(local.think.closedDays instanceof Set)) local.think.closedDays = new Set();
+      if (local.think.closedDays.has(date)) local.think.closedDays.delete(date);
+      else local.think.closedDays.add(date);
+      refreshThinkOnly();
+    },
+  });
+
+  thinkPanel.append(node);
+
+  /*
+   * 恢复滚动。
+   *
+   * 三种情况：
+   *   1. 用户本来就贴着底 → 继续贴底（新内容来了自然跟上）
+   *   2. 用户往上翻了 → 原样恢复他的位置，**绝不**拽回底部
+   *   3. 内容变短了（比如切了筛选）→ 旧位置越界，scrollTop 会被浏览器夹到最大值
+   *
+   * 这里**不加** scrollHeight 的差值。面板内容是「旧的在上、新的在下」，
+   * 新回合只会从底部追加；追加不移动上面的内容，所以保持同一个
+   * scrollTop 就是保持用户眼前那一段不动。加上差值反而会把他往下推。
+   */
+  const next = thinkPanel.querySelector('.think-scroll');
+  if (next) {
+    if (wasAtBottom) next.scrollTop = next.scrollHeight;
+    else next.scrollTop = prevTop;
+  }
+
+  if (focusKey) {
+    const again = next?.querySelector(`[data-think-key="${cssEscape(focusKey)}"]`);
+    again?.focus?.();
+  }
+}
+
+/**
+ * 把任意字符串塞进属性选择器前的转义。
+ *
+ * key 里带 `#` 和 `:`（`<at>#<convKey>#<n>`），不转义会被选择器当成
+ * id / 伪类解析 —— 直接抛错，或者更糟，匹配到别的元素。
+ *
+ * @param {string} value
+ */
+function cssEscape(value) {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(value);
+  return String(value).replace(/["\\]/g, '\\$&');
+}
+
+/**
+ * 把顶栏开关的按下状态同步成面板的真实状态。
+ *
+ * 抽出成函数是因为它有两条调用路径（整页重绘、以及输入保护下的
+ * 只刷新面板）。两处各写一遍，早晚会漂移成一边亮一边灭。
+ */
+function syncThinkToggle() {
+  if (!thinkToggle) return;
+  thinkToggle.setAttribute('aria-pressed', local.think.collapsed === true ? 'false' : 'true');
+}
+
+/**
+ * 顶栏开关。
+ *
+ * 用的是"当前状态取反"而不是读 aria-pressed：aria 是渲染产物，
+ * 在重绘之间可能与 local 短暂不一致，拿它当输入会让连点两下卡住。
+ */
+thinkToggle?.addEventListener('click', () => {
+  setThinkCollapsed(!local.think.collapsed);
+});
 
 /* ---------------------------------------------------------------- 导航 */
 
@@ -527,10 +730,13 @@ function render() {
    * **还在同一页且焦点在输入框里**就跳过整页重建。
    *
    * 只跳过视图重建，导航高亮、标题、主题按钮这些仍然更新——
-   * 它们不会毁掉输入状态。
+   * 它们不会毁掉输入状态。右侧思考面板同理：它不在 #view 里，
+   * 重建它不会碰到任何输入框，所以**也要照常刷新** ——
+   * 否则用户在填密钥时右边就冻住了。
    */
   const pageChanged = lastRenderedPage !== page.id;
   if (!pageChanged && (isEditing() || activeOps > 0)) {
+    refreshThinkOnly();
     syncThemeButtons();
     return;
   }
@@ -711,6 +917,13 @@ function render() {
   } else {
     toastEl.hidden = true;
   }
+
+  /*
+   * 思考面板在确认条之后挂载：两者是不同网格列，互不遮挡；
+   * 顺序只影响"先算谁"，放后面是为了让主视图先出现在屏幕上。
+   */
+  paintThinkPanel(s);
+  syncThinkToggle();
 
   syncThemeButtons();
 }

@@ -26,6 +26,7 @@ import os from 'node:os';
  * @property {string} vaultPath 加密后的凭据（DPAPI，绑定当前 Windows 账户）
  * @property {string} personaPath 人格卡：它是谁
  * @property {string} rolePath 角色卡：它在什么场景扮演什么
+ * @property {string} thinkingDir 思考链路的按日归档目录
  * @property {string} pluginsDir
  */
 
@@ -51,6 +52,13 @@ export function resolvePaths(root) {
     personaPath: path.join(resolvedRoot, 'persona.json'),
     /** 角色卡：它在什么场景扮演什么（与人格正交，各自独立切换） */
     rolePath: path.join(resolvedRoot, 'role.json'),
+    /**
+     * 思考链路归档：一天一个 `<YYYY-MM-DD>.json`。
+     *
+     * 单独一个目录而不是塞进 state/：它纯属可丢弃的展示数据，
+     * 清理能力（超期/超量自动删）只作用于这里，不会误伤会话与用量。
+     */
+    thinkingDir: path.join(resolvedRoot, 'thinking'),
     /** 插件根目录：每个插件一个子目录，入口 index.mjs */
     pluginsDir: path.join(resolvedRoot, 'plugins'),
   };

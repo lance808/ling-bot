@@ -36,6 +36,7 @@ import { runTurn, truncationNotice } from './llm/agent-loop.mjs';
 import { detectTrigger, decideProactive, isStrongTrigger, TriggerLedger } from './llm/triggers.mjs';
 import { UsageLedger } from './llm/usage.mjs';
 import { PersonaStore, RoleStore } from './llm/persona.mjs';
+import { ThinkingStore } from './llm/thinking.mjs';
 import { sealSecret, openSecret, isVaultAvailable } from './config/vault.mjs';
 import { probeVision, probeImageGen, describeCatalog, inferChannel } from './llm/capability.mjs';
 import { unlink as fsUnlink } from 'node:fs/promises';
@@ -101,6 +102,14 @@ const personaStore = new PersonaStore({ filePath: paths.personaPath });
  */
 const roleStore = new RoleStore({ filePath: paths.rolePath });
 
+/**
+ * 思考链路仓库：推理模型的 `reasoning` 按「会话 + 日」归档，只给界面看。
+ *
+ * 它是**纯展示数据**：不进任何一次请求的 messages（回灌 reasoning 会被上游 400），
+ * 也不参与授权与记账。所以它挂了、满了、被清了都不影响对话本身。
+ */
+const thinkingStore = new ThinkingStore({ dir: paths.thinkingDir });
+
 /* ---------------------------------------------------------------- 启动 */
 
 async function boot() {
@@ -146,6 +155,23 @@ async function boot() {
   persona = (await loadPersona()) || DEFAULT_PERSONA;
   // 角色和人格各载各的，互不影响
   await loadRole();
+
+  /*
+   * 读回近期思考记录。
+   *
+   * 失败不致命：这只影响"重启前的历史还能不能看到"，对话本身完全不依赖它。
+   * 但也不能静默吞 —— 记一条 warn，否则用户会以为思考记录凭空消失了。
+   */
+  try {
+    const loaded = await thinkingStore.load();
+    if (loaded.removed > 0) {
+      log.info('思考记录已按保留策略清理', { keptDays: loaded.loaded, removed: loaded.removed });
+    }
+  } catch (err) {
+    log.warn('读取思考记录失败（不影响对话）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
 
   // LLM 客户端：没配 key 也照常构造，只是 configured=false，界面据此提示
   llm = new LlmClient({
@@ -489,6 +515,13 @@ async function startTurn(convKey, job) {
 
     turnText = result.text ?? '';
 
+    /*
+     * 思考归档放在"是否发出回复"之前：它记的是「它想了什么」，
+     * 与这条回复最终发没发出去无关。取消的回合也有思考过程，一并留下。
+     * 没有 reasoning 时 record() 会直接返回 null（静默降级，不建空记录）。
+     */
+    recordThinking(convKey, result);
+
     const notice = truncationNotice(result);
     let reply = (result.text ?? '').trim();
 
@@ -533,6 +566,34 @@ async function startTurn(convKey, job) {
       pendingTurns.delete(convKey);
       void startTurn(convKey, next);
     }
+  }
+}
+
+/**
+ * 把一回合的思考记进仓库。
+ *
+ * 为什么单独抽一个函数：这里要吃掉所有异常。归档是纯展示数据，
+ * 磁盘满 / 权限不对都不该让一次已经成功的对话变成"回合失败"。
+ *
+ * @param {string} convKey
+ * @param {{thinkingTrace?: object[], text?: string}} result
+ */
+function recordThinking(convKey, result) {
+  try {
+    const steps = result?.thinkingTrace ?? [];
+    // 非推理模型：整段没有 reasoning，静默降级（不写文件、不建空记录）
+    if (!Array.isArray(steps) || steps.length === 0) return;
+    thinkingStore.record({
+      convKey,
+      at: Date.now(),
+      steps,
+      answerPreview: String(result?.text ?? '').slice(0, 200),
+    });
+  } catch (err) {
+    log.warn('思考记录写入失败（不影响对话）', {
+      convKey,
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
   }
 }
 
@@ -838,6 +899,8 @@ const rpc = {
             config: null,
             lastError,
             booting: true,
+            // 形状与正常快照一致：界面不必为"启动中"再写一条分支
+            thinking: { days: [], total: 0 },
           };
         }
         return {
@@ -860,6 +923,25 @@ const rpc = {
            */
           personaCards: personaStore.view([...recentByConv.keys()]),
           roleCards: roleStore.view([...recentByConv.keys()]),
+          /*
+           * 思考链路（只给界面看）。
+           *
+           * 形状被前端锁定，改之前先对齐：
+           *   { days: [{ date, entries: [{ at, convKey, steps: [
+           *              { n, reasoning, tools, answerPreview } ] }] }], total }
+           *
+           * 默认给"全部会话"——后端不知道界面当前在看哪个会话，
+           * 而多给不会出错、少给会让面板空着。界面若要只看当前会话，
+           * 可以带 params.convKey 来收窄（这里已经支持，传 null/不传即全部）。
+           *
+           * 每次快照都现算一份拷贝：界面拿到的是快照时刻的视图，
+           * 不会因为后续 record() 而在手里悄悄变。
+           */
+          thinking: thinkingStore.view({
+            convKey: params?.convKey ? String(params.convKey) : null,
+            days: 1,
+            limit: 50,
+          }),
           config: publicConfig(),
           lastError,
           brain: {
@@ -922,6 +1004,27 @@ const rpc = {
         }
         if (name === 'confirm.resolve') {
           return resolveConfirm(arg.id, arg.allow === true);
+        }
+        /*
+         * 思考链路。两个动作都很克制：只清当天、只导当前视图。
+         *
+         * 没有做 `thinking.clearAll`：那是一条不可撤销的批量删除，
+         * 而它的价值（省一次点击）远小于误触的代价。
+         */
+        if (name === 'thinking.clear') {
+          const r = await thinkingStore.clearDay(arg?.date);
+          log.info('思考记录已清空', { date: r.date, removed: r.removed });
+          return { ok: true, date: r.date, removed: r.removed };
+        }
+        if (name === 'thinking.export') {
+          // 导出成 JSON 文本交回界面（本机复制/另存），后端不直接写用户目录：
+          // 写哪由用户决定，后端只负责把数据原样给出。
+          const view = thinkingStore.view({
+            convKey: arg?.convKey ? String(arg.convKey) : null,
+            days: Number(arg?.days) > 0 ? Number(arg.days) : thinkingStore.maxDays,
+            limit: 500,
+          });
+          return { ok: true, total: view.total, json: JSON.stringify(view, null, 2) };
         }
         /*
          * 角色动作和人格动作完全对称。
@@ -1499,6 +1602,18 @@ rl.on('line', async (line) => {
 async function shutdown(code) {
   log.info('后端正在退出', { code });
   client?.close();
+  /*
+   * 退出前显式落盘一次。
+   *
+   * record() 是内存写入 + 防抖落盘，只靠那个定时器的话，
+   * 进程正常退出时最后一条思考会丢（定时器还没到点就被 exit 掐了）。
+   * 这里失败也不能拦住退出 —— 少一条展示数据不值得让进程卡死。
+   */
+  try {
+    await thinkingStore.flush();
+  } catch {
+    /* 已尽力 */
+  }
   process.exit(code);
 }
 

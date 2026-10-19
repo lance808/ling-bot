@@ -173,8 +173,9 @@ export class LlmClient {
    * @param {object[]} [req.tools] OpenAI 兼容的 function tools
    * @param {AbortSignal} [req.signal] 外部中断信号（界面「停止」）
    * @param {(delta: string) => void} [req.onDelta] 逐块回调（只给界面看）
+   * @param {(delta: string) => void} [req.onReasoningDelta] 思考内容逐块回调（**只给界面看**）
    * @param {boolean} [req.proactive] 主动回合标记（记账用）
-   * @returns {Promise<{text: string, toolCalls: object[], usage: object, model: string, cancelled: boolean}>}
+   * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], usage: object, model: string, cancelled: boolean}>}
    */
   async chat(req) {
     let lastErr = null;
@@ -188,7 +189,7 @@ export class LlmClient {
         lastErr = e;
         // 用户主动中断：不重试，直接返回已收内容
         if (e.code === 'E3010') {
-          return { text: '', toolCalls: [], usage: emptyUsage(), model: this.#opts.model, cancelled: true };
+          return cancelledResult(this.#opts.model);
         }
         if (!e.retryable || i === attempts - 1) break;
         // 退避：1s → 2s
@@ -200,7 +201,7 @@ export class LlmClient {
 
   /**
    * @param {object} req
-   * @returns {Promise<{text: string, toolCalls: object[], usage: object, model: string, cancelled: boolean}>}
+   * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], usage: object, model: string, cancelled: boolean}>}
    */
   async #once(req) {
     // 外部中断与超时合并成一个信号
@@ -233,7 +234,7 @@ export class LlmClient {
     } catch (err) {
       const e = /** @type {any} */ (err);
       if (req.signal?.aborted) {
-        return { text: '', toolCalls: [], usage: emptyUsage(), model: this.#opts.model, cancelled: true };
+        return cancelledResult(this.#opts.model);
       }
       if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
         throw new LlmError(`模型 ${this.#opts.timeoutMs}ms 内无响应`, { code: 'E3011', retryable: true });
@@ -254,18 +255,46 @@ export class LlmClient {
       });
     }
 
-    return parseSse(res, req.onDelta, this.#opts.model);
+    return parseSse(res, req.onDelta, this.#opts.model, req.onReasoningDelta);
   }
+}
+
+/**
+ * 中断时的统一返回值。
+ *
+ * @param {string} model
+ */
+function cancelledResult(model) {
+  return {
+    text: '',
+    reasoning: '',
+    toolCalls: [],
+    usage: emptyUsage(),
+    model,
+    cancelled: true,
+  };
 }
 
 /**
  * 解析 SSE 流。
  *
+ * ## 思考内容（reasoning）三条纪律
+ *
+ * 1. **只累积，不回灌**：`reasoning` 是返回值里的一等字段，但绝不允许被上层
+ *    拼进下一次请求的 messages。DeepSeek 官方明确说过不要把 reasoning_content
+ *    传回去（会 400），而且它比正文长得多，回灌会让 token 暴涨。
+ *    本文件只负责"收下来"，怎么用由上层决定（见 agent-loop 的 thinkingTrace）。
+ * 2. **字段名三种都要认**：`reasoning_content`（DeepSeek）、`reasoning`（部分中转）、
+ *    `thinking`（Anthropic 风格）。只认一个的话，换个上游就静默丢光了。
+ *    同一 chunk 里按这个优先级取第一个非空，避免三家都填时内容被重复拼。
+ * 3. **它是分片到达的**：和 content 一样要逐块累积，不能只取最后一次的 chunk。
+ *
  * @param {Response} res
  * @param {((d: string) => void) | undefined} onDelta
  * @param {string} model
+ * @param {((d: string) => void) | undefined} [onReasoningDelta]
  */
-async function parseSse(res, onDelta, model) {
+async function parseSse(res, onDelta, model, onReasoningDelta) {
   if (!res.body) throw new LlmError('模型响应没有 body', { code: 'E3021' });
 
   const reader = res.body.getReader();
@@ -273,6 +302,7 @@ async function parseSse(res, onDelta, model) {
   let buffer = '';
 
   let text = '';
+  let reasoning = '';
   /** @type {Map<number, {id: string, name: string, args: string}>} */
   const toolAcc = new Map();
   let usage = emptyUsage();
@@ -315,6 +345,17 @@ async function parseSse(res, onDelta, model) {
           onDelta?.(delta.content);
         }
 
+        /*
+         * 思考内容可能挂在 delta 上（流式增量），也可能挂在 message 上
+         * （个别中转把整段一次给过来，仍走 SSE 但只发一个 chunk）。
+         * 两处都看，代价可以忽略。
+         */
+        const thinkChunk = pickReasoning(delta) ?? pickReasoning(choice.message);
+        if (thinkChunk) {
+          reasoning += thinkChunk;
+          onReasoningDelta?.(thinkChunk);
+        }
+
         // 工具调用是分片到达的：按 index 累积 name 与 arguments 字符串
         if (Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
@@ -334,7 +375,26 @@ async function parseSse(res, onDelta, model) {
     .sort((a, b) => a[0] - b[0])
     .map(([, v]) => ({ id: v.id, name: v.name, arguments: v.args }));
 
-  return { text, toolCalls, usage, model: usedModel, cancelled: false };
+  return { text, reasoning, toolCalls, usage, model: usedModel, cancelled: false };
+}
+
+/**
+ * 从一坨对象里取思考文本。
+ *
+ * 优先级 `reasoning_content` > `reasoning` > `thinking`：
+ * 取第一个非空而不是全部拼起来 —— 三家上游同时填同一个值时，
+ * 拼起来会把同一段思考存三遍，界面看着像复读。
+ *
+ * @param {any} obj
+ * @returns {string | null}
+ */
+function pickReasoning(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const key of ['reasoning_content', 'reasoning', 'thinking']) {
+    const v = obj[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return null;
 }
 
 /**

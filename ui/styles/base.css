@@ -65,6 +65,18 @@
   --radius-lg: 14px;
   --gap: 16px;
   --sidebar-w: 216px;
+  /*
+   * 右侧思考面板的宽度。
+   *
+   * 它和侧栏不同：侧栏是导航，越窄越省地方；面板里全是正文（思考文本），
+   * 太窄会退化成每行三四个字、三行截断等于什么都没显示。
+   *
+   * 用 clamp 而不是固定值：窗口最小可以拖到 940px，那时 336px 会把
+   * 主内容区挤到 388px（表格要横向滚起来）。26vw 让它随窗口收，
+   * 但下限 284px 保证正文仍然读得下去。
+   */
+  --think-w: clamp(284px, 26vw, 356px);
+  --think-w-rail: 34px;
 }
 
 /* ------------------------------------------------------------ 暗色 */
@@ -190,7 +202,17 @@ body {
 
 .app {
   display: grid;
-  grid-template-columns: var(--sidebar-w) 1fr;
+  /*
+   * 三列：侧栏 / 主区 / 右侧思考面板。
+   *
+   * 第三列用 auto：面板的宽度由它自己的 CSS 决定（展开 --think-w、
+   * 收起 --think-w-rail），中间那列就可以吃掉剩下的全部空间。
+   * 如果这里写死 336px，面板收起后中间会留一道 300px 的空洞。
+   *
+   * 中间列用 minmax(0, 1fr) 而不是 1fr：1fr 的最小尺寸是内容的
+   * min-content，表格一宽就会把面板挤出屏幕。
+   */
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) auto;
   height: 100vh;
   overflow: hidden;
 }

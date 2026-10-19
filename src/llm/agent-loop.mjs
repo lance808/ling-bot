@@ -17,6 +17,13 @@
  *
  * 一律作为独立的 `tool` 角色消息，内容用 wrapToolResult 包起来。
  * **绝不拼进 system prompt** —— 那是把外部内容抬成指令，是最典型的注入路径。
+ *
+ * ## 思考内容（thinkingTrace）
+ *
+ * 推理模型每步返回的 `reasoning` 只累积到 `thinkingTrace` 里随返回值带出，
+ * **绝不进 conversation**：一旦把思考拼回 messages，上游会直接 400
+ * （官方明确禁止回传 reasoning_content），而且 token 会成倍上涨。
+ * 回灌 assistant 消息时只放 `content` 与 `tool_calls`，这是有意的。
  */
 
 import { wrapToolResult } from './prompt.mjs';
@@ -25,12 +32,21 @@ export const MAX_STEPS = 8;
 export const TOOL_BUDGET_MS = 30_000;
 
 /**
+ * 思考预览截到多长。
+ *
+ * 这里刻意留得比落盘上限（thinking.mjs 的 MAX_PREVIEW_CHARS=200）宽：
+ * 预览是"摘要"，具体截断规则归仓库管，这里只负责别把整段正文一直攥在内存里。
+ */
+const PREVIEW_SLICE = 500;
+
+/**
  * @typedef {object} LoopOptions
  * @property {{chat: Function}} llm
  * @property {{availableTools: () => object[], run: (name: string, args: unknown) => Promise<any>}} runner
  * @property {(schema: object) => object} toOpenAiTools
  * @property {AbortSignal} [signal]
  * @property {(delta: string) => void} [onDelta]
+ * @property {(delta: string) => void} [onReasoningDelta] 思考内容逐块回调（只给界面看，不回灌）
  * @property {(info: object) => void} [onToolCall] 每次工具调用的可见通知（界面用）
  * @property {(info: object) => void} [onUsage]
  */
@@ -39,15 +55,19 @@ export const TOOL_BUDGET_MS = 30_000;
  * 跑一回合。
  *
  * @param {LoopOptions & {messages: Array<{role: string, content: string}>, proactive?: boolean}} opts
- * @returns {Promise<{text: string, steps: number, cancelled: boolean, truncated: boolean, usage: object, toolTrace: object[]}>}
+ * @returns {Promise<{text: string, steps: number, cancelled: boolean, truncated: boolean, usage: object, toolTrace: object[], thinkingTrace: object[]}>}
  */
 export async function runTurn(opts) {
-  const { llm, runner, messages, signal, onDelta, onToolCall, onUsage, toOpenAiTools } = opts;
+  const { llm, runner, messages, signal, onDelta, onReasoningDelta, onToolCall, onUsage, toOpenAiTools } = opts;
 
   const startedAt = Date.now();
   const conversation = [...messages];
   const toolTrace = [];
+  /** @type {Array<{n: number, reasoning: string, tools: string[], answerPreview: string}>} */
+  const thinkingTrace = [];
   let steps = 0;
+  // 模型调用次数（与工具步数不同：一次调用可能带 0 个或多个工具调用）
+  let rounds = 0;
   let totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimated: false };
   let truncated = false;
 
@@ -56,7 +76,7 @@ export async function runTurn(opts) {
 
   while (steps < MAX_STEPS) {
     if (signal?.aborted) {
-      return { text: '', steps, cancelled: true, truncated, usage: totalUsage, toolTrace };
+      return { text: '', steps, cancelled: true, truncated, usage: totalUsage, toolTrace, thinkingTrace };
     }
 
     // 预算耗尽：收尾，不再问模型
@@ -70,23 +90,41 @@ export async function runTurn(opts) {
       tools: tools.length > 0 ? toOpenAiTools(tools) : undefined,
       signal,
       onDelta,
+      onReasoningDelta,
       proactive: opts.proactive,
     });
+
+    rounds += 1;
+    /*
+     * 思考内容只在**这一步有内容时**才记一条。
+     * 非推理模型（或上游没给 reasoning）时 thinkingTrace 会保持为空 ——
+     * 上层据此静默降级（不写文件、不建空记录），而不是留一堆空对象。
+     */
+    if (typeof res.reasoning === 'string' && res.reasoning.trim().length > 0) {
+      thinkingTrace.push({
+        n: rounds,
+        reasoning: res.reasoning,
+        // 这一步调了哪些工具：让界面能显示"它想了什么、然后干了什么"
+        tools: (res.toolCalls ?? []).map((tc) => tc?.name).filter((n) => typeof n === 'string' && n),
+        answerPreview: String(res.text ?? '').slice(0, PREVIEW_SLICE),
+      });
+    }
 
     accumulate(totalUsage, res.usage);
     onUsage?.({ usage: res.usage, model: res.model, proactive: opts.proactive === true });
 
     if (res.cancelled) {
-      return { text: '', steps, cancelled: true, truncated, usage: totalUsage, toolTrace };
+      return { text: '', steps, cancelled: true, truncated, usage: totalUsage, toolTrace, thinkingTrace };
     }
 
     // 没有工具调用 → 这就是最终回答
     if (!res.toolCalls?.length) {
-      return { text: res.text, steps, cancelled: false, truncated, usage: totalUsage, toolTrace };
+      return { text: res.text, steps, cancelled: false, truncated, usage: totalUsage, toolTrace, thinkingTrace };
     }
 
     // 有工具调用：把模型的"意图"作为 assistant 消息记进对话，
-    // 否则回灌 tool 结果时会缺少对应的调用记录（某些上游会因此 400）
+    // 否则回灌 tool 结果时会缺少对应的调用记录（某些上游会因此 400）。
+    // 注意这里**故意不带 reasoning** —— 见文件头注释。
     conversation.push({
       role: 'assistant',
       content: res.text ?? '',
@@ -145,6 +183,7 @@ export async function runTurn(opts) {
     truncated: true,
     usage: totalUsage,
     toolTrace,
+    thinkingTrace,
   };
 }
 

@@ -45,12 +45,17 @@ Thumbs.db
 开发文档/用户的突发奇想.txt
 开发文档/*.txt
 
-# 构建产物：可随时用 npm run build:desktop 重新生成，不进仓库。
+# 构建产物：可随时用 npm run build:root-exe 重新生成。
 #
 # 用 *.exe 通配而不是逐个列：列名字总会漏（上次就漏了 Ling-bot-console.exe）。
-# desktop/ 下是 Rust/C# 源码，不是产物，不要被这条误伤。
+# desktop/ 下是 Rust 源码，不是产物，不要被这条误伤。
 build/
 *.exe
+
+# 例外：根目录这个 exe 是要随仓库分发的（clone 完直接能双击）。
+# 它由 npm run build:root-exe 从 Rust 源码构建后复制过来，产物与源码同源，
+# 所以允许入库 —— 代价是仓库多 3.5MB，换取「不用装 Rust 也能跑」。
+!/Ling-bot.exe
 
 # Rust 编译缓存（体积大，且可随时重建）
 desktop/target/

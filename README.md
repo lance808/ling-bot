@@ -11,16 +11,25 @@
 
 | 方式 | 命令 | 适用 |
 | --- | --- | --- |
-| **双击 exe** | `npm run bundle:desktop` 生成 `dist/Ling-bot/Ling-bot.exe`，之后双击即可 | 日常使用 |
-| 开发运行 | `npm start` | 开发调试（自动构建并启动桌面壳） |
-| 只跑后端 | `npm run backend` | 纯 Node 下跑回归 |
+| **双击根目录 `Ling-bot.exe`** | 已随仓库提供，clone 完直接双击 | 日常使用、试用 |
+| 完整分发目录 | `npm run bundle:desktop` → `dist/Ling-bot/` | 拷给别人用 |
+| 开发运行 | `npm start` | 开发调试（自动构建并启动） |
 
 **桌面壳做什么**：Tauri 2 负责窗口、托盘与单实例；它拉起 Node 后端进程，
 并通过 stdin/stdout 上的 JSON-RPC 转发界面的请求。
 
-后端脚本和 Node 运行时随包一起分发，**目标机器不需要预装 Node**。
+### 根目录那个 exe 的前置条件
 
-> 打包产物含一份 Node 运行时，整包约 94 MB。
+它只有 3.5 MB，**不带 Node 运行时**——后端是 Node 脚本，壳只负责把它拉起来。
+所以目标机器需要：
+
+- **Node ≥ 24.22**（见版本基线）
+- **WebView2 运行时**（Windows 10 1803+ 一般已自带）
+- 已执行过一次 `npm install`（本项目零依赖，但插件机制需要数据目录）
+
+没有 Node 时双击仍能开窗，但界面会显示「后端未运行」，功能不可用。
+
+> 要一份**真正自包含**的分发（连 Node 一起带，约 94 MB），用 `npm run bundle:desktop`。
 
 
 ---

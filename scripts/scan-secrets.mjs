@@ -78,6 +78,7 @@ const PUBLIC_API_HOSTS = [
   'npmmirror.com',
   'registry.npmjs.org',
   'npmjs.com',
+  'schema.tauri.app',
 ];
 
 /**
@@ -100,6 +101,13 @@ function isPublicHost(host) {
   if (/^(?:api\.)?(?:x{2,}|example|test|foo|bar)\./.test(h)) return true;
   // 内网 / 回环地址：不含身份信息，且测试要用
   if (/^(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))\./.test(h)) return true;
+  /*
+   * RFC 2606 / RFC 6761 保留的"永不可解析"顶级域与二级域：
+   *   .invalid / .test / .example / .localhost
+   * 它们的存在意义就是"保证不是真实主机"，测试里用它最规范，
+   * 也该被认成占位 —— 否则 fake.invalid 这种反而过不了检查。
+   */
+  if (/\.(?:invalid|test|example|localhost)$/.test(h)) return true;
   // 测试用的短主机名（无点）
   if (!h.includes('.')) return true;
   return false;
@@ -211,6 +219,12 @@ function scanText(text, opts = {}) {
       if (PLACEHOLDER.test(line)) continue;
       // 包完整性哈希是公开值，不是凭据（sha512-/sha256- 后跟 base64）
       if (/\bsha(?:256|384|512)-/.test(m[0]) || /\bsha(?:256|384|512)-/.test(line)) continue;
+      /*
+       * Cargo 校验和同样是公开值：Cargo.lock 里每个 crate 一行 `checksum = "<64 hex>"`，
+       * 它校验的是 crates.io 上的包内容，泄露了也没有任何权限含义。
+       * 不豁免的话会一次报出几百条，把真正的凭据问题淹没掉。
+       */
+      if (/^\s*checksum\s*=\s*"[0-9a-f]{64}"\s*$/i.test(line)) continue;
       hits.push({
         rule: rule.name,
         // 只显示前 6 位，避免把凭据打印到终端/日志里

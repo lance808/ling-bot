@@ -22,6 +22,7 @@
     "preflight": "node scripts/preflight.mjs",
     "icons": "node scripts/make-tauri-icons.mjs",
     "build:desktop": "cargo build --release --manifest-path desktop/Cargo.toml",
+    "build:root-exe": "node scripts/build-root-exe.mjs",
     "bundle:desktop": "node scripts/bundle-desktop.mjs",
     "verify:node": "node scripts/verify-node.mjs"
   }

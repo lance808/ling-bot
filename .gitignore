@@ -80,3 +80,5 @@ secret.vault
 assets/*-report.txt
 assets/*-x[0-9]*.png
 
+.gitmsg.txt
+commit-msg.tmp

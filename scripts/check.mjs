@@ -185,6 +185,56 @@ async function checkBridgeSurface() {
   passes.push('I22 桌面桥接层只暴露 snapshot/action/setting');
 }
 
+/* ---------------------------------------------------------------- 外部接口闸门 */
+
+/**
+ * `ling_open_url` / `ling_spawn_snowluma` 是两个"能对系统做事"的接口，
+ * 它们的安全性完全落在 Rust 侧的校验上。JS 侧的规则可以被绕过，
+ * 所以必须断言原生侧真的有闸门，而不是只在注释里写了。
+ */
+async function checkShellGates() {
+  let rpc;
+  try {
+    rpc = await fs.readFile(path.join(repoRoot, 'desktop/src/rpc.rs'), 'utf8');
+  } catch {
+    failures.push('缺少 desktop/src/rpc.rs');
+    return;
+  }
+
+  // 1. 打开网址必须有主机白名单，且白名单是常量
+  if (!/const\s+ALLOWED_URL_HOSTS/.test(rpc)) {
+    failures.push('ling_open_url 必须带 ALLOWED_URL_HOSTS 主机白名单');
+    return;
+  }
+  if (!/fn\s+url_allowed/.test(rpc)) {
+    failures.push('ling_open_url 必须先过 url_allowed 校验');
+    return;
+  }
+  // 2. 必须拒绝非 http(s)：file:// 和 javascript: 是这类接口最常见的绕过方式
+  if (!/strip_prefix\("http:\/\/"\)/.test(rpc) || !/strip_prefix\("https:\/\/"\)/.test(rpc)) {
+    failures.push('ling_open_url 必须只接受 http/https');
+    return;
+  }
+  // 3. 必须拒绝 user@host 伪装
+  if (!/contains\('@'\)/.test(rpc)) {
+    failures.push('ling_open_url 必须拒绝含 @ 的 authority（防 user@host 伪装）');
+    return;
+  }
+
+  // 4. 启动 SnowLuma 必须校验目录里真有 index.mjs，否则等于"用任意参数启动任意程序"
+  if (!/join\("index\.mjs"\)/.test(rpc) || !/is_file\(\)/.test(rpc)) {
+    failures.push('ling_spawn_snowluma 必须校验目录内存在 index.mjs');
+    return;
+  }
+  // 5. 启动时不能弹控制台
+  if (!/creation_flags\(0x0800_0000\)/.test(rpc)) {
+    failures.push('ling_spawn_snowluma 启动子进程必须带 CREATE_NO_WINDOW');
+    return;
+  }
+
+  passes.push('I23 外部接口带闸门（网址白名单 / 只允许 http(s) / 启动前校验目录）');
+}
+
 /* ---------------------------------------------------------------- 文档同步 */
 
 async function checkDocsPresent() {
@@ -393,6 +443,7 @@ async function main() {
   await checkNoInnerHtml();
   await checkNoInlineStyle();
   await checkBridgeSurface();
+  await checkShellGates();
   await checkDocsPresent();
   await checkToolResultNeverInSystem();
   await checkBehaviorLayerIsConstant();

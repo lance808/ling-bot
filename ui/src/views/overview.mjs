@@ -22,6 +22,7 @@
  */
 
 import { el, pill, card, kv, clock } from '../render.mjs';
+import { renderEnvCardCached } from './env.mjs';
 
 /**
  * @param {any} snap
@@ -88,7 +89,15 @@ export function renderOverview(snap, ctx = {}) {
     ]),
   );
 
-  /* ------------------------------------------------ 二、今日消耗 */
+  /* ------------------------------------------------ 二、环境体检 */
+
+  /*
+   * 放在「链接状态」和「今日消耗」之间：前一块说"现在通了没"，
+   * 后一块说"花了多少钱"，而"本机装没装、跑没跑"是这两个的前提。
+   */
+  root.append(renderEnvCardCached({}));
+
+  /* ------------------------------------------------ 三、今日消耗 */
 
   const today = usage.today ?? {};
   const proactive = usage.todayProactive ?? {};

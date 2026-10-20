@@ -87,6 +87,37 @@ window.ling = {
     return invoke('ling_pick_file', { opts: opts ?? {} });
   },
 
+  /**
+   * 打开外部网址（含本地 SnowLuma 控制台）。
+   *
+   * 真正的主机白名单在 Rust 侧（`url_allowed`）—— 这里只是转发。
+   * 不在 JS 侧也做一份：两处规则很容易慢慢不一致，而原生那侧才是
+   * 唯一不可绕过的地方。
+   *
+   * @param {string} url
+   */
+  openUrl(url) {
+    return invoke('ling_open_url', { url: String(url ?? '') });
+  },
+
+  /**
+   * 启动 SnowLuma（只接受它自己的安装目录）。
+   *
+   * @param {string} dir
+   */
+  spawnSnowLuma(dir) {
+    return invoke('ling_spawn_snowluma', { dir: String(dir ?? '') });
+  },
+
+  /**
+   * 启动本机 QQ（只接受 QQ.exe 的真实路径）。
+   *
+   * @param {string} exe
+   */
+  spawnQQ(exe) {
+    return invoke('ling_spawn_qq', { exe: String(exe ?? '') });
+  },
+
   meta: {
     platform: 'win32',
     versions: {},

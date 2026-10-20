@@ -1090,3 +1090,155 @@ td { overflow-wrap: anywhere; }
   .confirm-card { padding: 9px 12px; }
   .confirm-args { max-height: 58px; }
 }
+
+/* ---------------------------------------------------------------- 环境体检
+ *
+ * 位置在「链接状态」与「今日消耗」之间。视觉上刻意比那两块更"紧"：
+ * 它是一个诊断块 —— 有异常时才展开下载区，正常时只占两行，
+ * 不该跟业务数据抢注意力。
+ */
+
+.env-card { display: flex; flex-direction: column; gap: 10px; }
+
+.env-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.env-head h2 { margin: 0; }
+.env-head-actions { display: flex; align-items: center; gap: 8px; }
+
+/* 三列：左=状态（三行），中=两个按钮竖排，右=控制台纵跨整列。 */
+.env-grid {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(160px, 210px) minmax(160px, 210px);
+  gap: 10px;
+  align-items: stretch;
+}
+
+.env-col-left { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+/* 中列两个按钮上下平分高度 */
+.env-col-mid { display: flex; flex-direction: column; gap: 8px; }
+.env-col-right { display: flex; }
+
+.env-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-inset);
+  min-width: 0;
+}
+.env-cell-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.env-cell-head strong { font-size: 13.5px; }
+.env-ver {
+  font-size: 12px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 竖跨两行的大按钮。
+ *
+ * 关键是圆角要跟着尺寸走：基础 .btn 是 7px，撑到 180px 高之后
+ * 那点圆角等于没有，整个按钮就退化成一个色块。这里用 --radius-lg，
+ * 再让它内部竖排（图标/主标题/副标题），看起来才像"卡片式操作区"。
+ */
+.env-big {
+  flex: 1;
+  width: 100%;
+  flex-direction: column;
+  gap: 3px;
+  border-radius: var(--radius-lg);
+  padding: 10px 12px;
+  justify-content: center;
+  text-align: center;
+  white-space: normal;
+  line-height: 1.35;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.env-big .env-big-sub {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--fg-dim);
+  opacity: 0.85;
+}
+
+/*
+ * 禁用态：基础 .btn:disabled 只压低整体不透明度，导致主标题和副标题
+ * 一起糊成一片（"已在运行"上的说明几乎读不出来）。
+ * 这里改成"降饱和 + 保住对比度"：副标题单独提亮，主标题稍微收一点。
+ */
+.env-big:disabled {
+  opacity: 1;
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--fg-faint);
+  cursor: default;
+}
+.env-big:disabled .env-big-sub { color: var(--fg-faint); opacity: 1; }
+
+.env-path {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 缺失时才出现：虚线框把它和"正常运行"区分开，但不至于像报错 */
+.env-install {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 11px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 9px;
+  background: var(--bg-inset);
+}
+.env-install-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.env-install-head strong { font-size: 13px; }
+.env-platforms { display: flex; gap: 6px; flex-wrap: wrap; }
+.env-chip {
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.env-chip:hover { background: var(--bg-hover); }
+.env-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--fg-invert);
+}
+.env-downloads { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.env-note {
+  font-size: 12px;
+  border-radius: 7px;
+  padding: 7px 10px;
+  background: var(--bg-inset);
+  color: var(--fg-dim);
+}
+.env-note.ok { background: var(--ok-soft); color: var(--ok); }
+.env-note.warn { background: var(--warn-soft); color: var(--warn); }
+.env-note.err { background: var(--err-soft); color: var(--err); }
+
+/* 窗口窄时三列会挤成一条，退回两列：状态整行，两个按钮并排一行 */
+@media (max-width: 900px) {
+  .env-grid { grid-template-columns: 1fr 1fr; }
+  .env-col-left { grid-column: 1 / -1; }
+  .env-col-mid { grid-column: 1 / 2; }
+  .env-col-right { grid-column: 2 / 3; }
+  .env-big { min-height: 52px; }
+}

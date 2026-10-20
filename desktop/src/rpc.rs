@@ -8,6 +8,8 @@
 //!   · ling_restart_backend
 //!   · ling_pick_file    —— 纯界面操作，只拿路径，不参与授权
 //!   · ling_meta         —— 只读环境信息
+//!   · ling_open_url     —— 打开网址，**只放行白名单主机**
+//!   · ling_spawn        —— 启动 SnowLuma，**只放行它自己的 index.mjs**
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
@@ -15,6 +17,134 @@ use tauri::{AppHandle, Manager, State};
 use crate::backend::{Backend, RpcError};
 
 const ALLOWED_METHODS: [&str; 3] = ["snapshot", "action", "setting"];
+
+/// `ling_open_url` 允许打开的主机。
+///
+/// 这个接口会把地址交给系统浏览器，等于"替用户点一个链接"。
+/// 不设白名单的话，任何注入到界面的字符串都能变成任意网址 ——
+/// 包括 `file:` 这类本地协议。所以只认下面这些站点，且必须是 https。
+const ALLOWED_URL_HOSTS: [&str; 8] = [
+    "nodejs.org",
+    "github.com",
+    "objects.githubusercontent.com",
+    "api.github.com",
+    "snowluma.com",
+    "www.snowluma.com",
+    "127.0.0.1",
+    "localhost",
+];
+
+/// 判断一个 URL 是否允许被打开。
+///
+/// 刻意实现得很窄：只接受 `http://127.0.0.1`、`http://localhost`
+/// 和 https 的白名单主机；其余一律拒绝。
+fn url_allowed(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix("http://").or_else(|| raw.strip_prefix("https://")) else {
+        return false;
+    };
+    let is_http = raw.starts_with("http://");
+    // 去掉 path/query，取 host[:port]
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = authority.split(':').next().unwrap_or("").to_ascii_lowercase();
+
+    // 本地控制台允许明文 http，其余必须 https
+    let local = host == "127.0.0.1" || host == "localhost";
+    if local {
+        return true;
+    }
+    if is_http {
+        return false;
+    }
+    ALLOWED_URL_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+/// 打开一个外部网址。
+///
+/// 只允许 http(s)，且主机要在白名单里（见 `url_allowed`）。
+#[tauri::command]
+pub fn ling_open_url(url: String) -> Value {
+    if !url_allowed(&url) {
+        return json!({
+            "ok": false,
+            "code": "E1004",
+            "message": format!("不允许打开该地址：{url}")
+        });
+    }
+    #[cfg(windows)]
+    {
+        // 用 cmd /c start 而不是 ShellExecuteW：无需额外依赖，且能正确处理默认浏览器。
+        // 空字符串是 start 的"窗口标题"占位，不能省（否则带引号的 URL 会被当标题）。
+        use std::os::windows::process::CommandExt;
+        let r = std::process::Command::new("cmd")
+            .args(["/c", "start", "", &url])
+            .creation_flags(0x0800_0000)
+            .spawn();
+        return match r {
+            Ok(_) => json!({ "ok": true }),
+            Err(e) => json!({ "ok": false, "code": "E1011", "message": format!("打开失败：{e}") }),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        match std::process::Command::new(opener).arg(&url).spawn() {
+            Ok(_) => json!({ "ok": true }),
+            Err(e) => json!({ "ok": false, "code": "E1011", "message": format!("打开失败：{e}") }),
+        }
+    }
+}
+
+/// 启动 SnowLuma。
+///
+/// 只接受一个目录参数，并要求该目录里**确实有 index.mjs**：
+/// 否则这个接口就变成"用任意参数启动任意程序"。
+/// 用 `node index.mjs`（而不是 launcher.bat）是为了不弹出控制台窗口。
+#[tauri::command]
+pub async fn ling_spawn_snowluma(dir: String) -> Value {
+    let dir_path = std::path::PathBuf::from(&dir);
+    let entry = dir_path.join("index.mjs");
+    if !entry.is_file() {
+        return json!({
+            "ok": false,
+            "code": "E1004",
+            "message": format!("这个目录不是 SnowLuma：{}\n              （缺少 index.mjs）", dir)
+        });
+    }
+
+    // SnowLuma 自带 node.exe 时优先用它：它自检要求 >=24，用系统的可能不匹配。
+    let bundled = dir_path.join("node.exe");
+    let node = if bundled.is_file() {
+        bundled.to_string_lossy().to_string()
+    } else {
+        std::env::var("LING_NODE").unwrap_or_else(|_| "node".to_string())
+    };
+
+    let mut cmd = std::process::Command::new(&node);
+    cmd.arg("index.mjs").current_dir(&dir_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 不弹控制台
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    match cmd.spawn() {
+        Ok(child) => json!({
+            "ok": true,
+            "pid": child.id(),
+            "message": format!("已启动 SnowLuma（PID {}），等它完成注入后点「控制台」", child.id())
+        }),
+        Err(e) => json!({
+            "ok": false,
+            "code": "E1011",
+            "message": format!("启动失败：{e}")
+        }),
+    }
+}
+
 
 /// 模型目录、连接测试、多阶段能力探测各有自己的网络预算，
 /// 不能被默认 15 秒先截断。
@@ -143,3 +273,83 @@ fn node_version() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "?".into())
 }
+/// 启动 QQ。
+///
+/// 与 SnowLuma 同理，只接受"可执行文件路径"，但校验更严：
+/// 文件名必须是 QQ.exe，且文件真实存在。否则这个接口就成了
+/// "启动任意程序"的通用入口。
+///
+/// 用 detached 方式启动：QQ 是用户自己的程序，不该跟着 Ling-bot 一起退出。
+#[tauri::command]
+pub fn ling_spawn_qq(exe: String) -> Value {
+    let p = std::path::PathBuf::from(&exe);
+    let fname = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if fname != "qq.exe" || !p.is_file() {
+        return json!({
+            "ok": false,
+            "code": "E1004",
+            "message": format!("不是有效的 QQ 可执行文件：{exe}")
+        });
+    }
+    let mut cmd = std::process::Command::new(&p);
+    // 工作目录设成它自己的目录：QQ 会按相对路径找同级的资源文件
+    if let Some(parent) = p.parent() {
+        cmd.current_dir(parent);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW | DETACHED_PROCESS：不弹控制台，也不随父进程退出
+        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
+    }
+    match cmd.spawn() {
+        Ok(child) => json!({
+            "ok": true,
+            "pid": child.id(),
+            "message": format!("已启动 QQ（PID {}）", child.id())
+        }),
+        Err(e) => json!({
+            "ok": false,
+            "code": "E1011",
+            "message": format!("启动 QQ 失败：{e}")
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_allowed;
+
+    /*
+     * 这个白名单是"能不能打开任意网址"的唯一闸门，值得逐条钉住。
+     * 尤其是 file:// 与用 user@host 伪装的地址 —— 它们是这类接口最常见
+     * 的两种绕过方式。
+     */
+    #[test]
+    fn allows_local_console_and_known_hosts() {
+        assert!(url_allowed("http://127.0.0.1:5099/"));
+        assert!(url_allowed("http://localhost:5099/"));
+        assert!(url_allowed("https://nodejs.org/dist/latest-v24.x/win-x64/"));
+        assert!(url_allowed("https://github.com/SnowLuma/SnowLuma/releases/latest"));
+        assert!(url_allowed("https://objects.githubusercontent.com/a/b.zip"));
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        assert!(!url_allowed("file:///C:/Windows/System32/calc.exe"));
+        assert!(!url_allowed("javascript:alert(1)"));
+        assert!(!url_allowed(""));
+        assert!(!url_allowed("http://evil.example/"));
+        assert!(!url_allowed("https://evil.example/"));
+        // 白名单主机不允许降级成明文 http
+        assert!(!url_allowed("http://nodejs.org/"));
+        // user@host 伪装：真正的 host 是 evil.example
+        assert!(!url_allowed("https://nodejs.org@evil.example/"));
+        // 后缀相近但不同域
+        assert!(!url_allowed("https://evilnodejs.org/"));
+    }
+}
+

@@ -42,6 +42,7 @@ import { ThinkingStore } from './llm/thinking.mjs';
 import { sealSecret, openSecret, isVaultAvailable } from './config/vault.mjs';
 import { probeVision, probeImageGen, describeCatalog, inferChannel, endpointKey, endpointCapabilities } from './llm/capability.mjs';
 import { unlink as fsUnlink } from 'node:fs/promises';
+import { probeEnvironment } from './env/probe.mjs';
 
 const paths = resolvePaths();
 const log = new Logger({ dir: paths.logsDir, level: process.env.LING_LOG_LEVEL ?? 'info' });
@@ -1010,6 +1011,19 @@ const rpc = {
           client?.close();
           startOneBot();
           return { ok: true };
+        }
+        /*
+         * 环境体检：SnowLuma / Node 装没装、跑没跑。
+         *
+         * 单独一个 action 而不是塞进每次 snapshot：它要探测端口、问 GitHub
+         * 拿下载直链，比快照慢一个量级。让界面按需触发（进页面时一次），
+         * 而不是每次刷新都拖慢。
+         */
+        if (name === 'env.probe') {
+          const report = await probeEnvironment({
+            snowlumaDir: config?.snowlumaDir,
+          });
+          return { ok: true, env: report };
         }
         if (name === 'tool.run') {
           // 来源固定为 console：这条通道只有本机主进程能访问（stdio，不开端口），

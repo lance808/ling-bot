@@ -32,7 +32,10 @@ pub fn run() {
             rpc::ling_invoke,
             rpc::ling_restart_backend,
             rpc::ling_pick_file,
-            rpc::ling_meta
+            rpc::ling_meta,
+            rpc::ling_open_url,
+            rpc::ling_spawn_snowluma,
+            rpc::ling_spawn_qq
         ])
         .manage(Runtime {
             quitting: AtomicBool::new(false),

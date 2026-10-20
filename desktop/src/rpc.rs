@@ -214,8 +214,11 @@ pub fn ling_restart_backend(app: AppHandle, backend: State<'_, Backend>) -> Valu
     json!({ "ok": true, "message": "已发出后端重启请求，正在等待就绪" })
 }
 
-/// 选文件：只返回本机路径，不读内容、不落盘。
+/// 选文件 / 选目录：只返回本机路径，不读内容、不落盘。
 /// 渲染进程没有文件系统权限，所以只能由原生对话框给出。
+///
+/// `kind = "dir"` 选目录（给"手动指定安装目录"用）：
+/// 用户脑子里记的往往是安装目录，不是 exe 的完整路径。
 #[tauri::command]
 pub async fn ling_pick_file(app: AppHandle, opts: Option<Value>) -> Value {
     use tauri_plugin_dialog::DialogExt;
@@ -227,11 +230,20 @@ pub async fn ling_pick_file(app: AppHandle, opts: Option<Value>) -> Value {
         .unwrap_or("file")
         .to_string();
 
+    // 选目录走另一个 API：文件对话框选不到目录
+    if kind == "dir" {
+        return match app.dialog().file().blocking_pick_folder() {
+            Some(path) => json!({ "ok": true, "path": path.to_string() }),
+            None => json!({ "ok": false, "canceled": true }),
+        };
+    }
+
     let mut builder = app.dialog().file();
     builder = match kind.as_str() {
         "image" => builder.add_filter("图片", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]),
         "video" => builder.add_filter("视频", &["mp4", "mov", "mkv", "avi", "webm"]),
         "record" => builder.add_filter("语音", &["mp3", "wav", "amr", "silk", "ogg", "m4a"]),
+        "exe" => builder.add_filter("程序", &["exe"]),
         _ => builder.add_filter("所有文件", &["*"]),
     };
 
@@ -275,17 +287,18 @@ fn node_version() -> String {
 }
 /// 启动 QQ。
 ///
-/// 与 SnowLuma 同理，只接受"可执行文件路径"，但校验更严：
-/// 文件名必须是 QQ.exe，且文件真实存在。否则这个接口就成了
-/// "启动任意程序"的通用入口。
+/// 只接受 QQ.exe 的真实路径：文件名不是 QQ.exe 一律拒绝，
+/// 否则这个接口就成了"启动任意程序"的通用入口。
 ///
-/// 用 detached 方式启动：QQ 是用户自己的程序，不该跟着 Ling-bot 一起退出。
+/// 启动方式与 `ling_open_url` 保持一致：`cmd /c start "" "<exe>"`。
+/// 这是最省事也最可靠的做法 —— 交给 shell 去拉起程序，
+/// 等于用户在命令行里自己敲 start，GUI 程序能正常拿到桌面会话、
+/// 正常显示窗口。之前用 `Command::spawn` 配各种 creation_flags
+/// 反而把 QQ 挂在了错误的环境里，表现为"点了没反应"。
 ///
-/// 注意：`spawn()` 成功只代表进程被创建，**不代表它留下来了**。
-/// QQ 可能因为已经在运行、缺少运行库、被安全软件拦下等原因
-/// 起一下就退。所以这里启动后等一小会儿再确认一遍，
-/// 并把"起来了但很快退出"当成失败报出来 —— 否则界面会说"已启动"，
-/// 而用户看到的是没有任何反应。
+/// 注意 `spawn()` 成功只代表 start 被调用，**不代表 QQ 起来了**。
+/// 所以启动后等一小会儿确认进程数，把"没起来"如实报出来，
+/// 而不是界面说"已启动"、用户对着屏幕发愣。
 #[tauri::command]
 pub async fn ling_spawn_qq(exe: String) -> Value {
     let p = std::path::PathBuf::from(&exe);
@@ -302,61 +315,60 @@ pub async fn ling_spawn_qq(exe: String) -> Value {
     }
 
     /*
-     * 启动 + 确认要等 3 秒，绝不能放在同步命令里：
-     * Tauri 的同步命令在主线程跑，睡 3 秒会把整个界面冻住。
-     * 放到 blocking 线程池里做，命令本身保持 async。
+     * 启动 + 确认要等几秒，不能放在同步命令里：
+     * Tauri 的同步命令在主线程跑，睡几秒会把界面冻住。
      */
     let res = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(&p);
-        // 工作目录设成它自己的目录：QQ 会按相对路径找同级的资源文件
-        if let Some(parent) = p.parent() {
-            cmd.current_dir(parent);
-        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW | DETACHED_PROCESS：不弹控制台，也不随父进程退出
-            cmd.creation_flags(0x0800_0000 | 0x0000_0008);
-        }
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
+            // 与 ling_open_url 同样的写法：
+            // 空字符串是 start 的"窗口标题"占位，不能省 ——
+            // 否则带引号的路径会被 start 当成标题，程序反而没启动。
+            let spawned = std::process::Command::new("cmd")
+                .args(["/c", "start", "", &exe])
+                .creation_flags(0x0800_0000)
+                .spawn();
+
+            if let Err(e) = spawned {
                 return json!({
                     "ok": false,
                     "code": "E1011",
                     "message": format!("启动 QQ 失败：{e}")
-                })
+                });
             }
-        };
-        let pid = child.id();
+        }
+        #[cfg(not(windows))]
+        {
+            return json!({
+                "ok": false,
+                "code": "E1004",
+                "message": "当前平台不支持启动 QQ"
+            });
+        }
 
         /*
-         * 等 3 秒再确认进程还活着。
-         *
-         * 为什么必须等：`spawn()` 成功只代表进程被创建，**不代表它留下了**。
-         * QQ 可能因为缺运行库、被安全软件拦下、安装损坏而起一下就退。
-         * 只报"已启动"会让用户对着毫无反应的屏幕发愣。
-         *
-         * 另外 QQ 是单实例程序：已经在跑时，新进程会把请求转交给
-         * 已有实例然后自己退出。这种情况用户要的效果已经达成，
-         * 所以只要"有 QQ 在跑"就算成功。
+         * 等 6 秒再确认。QQ 冷启动比想象中慢（它要先起一个
+         * 引导进程再去加载主程序），3 秒常常还没起完，
+         * 等太短会把"正在启动"误判成"失败"。
          */
-        std::thread::sleep(std::time::Duration::from_millis(3000));
-        let alive = qq_process_count();
-
-        if alive > 0 {
-            json!({
-                "ok": true,
-                "pid": pid,
-                "running": alive,
-                "message": format!("QQ 已启动（{alive} 个进程）")
-            })
-        } else {
-            json!({
-                "ok": false,
-                "code": "E1012",
-                "message": "QQ 启动了但立刻退出。常见原因：缺少运行库、被安全软件拦下，或安装损坏。"
-            })
+        #[cfg(windows)]
+        {
+            std::thread::sleep(std::time::Duration::from_millis(6000));
+            let alive = qq_process_count();
+            if alive > 0 {
+                json!({
+                    "ok": true,
+                    "running": alive,
+                    "message": format!("QQ 已启动（{alive} 个进程）")
+                })
+            } else {
+                json!({
+                    "ok": false,
+                    "code": "E1012",
+                    "message": format!("没能拉起 QQ（{exe}）。可以手动双击试一下，确认它本身能正常启动。")
+                })
+            }
         }
     })
     .await;

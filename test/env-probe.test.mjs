@@ -14,6 +14,7 @@ import {
   checkNodeVersion,
   inspectSnowLumaDir,
   findSnowLuma,
+  findQQ,
   isPortOpen,
   downloadUrls,
   processCount,
@@ -132,7 +133,78 @@ test('未知平台也有可用的兜底地址', () => {
   assert.ok(u.snowluma);
 });
 
-/* ------------------------------------------------------------ 进程存活判断 */
+/* ------------------------------------------------------------ QQ 路径定位 */
+
+/*
+ * 这一组守的是"装在别人电脑上也要能找到 QQ"。
+ *
+ * 关键语义：用户手动指的路径 > 自动识别。自动识别再聪明也不该
+ * 覆盖人的明确选择 —— 机器上可能装着新旧两套 QQ。
+ */
+
+test('★ 手动指定 exe 时来源标为 manual 且路径正确', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-'));
+  const exe = path.join(dir, 'QQ.exe');
+  fs.writeFileSync(exe, 'x');
+  const r = findQQ(exe);
+  assert.equal(r.installed, true);
+  assert.equal(r.source, 'manual');
+  assert.equal(r.exe, exe);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('★ 手动指定安装目录时自动补上 QQ.exe', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-'));
+  fs.writeFileSync(path.join(dir, 'QQ.exe'), 'x');
+  const r = findQQ(dir);
+  assert.equal(r.installed, true);
+  assert.equal(r.source, 'manual');
+  assert.equal(r.exe, path.join(dir, 'QQ.exe'));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('手动路径带引号也能识别（用户从别处复制常带引号）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-'));
+  const exe = path.join(dir, 'QQ.exe');
+  fs.writeFileSync(exe, 'x');
+  const r = findQQ(`"${exe}"`);
+  assert.equal(r.installed, true);
+  assert.equal(r.exe, exe);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('★ 手动路径无效时如实报失败，不静默回退到自动识别', () => {
+  /*
+   * 静默回退是最坏的行为：用户填错了路径，界面却显示"已安装"
+   * （其实用的是自动识别出来的另一套），他会以为自己填的生效了。
+   */
+  const r = findQQ(path.join(os.tmpdir(), 'definitely-no-qq-here-xyz'));
+  assert.equal(r.installed, false);
+  assert.equal(r.exe, null);
+  assert.equal(r.source, 'manual');
+  assert.ok(r.badPath, '要把用户填的原值带回界面，方便他改');
+});
+
+test('手动指定的优先级高于注册表识别', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-'));
+  const exe = path.join(dir, 'QQ.exe');
+  fs.writeFileSync(exe, 'x');
+  const r = findQQ(exe);
+  // 只要 manual 命中，就绝不会是 registry —— 哪怕注册表里也有 QQ
+  assert.equal(r.source, 'manual');
+  assert.equal(r.exe, exe);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('空字符串等同于"未指定"，走自动识别', () => {
+  const r = findQQ('');
+  assert.notEqual(r.source, 'manual');
+});
+
+test('返回的 exe 若存在必须是 QQ.exe', () => {
+  const r = findQQ(undefined);
+  if (r.installed) assert.match(r.exe, /QQ\.exe$/i);
+});
 
 /*
  * 这一组守的是一个真出现过的 bug：原来用 `tasklist /FI ... /NH` 的输出

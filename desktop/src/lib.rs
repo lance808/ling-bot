@@ -158,7 +158,24 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // 机器人要常驻：关窗只隐藏，真正退出走托盘
+                /*
+                 * 机器人要常驻：点窗口的 X 只隐藏，真正退出走托盘。
+                 *
+                 * 但必须让"真的在退出"这条路通过 —— 否则托盘退出会卡死：
+                 * 托盘 quit 里调 app.exit(0)，Tauri 会去关窗口，这里又
+                 * 无条件 prevent_close 把退出流程拦住，表现就是"点了退出
+                 * 没反应、进程还在"。
+                 *
+                 * quitting 这个标志之前只写不读，正是这个 bug 的来源。
+                 */
+                let quitting = window
+                    .app_handle()
+                    .try_state::<Runtime>()
+                    .map(|r| r.quitting.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+                if quitting {
+                    return;
+                }
                 api.prevent_close();
                 let _ = window.hide();
             }

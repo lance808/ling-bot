@@ -20,7 +20,7 @@
  */
 
 import { el, pill } from '../render.mjs';
-import { action, openUrl, spawnSnowLuma } from '../api.mjs';
+import { action, openUrl, spawnSnowLuma, spawnQQ, setting, pickFile } from '../api.mjs';
 
 /** 平台切换按钮 */
 const PLATFORMS = [
@@ -286,6 +286,102 @@ export function renderEnvCard(env, ctx = {}) {
 
   if (!sl.installed && sl.reason) {
     card.append(el('div', { class: 'env-path', text: `检测说明：${sl.reason}` }));
+  }
+
+  /* ---------------------------------------------------- QQ 路径可手动指定 */
+
+  /*
+   * 为什么需要这一行：自动识别（注册表 + 猜常见目录）在**别人电脑上**
+   * 总有够不到的情况 —— 装在非系统盘的自定义目录、绿色版、
+   * 同时装了新旧两版、注册表被清理过。与其把识别逻辑堆到无限长去猜，
+   * 不如给一个明确入口让人自己指。
+   *
+   * 平时它不显眼（只是一个可编辑的路径行），识别失败时才提示得重一些。
+   */
+  const qqSourceText = {
+    manual: '手动指定',
+    registry: '注册表识别',
+    candidate: '常见目录',
+  }[qq.source] ?? '未识别';
+
+  const qqPathInput = el('input', {
+    class: 'env-input',
+    type: 'text',
+    value: qq.badPath ?? qq.exe ?? '',
+    placeholder: '例如 D:\\QQ （安装目录）或 D:\\QQ\\QQ.exe',
+    spellcheck: 'false',
+    // 用户手动指过就直接亮出来；否则只是"当前识别到的"
+    title: qq.badPath
+      ? '这个路径下没找到 QQ.exe，改一下或点「重新检测」'
+      : '可以填安装目录，也可以直接填 QQ.exe 的完整路径；留空表示自动识别',
+  });
+
+  const saveQQPath = async (value) => {
+    const r = await setting('qqExe', value);
+    if (!r.ok) {
+      say(r.message ?? '保存失败', 'err');
+      return false;
+    }
+    return true;
+  };
+
+  const qqPathRow = el('div', { class: 'env-pathbar' }, [
+    el('span', { class: 'env-pathbar-label', text: 'QQ 路径' }),
+    qqPathInput,
+    (() => {
+      const b = el('button', { class: 'btn btn-sm', type: 'button', text: '选目录' });
+      b.addEventListener('click', async () => {
+        const picked = await pickFile('dir');
+        if (picked.canceled || !picked.path) return;
+        qqPathInput.value = picked.path;
+        if (await saveQQPath(picked.path)) {
+          say(`已记住 QQ 目录：${picked.path}`, 'ok');
+          ctx.onProbe?.();
+        }
+      });
+      return b;
+    })(),
+    (() => {
+      const b = el('button', { class: 'btn btn-sm', type: 'button', text: '选 QQ.exe' });
+      b.addEventListener('click', async () => {
+        const picked = await pickFile('exe');
+        if (picked.canceled || !picked.path) return;
+        qqPathInput.value = picked.path;
+        if (await saveQQPath(picked.path)) {
+          say(`已记住 QQ 路径：${picked.path}`, 'ok');
+          ctx.onProbe?.();
+        }
+      });
+      return b;
+    })(),
+    el('span', { class: 'env-pathbar-src', text: qqSourceText }),
+  ]);
+
+  // 回车即保存，输入框旁边不需要再多一个按钮
+  qqPathInput.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    if (await saveQQPath(qqPathInput.value)) {
+      say('已保存 QQ 路径', 'ok');
+      ctx.onProbe?.();
+    }
+  });
+
+  card.append(qqPathRow);
+
+  /*
+   * 识别失败时把话说明白：用户最需要知道的是"去哪儿找"。
+   * 只在他看得见的地方多写一句，正常时不占地方。
+   */
+  if (!qq.installed) {
+    card.append(
+      el('div', {
+        class: 'env-note warn',
+        text: qq.badPath
+          ? `你填的路径下没找到 QQ.exe：${qq.badPath}。改一下，或点「选目录」重新指定。`
+          : '没自动识别到 QQ。点「选目录」选 QQ 的安装文件夹（里面有 QQ.exe），或直接选 QQ.exe。',
+      }),
+    );
   }
 
   /* ---------------------------------------------------- 缺失时的下载区 */

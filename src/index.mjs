@@ -1022,6 +1022,8 @@ const rpc = {
         if (name === 'env.probe') {
           const report = await probeEnvironment({
             snowlumaDir: config?.snowlumaDir,
+            // 用户手动指定的 QQ 路径优先于自动识别
+            qqExe: config?.qqExe,
           });
           return { ok: true, env: report };
         }
@@ -1380,6 +1382,38 @@ const rpc = {
           config.llm.model = v;
           await persistConfig();
           rebuildLlmClient();
+          return { ok: true };
+        }
+
+        if (key === 'qqExe') {
+          /*
+           * 用户手填 QQ 安装目录或 QQ.exe 路径。
+           *
+           * 为什么需要这个：自动识别（注册表 + 猜常见目录）在别人电脑上
+           * 总有够不到的情况 —— 装在非系统盘的自定义目录、绿色版、
+           * 同时装了新旧两版。与其让识别逻辑无限膨胀去猜，不如给一个
+           * 明确入口让人自己指。
+           *
+           * 只做形状校验（非空、长度、不含非法字符），**不校验文件是否存在**：
+           * 用户可能想先填好、后装 QQ。存在与否由体检卡如实显示。
+           */
+          const v = String(value ?? '').trim().replace(/^"|"$/g, '');
+          if (v.length > 260) return { ok: false, code: 'E4041', message: '路径过长' };
+          if (/[\0\r\n]/.test(v)) return { ok: false, code: 'E4041', message: '路径含非法字符' };
+          if (v) config.qqExe = v;
+          else delete config.qqExe;
+          await persistConfig();
+          return { ok: true };
+        }
+
+        if (key === 'snowlumaDir') {
+          // 与 qqExe 同样的语义：留空表示回到自动识别
+          const v = String(value ?? '').trim().replace(/^"|"$/g, '');
+          if (v.length > 260) return { ok: false, code: 'E4041', message: '路径过长' };
+          if (/[\0\r\n]/.test(v)) return { ok: false, code: 'E4041', message: '路径含非法字符' };
+          if (v) config.snowlumaDir = v;
+          else delete config.snowlumaDir;
+          await persistConfig();
           return { ok: true };
         }
 

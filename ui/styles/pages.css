@@ -1287,6 +1287,49 @@ td { overflow-wrap: anywhere; }
 .env-note.warn { background: var(--warn-soft); color: var(--warn); }
 .env-note.err { background: var(--err-soft); color: var(--err); }
 
+/* ---------------------------------------------------------------- QQ 路径行
+ *
+ * 自动识别在别人电脑上总有够不到的时候，所以给一条可编辑的路径。
+ * 它平时只是一个安静的单行（高度很小），识别失败时配合下面的
+ * 警告条一起出现，引导用户自己指定。
+ */
+
+.env-pathbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.env-pathbar-label {
+  font-size: 12px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+
+.env-input {
+  flex: 1;
+  min-width: 180px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
+}
+.env-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.env-input::placeholder { color: var(--fg-faint); }
+
+.env-pathbar-src {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+
 /* 窗口窄时四列挤不下：状态整行，两个按钮并排一行，竖排 QQ 藏起来 */
 @media (max-width: 980px) {
   .env-grid { grid-template-columns: 1fr 1fr; }

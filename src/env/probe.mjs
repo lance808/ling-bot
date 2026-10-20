@@ -52,38 +52,106 @@ export function qqCandidates() {
 /**
  * 从注册表读 QQ 的安装路径。
  *
- * 为什么优先注册表：用户装哪个盘不确定，而卸载项里的 `DisplayIcon`
- * 通常写成 `D:\QQ\QQ.exe,0` —— 这是程序自己写的，比猜目录可靠。
- * 只在 Windows 且 reg.exe 可用时尝试，失败就退回候选目录。
+ * 这个项目要装到别人电脑上，所以不能靠"猜盘符"。按可靠性从高到低试：
+ *
+ *   1. Tencent\QQNT 的 `Install` 值
+ *      —— QQ 安装器自己写的安装目录（实测 HKLM\SOFTWARE\WOW6432Node\
+ *      Tencent\QQNT 下 Install = D:\QQ）。这是最权威的来源：不管装在
+ *      哪个盘、哪个自定义目录，只要走正常安装流程就会写这个值。
+ *
+ *   2. App Paths\QQ.exe
+ *      —— Windows 按程序名定位 exe 的标准位置。有些安装方式会写这里，
+ *      写了的机器上它能直接给出完整 exe 路径。
+ *
+ *   3. 卸载项里的 DisplayIcon / InstallLocation
+ *      —— 最后的注册表兜底。DisplayIcon 常写成 "D:\QQ\QQ.exe,0"，
+ *      要剥掉逗号后的图标序号。
+ *
+ * 每条都要落到"文件真实存在"才算数：注册表可能残留旧路径，
+ * 用户可能把 QQ 卸了但没清干净。
  *
  * @returns {string | null}
  */
 export function qqFromRegistry() {
   if (process.platform !== 'win32') return null;
-  const keys = [
-    'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-    'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-  ];
-  for (const key of keys) {
+
+  /** 跑 reg query，拿 stdout；失败返回 null */
+  const query = (key, ...extra) => {
     try {
-      const out = execFileSync('reg', ['query', key, '/s', '/f', 'QQ', '/t', 'REG_SZ'], {
+      return execFileSync('reg', ['query', key, ...extra], {
         encoding: 'utf8',
         timeout: 4000,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'ignore'],
       });
-      // 找形如  "DisplayIcon    REG_SZ    D:\QQ\QQ.exe,0"
-      for (const line of out.split(/\r?\n/)) {
-        const m = /DisplayIcon\s+REG_SZ\s+(.+?)(?:,\d+)?\s*$/i.exec(line.trim());
-        if (!m) continue;
-        const exe = m[1].trim();
+    } catch {
+      return null;
+    }
+  };
+
+  /** 从一段 reg 输出里取某个值的字符串内容 */
+  const readValue = (text, name) => {
+    if (!text) return null;
+    // 形如 "    Install    REG_SZ    D:\QQ"
+    const re = new RegExp(`^\\s*${name}\\s+REG_SZ\\s+(.+?)\\s*$`, 'im');
+    const m = re.exec(text);
+    return m ? m[1].trim() : null;
+  };
+
+  // ---- 1. Tencent\QQNT 的 Install ----
+  const qqntKeys = [
+    'HKLM\\SOFTWARE\\WOW6432Node\\Tencent\\QQNT',
+    'HKLM\\SOFTWARE\\Tencent\\QQNT',
+    'HKCU\\SOFTWARE\\Tencent\\QQNT',
+  ];
+  for (const key of qqntKeys) {
+    const dir = readValue(query(key), 'Install');
+    if (!dir) continue;
+    const exe = path.join(dir, 'QQ.exe');
+    if (fs.existsSync(exe)) return exe;
+  }
+
+  // ---- 2. App Paths ----
+  const appPathKeys = [
+    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\QQ.exe',
+    'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\QQ.exe',
+  ];
+  for (const key of appPathKeys) {
+    const raw = readValue(query(key), '');
+    if (!raw) continue;
+    // 这个值可能带引号
+    const exe = raw.replace(/^"|"$/g, '').trim();
+    if (/qq\.exe$/i.test(exe) && fs.existsSync(exe)) return exe;
+  }
+
+  // ---- 3. 卸载项 ----
+  const uninstallKeys = [
+    'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  ];
+  for (const root of uninstallKeys) {
+    const out = query(root, '/s', '/f', 'QQ', '/t', 'REG_SZ');
+    if (!out) continue;
+    for (const line of out.split(/\r?\n/)) {
+      const t = line.trim();
+      // DisplayIcon 优先，其次是 InstallLocation
+      const mIcon = /^DisplayIcon\s+REG_SZ\s+(.+?)(?:,\d+)?\s*$/i.exec(t);
+      if (mIcon) {
+        const exe = mIcon[1].trim().replace(/^"|"$/g, '');
         if (/qq\.exe$/i.test(exe) && fs.existsSync(exe)) return exe;
       }
-    } catch {
-      // reg 不可用或没有该项：继续下一个
+      const mLoc = /^InstallLocation\s+REG_SZ\s+(.+?)\s*$/i.exec(t);
+      if (mLoc) {
+        const dir = mLoc[1].trim().replace(/^"|"$/g, '');
+        if (dir) {
+          const exe = path.join(dir, 'QQ.exe');
+          if (fs.existsSync(exe)) return exe;
+        }
+      }
     }
   }
+
   return null;
 }
 
@@ -152,11 +220,39 @@ export function qqRunning() {
 }
 
 /** 定位 QQ 可执行文件 */
+/**
+ * 定位 QQ 可执行文件。
+ *
+ * 优先级：**用户手动指定 > 注册表 > 猜常见目录**。
+ *
+ * 手动指定必须排第一 —— 那是用户在界面上亲手指的路径，
+ * 机器上可能装着两套 QQ（新旧版并存），或者装在自动识别
+ * 够不到的地方。自动识别再"聪明"也不该覆盖人的明确选择。
+ *
+ * `explicit` 既接受 exe 路径，也接受安装目录：
+ * 用户从资源管理器复制过来的往往是目录。
+ *
+ * @param {string} [explicit]
+ */
 export function findQQ(explicit) {
+  if (explicit) {
+    const raw = String(explicit).trim().replace(/^"|"$/g, '');
+    if (raw) {
+      // 是个目录就给补上 QQ.exe；已经是 exe 就直接用
+      const asExe = /\.exe$/i.test(raw) ? raw : path.join(raw, 'QQ.exe');
+      if (fs.existsSync(asExe)) return { installed: true, exe: asExe, source: 'manual' };
+      /*
+       * 用户填了但文件不在：不能静默回退到自动识别 —— 那样他会以为
+       * 自己填的生效了。这里如实报"没找到"，让界面提示他路径有问题。
+       */
+      return { installed: false, exe: null, source: 'manual', badPath: raw };
+    }
+  }
+
   const fromReg = qqFromRegistry();
   if (fromReg) return { installed: true, exe: fromReg, source: 'registry' };
-  const dirs = explicit ? [explicit, ...qqCandidates()] : qqCandidates();
-  for (const p of dirs) {
+
+  for (const p of qqCandidates()) {
     if (p && fs.existsSync(p)) return { installed: true, exe: p, source: 'candidate' };
   }
   return { installed: false, exe: null, source: null };
@@ -387,6 +483,14 @@ export async function probeEnvironment(opts = {}) {
       installed: qq.installed,
       exe: qq.exe,
       running: qqRunning(),
+      /*
+       * 来源要让界面能看见：手动指定 / 注册表 / 猜出来的目录。
+       * 自动找到的路径可能不是用户想要的那套（机器上装着两份 QQ），
+       * 标出来他才好判断要不要手动改。
+       */
+      source: qq.source ?? null,
+      /** 用户填了但文件不存在时，把这个值带回去让他改 */
+      badPath: qq.badPath ?? null,
     },
     snowluma: {
       installed: snowluma.installed,

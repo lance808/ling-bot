@@ -235,6 +235,64 @@ async function checkShellGates() {
   passes.push('I23 外部接口带闸门（网址白名单 / 只允许 http(s) / 启动前校验目录）');
 }
 
+/**
+ * 托盘"退出"必须真的能退出。
+ *
+ * 这里守的是一个实际发生过的 bug：窗口的 CloseRequested 无条件
+ * prevent_close（为了让点 X 只隐藏），结果托盘 quit 里调 app.exit(0)
+ * 时，Tauri 去关窗口又被拦下 —— 点退出毫无反应，进程还留着。
+ *
+ * 修法是让 CloseRequested 先看"是否正在退出"。这条检查确保：
+ * 那个退出标志必须既被写、也被读；只写不读等于没有。
+ */
+async function checkQuitPath() {
+  let lib;
+  try {
+    lib = await fs.readFile(path.join(repoRoot, 'desktop/src/lib.rs'), 'utf8');
+  } catch {
+    failures.push('缺少 desktop/src/lib.rs');
+    return;
+  }
+
+  if (!/CloseRequested/.test(lib)) return; // 没有关窗拦截，无需检查
+  if (!/prevent_close/.test(lib)) return;
+
+  // 有 prevent_close 就必须有对应的"放行"条件，否则退出永远被拦
+  const writes = (lib.match(/quitting\.store\(\s*true/g) ?? []).length;
+  const reads = (lib.match(/quitting\.load\(/g) ?? []).length;
+
+  if (writes === 0) {
+    failures.push('托盘退出必须设置 quitting 标志');
+    return;
+  }
+  if (reads === 0) {
+    failures.push(
+      'quitting 只写不读：CloseRequested 会无条件 prevent_close，导致托盘退出无反应',
+    );
+    return;
+  }
+  /*
+   * 放行必须发生在拦截之前（先判断再拦）。
+   *
+   * 注意只认**代码行**，不认注释：注释里也会写 prevent_close 和
+   * quitting，按子串位置比较会得出相反结论（这个检查第一版就栽过）。
+   */
+  const codeLines = lib
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('//') && !l.startsWith('*') && !l.startsWith('/*'));
+
+  const idxRead = codeLines.findIndex((l) => l.includes('quitting.load('));
+  const idxPrevent = codeLines.findIndex((l) => l.includes('api.prevent_close()'));
+
+  if (idxRead === -1 || idxPrevent === -1 || idxRead > idxPrevent) {
+    failures.push('quitting 的判断必须早于 api.prevent_close()，否则起不到放行作用');
+    return;
+  }
+
+  passes.push('I24 托盘退出真的能退出（quitting 标志读写成对）');
+}
+
 /* ---------------------------------------------------------------- 文档同步 */
 
 async function checkDocsPresent() {
@@ -444,6 +502,7 @@ async function main() {
   await checkNoInlineStyle();
   await checkBridgeSurface();
   await checkShellGates();
+  await checkQuitPath();
   await checkDocsPresent();
   await checkToolResultNeverInSystem();
   await checkBehaviorLayerIsConstant();

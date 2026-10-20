@@ -16,6 +16,7 @@ import {
   findSnowLuma,
   isPortOpen,
   downloadUrls,
+  processCount,
   NODE_REQUIRED,
 } from '../src/env/probe.mjs';
 
@@ -129,4 +130,38 @@ test('未知平台也有可用的兜底地址', () => {
   const u = downloadUrls('sunos');
   assert.match(u.node, /^https:\/\/nodejs\.org\/dist\/latest-v24\.x\//);
   assert.ok(u.snowluma);
+});
+
+/* ------------------------------------------------------------ 进程存活判断 */
+
+/*
+ * 这一组守的是一个真出现过的 bug：原来用 `tasklist /FI ... /NH` 的输出
+ * 去正则匹配 "QQ.exe"，但
+ *   1) 中文 Windows 上 tasklist 输出是 GBK，utf8 解码后是乱码；
+ *   2) "没有匹配任务" 那句提示语里也含 QQ.exe，会把 0 个进程误判成有。
+ * 结果就是启动成功却报失败、状态点乱跳。
+ *
+ * 现在改成拿结构化计数，这里钉住它的语义。
+ */
+
+test('★ 不存在的进程名计数为 0', () => {
+  assert.equal(processCount('definitely-not-a-real-process-xyz.exe'), 0);
+});
+
+test('计数结果是整数且非负', () => {
+  const n = processCount('node.exe');
+  assert.ok(Number.isInteger(n), `应返回整数，实际 ${n}`);
+  assert.ok(n >= 0);
+});
+
+test('进程名不区分大小写也能查（Windows 语义）', () => {
+  // 大写的系统进程
+  const upper = processCount('EXPLORER.EXE');
+  const lower = processCount('explorer.exe');
+  assert.equal(upper, lower, '大小写应得到相同结果');
+});
+
+test('不解析本地化文本：特殊字符的进程名不会误判', () => {
+  // 含正则元字符的进程名不该让函数抛异常或误报
+  assert.equal(processCount('.*.exe'), 0);
 });

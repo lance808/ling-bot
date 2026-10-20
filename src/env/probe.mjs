@@ -87,20 +87,68 @@ export function qqFromRegistry() {
   return null;
 }
 
-/** 本机是否已有 QQ 进程在跑 */
-export function qqRunning() {
-  if (process.platform !== 'win32') return false;
+/*
+ * ---------------------------------------------------------------- 进程存活
+ *
+ * 为什么不解析 `tasklist` 的文本：它在中文 Windows 上是 GBK，
+ * 用 utf8 解码会得到乱码（实测 `��Ϣ`）；而且"没有匹配"那句
+ * 提示语里也含 `QQ.exe`，正则容易被它骗到。
+ *
+ * 改用 WMIC / PowerShell 拿**结构化**结果，只问"进程在不在"，
+ * 不碰任何需要本地化的文字。
+ */
+
+/**
+ * 某个进程名当前有几个实例。
+ *
+ * @param {string} name 例如 'QQ.exe'
+ * @returns {number}
+ */
+export function processCount(name) {
+  if (process.platform !== 'win32') return 0;
+
+  /*
+   * 先用 wmic：它比启动 PowerShell 快一个数量级（约 100ms vs 700ms），
+   * 而体检卡每次刷新都要问一次。PowerShell 留作兜底 ——
+   * 新版 Windows 已经开始移除 wmic，不能只依赖它。
+   */
   try {
-    const out = execFileSync('tasklist', ['/FI', 'IMAGENAME eq QQ.exe', '/NH'], {
+    const out = execFileSync('wmic', ['process', 'where', `name='${name}'`, 'get', 'ProcessId'], {
       encoding: 'utf8',
-      timeout: 4000,
+      timeout: 6000,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return /qq\.exe/i.test(out);
+    // 输出形如 "ProcessId\n1234\n5678\n"：数字行数就是进程数
+    return out
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => /^\d+$/.test(s)).length;
   } catch {
-    return false;
+    // wmic 不存在或被禁用：退回 CIM
   }
+
+  try {
+    const out = execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `@(Get-CimInstance Win32_Process -Filter "Name='${name}'" -ErrorAction SilentlyContinue).Count`,
+      ],
+      { encoding: 'utf8', timeout: 8000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const n = Number.parseInt(out.trim(), 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** 本机是否已有 QQ 进程在跑 */
+export function qqRunning() {
+  return processCount('QQ.exe') > 0;
 }
 
 /** 定位 QQ 可执行文件 */

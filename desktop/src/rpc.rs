@@ -280,8 +280,14 @@ fn node_version() -> String {
 /// "启动任意程序"的通用入口。
 ///
 /// 用 detached 方式启动：QQ 是用户自己的程序，不该跟着 Ling-bot 一起退出。
+///
+/// 注意：`spawn()` 成功只代表进程被创建，**不代表它留下来了**。
+/// QQ 可能因为已经在运行、缺少运行库、被安全软件拦下等原因
+/// 起一下就退。所以这里启动后等一小会儿再确认一遍，
+/// 并把"起来了但很快退出"当成失败报出来 —— 否则界面会说"已启动"，
+/// 而用户看到的是没有任何反应。
 #[tauri::command]
-pub fn ling_spawn_qq(exe: String) -> Value {
+pub async fn ling_spawn_qq(exe: String) -> Value {
     let p = std::path::PathBuf::from(&exe);
     let fname = p
         .file_name()
@@ -294,29 +300,105 @@ pub fn ling_spawn_qq(exe: String) -> Value {
             "message": format!("不是有效的 QQ 可执行文件：{exe}")
         });
     }
-    let mut cmd = std::process::Command::new(&p);
-    // 工作目录设成它自己的目录：QQ 会按相对路径找同级的资源文件
-    if let Some(parent) = p.parent() {
-        cmd.current_dir(parent);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW | DETACHED_PROCESS：不弹控制台，也不随父进程退出
-        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
-    }
-    match cmd.spawn() {
-        Ok(child) => json!({
-            "ok": true,
-            "pid": child.id(),
-            "message": format!("已启动 QQ（PID {}）", child.id())
-        }),
+
+    /*
+     * 启动 + 确认要等 3 秒，绝不能放在同步命令里：
+     * Tauri 的同步命令在主线程跑，睡 3 秒会把整个界面冻住。
+     * 放到 blocking 线程池里做，命令本身保持 async。
+     */
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&p);
+        // 工作目录设成它自己的目录：QQ 会按相对路径找同级的资源文件
+        if let Some(parent) = p.parent() {
+            cmd.current_dir(parent);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW | DETACHED_PROCESS：不弹控制台，也不随父进程退出
+            cmd.creation_flags(0x0800_0000 | 0x0000_0008);
+        }
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "code": "E1011",
+                    "message": format!("启动 QQ 失败：{e}")
+                })
+            }
+        };
+        let pid = child.id();
+
+        /*
+         * 等 3 秒再确认进程还活着。
+         *
+         * 为什么必须等：`spawn()` 成功只代表进程被创建，**不代表它留下了**。
+         * QQ 可能因为缺运行库、被安全软件拦下、安装损坏而起一下就退。
+         * 只报"已启动"会让用户对着毫无反应的屏幕发愣。
+         *
+         * 另外 QQ 是单实例程序：已经在跑时，新进程会把请求转交给
+         * 已有实例然后自己退出。这种情况用户要的效果已经达成，
+         * 所以只要"有 QQ 在跑"就算成功。
+         */
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+        let alive = qq_process_count();
+
+        if alive > 0 {
+            json!({
+                "ok": true,
+                "pid": pid,
+                "running": alive,
+                "message": format!("QQ 已启动（{alive} 个进程）")
+            })
+        } else {
+            json!({
+                "ok": false,
+                "code": "E1012",
+                "message": "QQ 启动了但立刻退出。常见原因：缺少运行库、被安全软件拦下，或安装损坏。"
+            })
+        }
+    })
+    .await;
+
+    match res {
+        Ok(v) => v,
         Err(e) => json!({
             "ok": false,
-            "code": "E1011",
-            "message": format!("启动 QQ 失败：{e}")
+            "code": "E1013",
+            "message": format!("启动 QQ 时内部出错：{e}")
         }),
     }
+}
+
+/// 当前有几个 QQ.exe 在跑。
+///
+/// 用 PowerShell 的 CIM 查询而不是解析 tasklist 的文本：
+/// 后者在不同语言版本下输出不同，还会把提示语里的 "QQ.exe" 算成命中。
+#[cfg(windows)]
+fn qq_process_count() -> usize {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "@(Get-CimInstance Win32_Process -Filter \"Name='QQ.exe'\" -ErrorAction SilentlyContinue).Count",
+        ])
+        .creation_flags(0x0800_0000)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+#[cfg(not(windows))]
+fn qq_process_count() -> usize {
+    0
 }
 
 #[cfg(test)]
@@ -350,6 +432,29 @@ mod tests {
         assert!(!url_allowed("https://nodejs.org@evil.example/"));
         // 后缀相近但不同域
         assert!(!url_allowed("https://evilnodejs.org/"));
+    }
+
+    #[test]
+    fn qq_spawn_rejects_non_qq_executable() {
+        // 这个接口的闸门：文件名不是 QQ.exe 一律拒绝，
+        // 否则它就成了"启动任意程序"的通用入口。
+        let tmp = std::env::temp_dir().join("not-a-qq.exe");
+        std::fs::write(&tmp, b"x").unwrap();
+        let out = tauri::async_runtime::block_on(super::ling_spawn_qq(
+            tmp.to_string_lossy().to_string(),
+        ));
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(out["ok"], serde_json::json!(false));
+        assert_eq!(out["code"], serde_json::json!("E1004"));
+    }
+
+    #[test]
+    fn qq_spawn_rejects_missing_file() {
+        let out = tauri::async_runtime::block_on(super::ling_spawn_qq(
+            r"C:\definitely\not\here\QQ.exe".to_string(),
+        ));
+        assert_eq!(out["ok"], serde_json::json!(false));
+        assert_eq!(out["code"], serde_json::json!("E1004"));
     }
 }
 

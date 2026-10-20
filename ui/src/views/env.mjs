@@ -53,7 +53,7 @@ const ui = {
  * 环境体检卡。
  *
  * @param {any} env 后端 `env.probe` 的返回
- * @param {{onRefresh?: () => void}} [ctx]
+ * @param {{onRefresh?: () => void, onProbe?: () => void}} [ctx]
  * @returns {HTMLElement}
  */
 export function renderEnvCard(env, ctx = {}) {
@@ -141,6 +141,17 @@ export function renderEnvCard(env, ctx = {}) {
 
   /* ---------------------------------------------------- 第 3 列：QQ 启动（上） */
 
+  /** 把按钮画成"运行中 / 可启动"两态之一 */
+  const paintQQ = (running) => {
+    qqBtn.disabled = Boolean(running) || !qq.installed;
+    qqBtn.replaceChildren(
+      ...bigLabel(
+        running ? 'QQ 已在运行' : 'QQ 启动',
+        running ? '无需重复启动' : qq.installed ? '拉起 QQ 客户端' : '未检测到 QQ',
+      ),
+    );
+  };
+
   const qqBtn = bigBtn({
     main: qq.running ? 'QQ 已在运行' : 'QQ 启动',
     sub: qq.running ? '无需重复启动' : qq.installed ? '拉起 QQ 客户端' : '未检测到 QQ',
@@ -151,22 +162,37 @@ export function renderEnvCard(env, ctx = {}) {
         return;
       }
       qqBtn.disabled = true;
-      qqBtn.replaceChildren(...bigLabel('启动中…', '正在拉起 QQ'));
+      qqBtn.replaceChildren(...bigLabel('启动中…', '正在确认 QQ 是否起来'));
+
       const r = await spawnQQ(qq.exe);
-      if (r.ok) {
-        say(r.message ?? '已启动 QQ', 'ok');
-        setTimeout(() => ctx.onRefresh?.(), 4000);
-      } else {
-        say(r.message ?? '启动 QQ 失败', 'err');
-      }
-      qqBtn.disabled = Boolean(qq.running);
-      qqBtn.replaceChildren(
-        ...bigLabel(qq.running ? 'QQ 已在运行' : 'QQ 启动', qq.running ? '无需重复启动' : '拉起 QQ 客户端'),
-      );
+
+      /*
+       * 是否运行成功，以**这次启动的返回结果**为准，不能用闭包里
+       * 那份旧快照 qq.running —— 它反映的是这个卡片画出来的那一刻。
+       * 之前就栽在这里：启动其实成功了，界面却按旧值把按钮画回
+       * "可启动"，看起来像失败。
+       */
+      const nowRunning = r.ok ? r.running > 0 || r.ok : Boolean(qq.running);
+      paintQQ(nowRunning);
+      say(r.ok ? (r.message ?? '已启动 QQ') : (r.message ?? '启动 QQ 失败'), r.ok ? 'ok' : 'err');
+
+      // 强制绕过 30 秒缓存重新探一次，让状态点、控制台可用性一起更新
+      if (r.ok) ctx.onProbe?.();
     },
   });
 
   /* ---------------------------------------------------- 第 3 列：SnowLuma 启动（下） */
+
+  /** 把按钮画成"运行中 / 可启动"两态之一 */
+  const paintSL = (running) => {
+    startBtn.disabled = Boolean(running) || !sl.installed;
+    startBtn.replaceChildren(
+      ...bigLabel(
+        running ? '已在运行' : 'SnowLuma 启动',
+        running ? '无需重复启动' : sl.installed ? '拉起本机实例' : '需先安装',
+      ),
+    );
+  };
 
   const startBtn = bigBtn({
     main: sl.running ? '已在运行' : 'SnowLuma 启动',
@@ -181,20 +207,20 @@ export function renderEnvCard(env, ctx = {}) {
       startBtn.disabled = true;
       startBtn.replaceChildren(...bigLabel('启动中…', '正在拉起进程'));
       const r = await spawnSnowLuma(sl.dir);
+
       if (r.ok) {
         say(r.message ?? '已启动 SnowLuma', 'ok');
-        // 它注入原生组件需要时间，等一会儿再检测；否则立刻探还是"未运行"
-        setTimeout(() => ctx.onRefresh?.(), 4000);
+        /*
+         * 注入原生组件需要时间，但按钮不能等 4 秒才变。
+         * 先把按钮画成"运行中"给个即时反馈，再延迟重探确认真实状态 ——
+         * 探回来若发现没起来，refresh 会把它改回去，不会骗人。
+         */
+        paintSL(true);
+        setTimeout(() => ctx.onProbe?.(), 4000);
       } else {
         say(r.message ?? '启动失败', 'err');
+        paintSL(Boolean(sl.running));
       }
-      startBtn.disabled = Boolean(sl.running);
-      startBtn.replaceChildren(
-        ...bigLabel(
-          sl.running ? '已在运行' : 'SnowLuma 启动',
-          sl.running ? '无需重复启动' : sl.installed ? '拉起本机实例' : '需先安装',
-        ),
-      );
     },
   });
 
@@ -394,7 +420,10 @@ export function renderEnvCardCached(ctx = {}) {
   const paint = (env) => {
     holder.replaceChildren(
       renderEnvCard(env, {
+        // 「重新检测」按钮：清掉缓存重探
         onRefresh: () => refresh(true),
+        // 启动动作之后用：同样绕过缓存，但保留操作提示
+        onProbe: () => refresh(true),
       }),
     );
   };

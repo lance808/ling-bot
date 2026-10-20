@@ -1,8 +1,8 @@
 /**
  * 路径解析 —— 数据放哪
  *
- * 开发期默认放仓库内 `data/`；打包后主进程通过 `LING_USER_DATA`
- * 指到 Electron 的 `app.getPath('userData')`。
+ * 开发期默认放仓库内 `data/`；打包后桌面壳通过 `LING_USER_DATA`
+ * 指到 `%APPDATA%\ling-bot`。
  *
  * 结构（对照 FUNCTIONS §5 F5）：
  *   <root>/config.json

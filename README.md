@@ -11,18 +11,17 @@
 
 | 方式 | 命令 | 适用 |
 | --- | --- | --- |
-| **双击 exe** | `npm run build:exe` 生成 `Ling-bot.exe`，之后双击即可 | 日常使用 |
-| 命令行 | `npm start` | 开发调试（能看完整日志） |
+| **双击 exe** | `npm run bundle:desktop` 生成 `dist/Ling-bot/Ling-bot.exe`，之后双击即可 | 日常使用 |
+| 开发运行 | `npm start` | 开发调试（自动构建并启动桌面壳） |
 | 只跑后端 | `npm run backend` | 纯 Node 下跑回归 |
 
-**exe 启动器做什么**：检查 Node 版本（>= 24.22 且 < 25）→ 检查依赖是否已装 → 拉起 `npm start`。
-检查不通过时**弹窗说明具体缺什么**，并可一键跳转 Node / SnowLuma 下载页
-（详情同时写入 `launcher-error.log`，弹窗被关掉也能事后查）。
+**桌面壳做什么**：Tauri 2 负责窗口、托盘与单实例；它拉起 Node 后端进程，
+并通过 stdin/stdout 上的 JSON-RPC 转发界面的请求。
 
-它只有 ~10KB：用 Windows 自带的 .NET Framework 编译，**不打包整个 Electron**，零新增依赖。
-源码在 `launcher/Launcher.cs`，验证在 `npm run test:exe`（14 项）。
+后端脚本和 Node 运行时随包一起分发，**目标机器不需要预装 Node**。
 
-> ⚠️ 它**不自带运行时**：目标机器需要先装 Node 24 并执行过一次 `npm install`。
+> 打包产物含一份 Node 运行时，整包约 94 MB。
+
 
 ---
 
@@ -32,7 +31,9 @@
    Ling-bot 只是 OneBot 的**客户端**，自身**没有任何注入面**，不写 DLL、不碰 QQ 进程内存。
 2. **不往 DSH 里装任何东西** —— 不写 `cordis.patch.yml`、不注册 bundle、不生成 agent preset、不挂 MCP。
    AI 大脑直连 OpenAI 兼容接口。
-3. **自己是一个 Electron 桌面应用** —— 负责拉起后端进程、承载界面、管理账号/会话/日志/诊断。
+3. **桌面端用 Tauri 2，不用 Electron** —— 窗口/托盘由 Rust 承担，界面走系统 WebView2，
+   后端仍是纯 Node 进程。这样安装包更小、启动没有额外控制台窗口、
+   任务栏图标由安装包资源直接决定，不再受 Electron 宿主身份影响。
 
 ---
 
@@ -40,23 +41,24 @@
 
 | 阶段 | 状态 | 说明 |
 | --- | --- | --- |
-| **P0 骨架** | ✅ 完成 | Electron 窗口 + 托盘 + 单实例、后端 fork 与守护、stdio JSON-RPC、**扩展骨架**、**权限模型** |
+| **P0 骨架** | ✅ 完成 | Tauri 窗口 + 托盘 + 单实例、后端进程守护、stdio JSON-RPC、**扩展骨架**、**权限模型** |
 | **P1 收消息** | ✅ 完成 | 自实现 OneBot 11 客户端、事件归一化、上游健康三态。**已对真实 SnowLuma 联调通过**（收：`group:<测试群号>` 实测） |
 | **P2 发消息** | ✅ 完成 | 唯一发送闸门（白名单 + 出站审计 + 限流）。**真实投递验证通过**（`message_id` 已返回） |
 | **P3 接大脑** | ✅ 完成 | 提示三层、流式 SSE、8 步/30 秒工具循环、R2/R3 人工确认（fail-closed）、概率唤醒三重护栏、用量记账（主动支出单列） |
 | P4 打磨 | 🚧 进行中 | 打包、人格卡 CRUD、更多工具 |
 | P5 扩展功能 | ⬜ 待做 | 语音、表情包、群管理、Qzone（架构已留口） |
 
-当前自检规模：**74 个单测 + 14 项静态检查 + 启动自检 + 两套端到端**。
+当前自检规模：**438 个单测 + 16 项静态检查 + 启动自检 + 两套端到端**。
 
 ```bash
-npm run verify:node   # Node 版本基线（>= 24.22 < 25）
-npm test              # 74 个单测
-npm run check         # 14 项静态检查（含 I15–I18 安全不变量）+ 单测
-npm run smoke         # 启动自检（后端 + JSON-RPC + 闸门行为）
-npm run live          # 真实端点只读联调（需参数：ws url + WS token）
-npm run e2e:llm       # 真实 HTTP+SSE 路径（本地假上游，不烧 token）
-npm start             # 启动桌面端
+npm run verify:node    # Node 版本基线（>= 24.22 < 25）
+npm test               # 438 个单测
+npm run check          # 16 项静态检查（含 I15–I18 安全不变量）+ 单测
+npm run smoke          # 启动自检（后端 + JSON-RPC + 闸门行为）
+npm run live           # 真实端点只读联调（需参数：ws url + WS token）
+npm run e2e:llm        # 真实 HTTP+SSE 路径（本地假上游，不烧 token）
+npm start              # 构建并启动桌面端
+npm run bundle:desktop # 生成可分发的 dist/Ling-bot
 ```
 
 > `npm run live` 的 token 要从 `D:\SnowLuma\config\onebot_<QQ号>.json` 的
@@ -70,26 +72,26 @@ npm start             # 启动桌面端
 | 组件 | 版本 | 备注 |
 | --- | --- | --- |
 | **SnowLuma** | **2.0.0** | 唯一 QQ 接入端；装于 `D:\SnowLuma` |
-| **Node.js** | **24.22.0** | SnowLuma 2.0.0 要求 `>=24`；与 Electron 内置版本对齐 |
+| **Node.js** | **24.22.0** | SnowLuma 2.0.0 要求 `>=24`；也是随包分发的运行时 |
 | **npm** | **11.19.1** | 随 Node 24 一同升级 |
-| **Electron** | **44.9.0** | 其 `DEPS` 声明 `node_version = v24.22.0` |
+| **Tauri** | **2.x** | 桌面壳；Windows 上用系统 WebView2 渲染 |
+| **Rust** | **stable（MSVC）** | 编译桌面壳，需 VS 生成工具提供链接器 |
 | **OS** | Windows x64 | 开发机 AMD64 |
 
 > ⚠️ **Node 必须 ≥ 24**。`engines` 不匹配时 npm 只警告不阻断，会埋下「构建过、运行炸」的隐患。
-> 项目级 Node 请锁 24.22.x，与 Electron 内置版本保持一致。
+> 项目级 Node 请锁 24.22.x —— 打包时会把这份运行时一起带上。
 
 ---
 
-## 快速开始（待实现）
-
-> 以下为规划中的形态，P0 阶段落地。
+## 快速开始
 
 ```bash
 # 前置：SnowLuma 已启动并完成 QQ 注入
 # 1. 确认 SnowLuma 侧 OneBot 端口（默认 HTTP 3000 / WS 3001）
-# 2. 启动桌面端
-pnpm install
-pnpm start        # 或双击打包后的 exe
+# 2. 装依赖并启动桌面端
+npm install
+npm start              # 开发运行（需 Rust + VS 生成工具）
+npm run bundle:desktop # 或直接出一份可分发目录
 ```
 
 ---

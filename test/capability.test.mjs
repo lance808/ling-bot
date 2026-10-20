@@ -50,7 +50,7 @@ test('正常回答 → 支持', () => {
     choices: [{ message: { content: '红色' }, finish_reason: 'stop' }],
   });
   assert.equal(r.supported, true);
-  assert.match(r.detail, /红色/);
+  assert.match(r.detail, /识别固定红图|红色/, '说明要能看出是验证了目标颜色');
 });
 
 test('★ 正式回答为空但思考内容描述了图 → 支持（kimi-k3 的真实形状）', () => {

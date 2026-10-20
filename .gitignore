@@ -45,14 +45,18 @@ Thumbs.db
 开发文档/用户的突发奇想.txt
 开发文档/*.txt
 
-# 构建产物：可随时用 npm run build:exe 重新生成，不进仓库。
+# 构建产物：可随时用 npm run build:desktop 重新生成，不进仓库。
 #
 # 用 *.exe 通配而不是逐个列：列名字总会漏（上次就漏了 Ling-bot-console.exe）。
-# launcher/ 下是 C# 源码，不是产物，不要被这条误伤。
+# desktop/ 下是 Rust/C# 源码，不是产物，不要被这条误伤。
 build/
 *.exe
-!launcher/**
-launcher-error.log
+
+# Rust 编译缓存（体积大，且可随时重建）
+desktop/target/
+
+# Tauri 构建时生成的 schema（每次构建自动重写，不必入库）
+desktop/gen/
 
 # 凭据保险箱（DPAPI 密文，换账户就废，但也不该进仓库）
 secret.vault

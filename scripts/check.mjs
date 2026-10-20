@@ -150,26 +150,39 @@ async function checkNoInlineStyle() {
   }
 }
 
-async function checkPreloadIsCjs() {
-  const cjs = path.join(repoRoot, 'electron/preload.cjs');
-  const esm = path.join(repoRoot, 'electron/preload.mjs');
+/**
+ * I22：桌面壳的桥接面必须比页面窄。
+ *
+ * 页面只认识 window.ling 的五个能力，桥接层必须只暴露这些；
+ * 一旦有人往桥接层里塞"顺手再加个命令"，渲染层就重新获得了
+ * 任意调用桌面命令的能力，窄接口就失效了。
+ */
+async function checkBridgeSurface() {
+  const file = path.join(repoRoot, 'desktop/bridge.js');
+  let text;
   try {
-    await fs.access(esm);
-    failures.push('存在 electron/preload.mjs：sandbox preload 必须是 CJS，否则加载失败');
+    text = await fs.readFile(file, 'utf8');
+  } catch {
+    failures.push('缺少 desktop/bridge.js（桌面桥接层）');
     return;
-  } catch {
-    /* 不存在才是对的 */
   }
-  try {
-    const text = await fs.readFile(cjs, 'utf8');
-    if (/^\s*import\s/m.test(text)) {
-      failures.push('preload.cjs 里出现了 ESM import（sandbox 下会加载失败）');
-      return;
-    }
-    passes.push('preload 是 CJS（sandbox 下可加载）');
-  } catch {
-    failures.push('缺少 electron/preload.cjs');
+  const allowed = ['snapshot', 'action', 'setting'];
+  const m = text.match(/ALLOWED_METHODS\s*=\s*new Set\(\[([^\]]*)\]\)/);
+  if (!m) {
+    failures.push('桥接层必须有 ALLOWED_METHODS 白名单');
+    return;
   }
+  const listed = [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
+  if (JSON.stringify(listed) !== JSON.stringify([...allowed].sort())) {
+    failures.push(`桥接层白名单应恰为 ${allowed.join('/')}，实际 ${listed.join('/')}`);
+    return;
+  }
+  // 登录态/凭据类东西绝不能出现在桥接层
+  if (/secret\.|apiKey|vault/i.test(text)) {
+    failures.push('桥接层出现了凭据相关字样');
+    return;
+  }
+  passes.push('I22 桌面桥接层只暴露 snapshot/action/setting');
 }
 
 /* ---------------------------------------------------------------- 文档同步 */
@@ -274,14 +287,23 @@ async function checkKeyNeverPlaintext() {
   // 一旦那样，key 就躺在明文里，拷走即泄露。
   const src = await fs.readFile(path.join(repoRoot, 'src', 'index.mjs'), 'utf8');
 
-  // (1) 保存 key 的动作必须写 vaultPath，不能写 configPath
+  // (1) 保存 key 的动作必须写 vaultPath。
+  //     可以重写 configPath，但只能写入空 apiKey（迁移旧明文），
+  //     不能把 key 变量写进配置文件。
   const saveBlock = src.slice(src.indexOf("name === 'secret.saveApiKey'"), src.indexOf("name === 'secret.clearApiKey'"));
   if (!saveBlock.includes('paths.vaultPath')) {
     failures.push('I21 保存 API Key 时没有写入保险箱（paths.vaultPath）');
     return;
   }
-  if (saveBlock.includes('paths.configPath')) {
-    failures.push('I21 保存 API Key 时写到了 config.json —— key 会以明文落盘');
+  const writesConfig = saveBlock.includes('paths.configPath');
+  const clearsConfigKey = /apiKey:\s*''/.test(saveBlock);
+  const writesRawKey = /apiKey:\s*(?!'')\w/.test(saveBlock);
+  if (writesRawKey) {
+    failures.push('I21 保存 API Key 时把 key 写进了 config.json —— 明文落盘');
+    return;
+  }
+  if (writesConfig && !clearsConfigKey) {
+    failures.push('I21 保存 API Key 时重写 config.json 但没有清空 apiKey 字段');
     return;
   }
 
@@ -370,7 +392,7 @@ async function main() {
   await checkGateIsPure();
   await checkNoInnerHtml();
   await checkNoInlineStyle();
-  await checkPreloadIsCjs();
+  await checkBridgeSurface();
   await checkDocsPresent();
   await checkToolResultNeverInSystem();
   await checkBehaviorLayerIsConstant();

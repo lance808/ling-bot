@@ -51,6 +51,7 @@ function mintToken() {
  * @type {{token?: string, admins?: string, port?: string, sessionId?: string}}
  */
 const draft = {};
+let notice = null;
 
 /** 丢掉所有草稿（保存成功后调用） */
 function clearDraft() {
@@ -70,7 +71,7 @@ export function renderDsh(snap, ctx) {
 
   const local = {
     // 草稿优先：用户刚改了还没保存的值不能被重渲染冲掉
-    token: draft.token ?? String(dsh.token ?? ''),
+    token: draft.token ?? '',
     revealed: draft.revealed === true,
     admins: draft.admins ?? (Array.isArray(dsh.admins) ? dsh.admins.join(',') : ''),
     port: draft.port ?? String(dsh.port ?? 3458),
@@ -78,8 +79,9 @@ export function renderDsh(snap, ctx) {
     enabled: dsh.enabled === true,
   };
 
-  const msg = el('div', { class: 'muted mono', text: '' });
+  const msg = el('div', { class: notice?.cls ?? 'muted mono', text: notice?.text ?? '', role: 'status' });
   const say = (t, cls = 'muted mono') => {
+    notice = { text: t, cls };
     msg.className = cls;
     msg.textContent = t;
   };
@@ -91,7 +93,7 @@ export function renderDsh(snap, ctx) {
       type: 'password',
       class: 'text-input mono',
       value: local.token,
-      placeholder: '点「生成」得到一个随机令牌',
+      placeholder: dsh.token ? '已设置（不回显）；留空保持原令牌' : '点「生成」得到一个随机令牌',
       autocomplete: 'off',
       spellcheck: false,
     })
@@ -196,7 +198,8 @@ export function renderDsh(snap, ctx) {
     });
   }
 
-  const enabledToggle = el('input', { type: 'checkbox', checked: local.enabled });
+  const enabledToggle = el('input', { type: 'checkbox', checked: draft.enabled ?? local.enabled });
+  enabledToggle.addEventListener('change', () => { draft.enabled = enabledToggle.checked; });
 
   const saveBtn = el('button', {
     class: 'btn btn-primary',
@@ -213,7 +216,7 @@ export function renderDsh(snap, ctx) {
 
       // 做了就要能起：先拦掉必然起不来的组合，别让人保存完去猜为什么没反应
       if (enabledToggle.checked) {
-        if (!token) return say('开了总开关就必须有令牌，否则端口起不来', 'err mono');
+        if (!token && !dsh.token) return say('开了总开关就必须有令牌，否则端口起不来', 'err mono');
         if (admins.length === 0) return say('开了总开关就必须有管理员，否则审批推出去没人能答', 'err mono');
         if (!Number.isInteger(port) || port < 1024 || port > 65535) {
           return say('端口要在 1024–65535 之间', 'err mono');
@@ -223,22 +226,15 @@ export function renderDsh(snap, ctx) {
         if (!/^\d{4,15}$/.test(a)) return say(`管理员「${a}」不像 QQ 号（应为 4–15 位数字）`, 'err mono');
       }
 
-      const steps = [
-        ['dsh.enabled', enabledToggle.checked],
-        ['dsh.token', token],
-        ['dsh.admins', admins],
-        ['dsh.port', port],
-        ['dsh.sessionId', sessionId],
-      ];
-      for (const [key, value] of steps) {
-        const r = await ctx.onSaveSetting(String(key), value);
-        if (!r?.ok) return say(`保存 ${key} 失败：${r?.message ?? r?.code}`, 'err mono');
-      }
+      saveBtn.disabled = true;
+      const r = await ctx.onSaveSetting('dsh.config', { enabled: enabledToggle.checked, token, admins, port, sessionId });
+      saveBtn.disabled = false;
+      if (!r?.ok) return say(`保存失败：${r?.message ?? r?.code}`, 'err mono');
       local.enabled = enabledToggle.checked;
       // 保存成功 = 磁盘已经是这些值了，草稿完成使命。
       // 清掉之后下一次渲染才会老老实实从快照取值（否则草稿会一直压着快照）。
       clearDraft();
-      say('✓ 已保存。端口改动要重启 Ling-bot 才生效', 'ok mono');
+      say(r.message ?? r.runtime?.message ?? '✓ 接入配置已保存', r.restartRequired || r.applied === false || r.runtime?.restartRequired ? 'warn mono' : 'ok mono');
     },
   });
 

@@ -6,6 +6,8 @@
  * 一切动作都走 { name, params }，由后端按注册表分发。
  */
 
+import { resultOf } from './contracts.mjs';
+
 const ling = /** @type {any} */ (globalThis).ling;
 
 export function hasBridge() {
@@ -13,8 +15,12 @@ export function hasBridge() {
 }
 
 /** @returns {Promise<any>} */
-export function snapshot() {
-  return ling.invoke('snapshot', {});
+export function snapshot(params = {}) {
+  return ling.invoke('snapshot', params);
+}
+
+export function restartBackend() {
+  return resultOf(() => ling.restartBackend());
 }
 
 /**
@@ -24,7 +30,7 @@ export function snapshot() {
  * @param {object} [params]
  */
 export function action(name, params = {}) {
-  return ling.invoke('action', { name, params });
+  return resultOf(() => ling.invoke('action', { name, params }));
 }
 
 /**
@@ -34,7 +40,7 @@ export function action(name, params = {}) {
  * @param {any} value
  */
 export function setting(key, value) {
-  return ling.invoke('setting', { key, value });
+  return resultOf(() => ling.invoke('setting', { key, value }));
 }
 
 /**
@@ -63,5 +69,5 @@ export function meta() {
  */
 export function pickFile(kind) {
   if (!ling?.pickFile) return Promise.resolve({ ok: false, canceled: true });
-  return ling.pickFile({ kind });
+  return resultOf(() => ling.pickFile({ kind }));
 }

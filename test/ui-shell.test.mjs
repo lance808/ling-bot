@@ -5,15 +5,18 @@
  * 页面文件存在、导出名对得上、主题有两条主题令牌、
  * send-media 的四类校验都在。
  *
- * 真正的渲染由 scripts/ui-e2e.mjs 覆盖（它要跑 Electron），
+ * 真正的渲染需要开窗口（见 desktop/，用 Tauri 壳）；
  * 这里只做能静态确定的部分，避免每次改文案都要开窗口。
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import path from 'node:path';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const ROOT = new URL('../', import.meta.url);
+const repoRoot = fileURLToPath(ROOT);
 
 /** @param {string} rel */
 function read(rel) {
@@ -139,13 +142,13 @@ test('sendText 和 sendMedia 走同一个闸门（不能有旁路）', () => {
   assert.equal(sendCalls, 1, `sendAction 应只被调用一次，实际 ${sendCalls} 次`);
 });
 
-test('选文件走独立 IPC 通道，不是 QQ 能力的 action', () => {
-  const preload = read('electron/preload.cjs');
-  assert.match(preload, /ling:pick-file/, 'preload 要暴露 pickFile');
-  const main = read('electron/main.mjs');
-  assert.match(main, /ipcMain\.handle\('ling:pick-file'/, '主进程要处理 pick-file');
+test('选文件走独立通道，不是 QQ 能力的 action', () => {
+  const bridge = read('desktop/bridge.js');
+  assert.match(bridge, /pickFile/, '桥接层要暴露 pickFile');
+  const rpc = read('desktop/src/rpc.rs');
+  assert.match(rpc, /ling_pick_file/, '壳要处理 ling_pick_file');
   // 只返回路径，不读内容
-  assert.match(main, /return \{ ok: true, path: res\.filePaths\[0\] \}/);
+  assert.match(rpc, /"ok": true, "path": text/);
 });
 
 /* --------------------------------------------------- 会话页 */
@@ -184,7 +187,7 @@ test('词元页不折算金额（文档明确不支持计算花费）', () => {
 test('词元页的缓存命中率区分「没有数据」和「0%」', () => {
   const src = read('ui/src/views/usage.mjs');
   assert.match(src, /hitRate === null/, '要区分 null 与 0');
-  assert.match(src, /上游未返回缓存细节/, '要解释为什么没有');
+  assert.match(src, /没有可用缓存明细|没有返回缓存明细|缓存明细/, '要解释为什么没有');
 });
 
 test('四个时间范围都在', () => {
@@ -396,12 +399,14 @@ test('★ 左下角两个按钮不换行', () => {
   assert.match(block, /white-space:\s*nowrap/);
 });
 
-test('★ 默认菜单栏必须去掉', () => {
-  // Electron 在 Windows 上默认挂 File/Edit/View/Window，本项目一项都用不上
-  const src = read('electron/main.mjs');
-  assert.match(src, /win\.setMenu\(null\)/, '窗口要移除菜单');
-  assert.match(src, /Menu\.setApplicationMenu\(null\)/, '全局也要移除');
-  assert.match(src, /autoHideMenuBar:\s*true/, '顺手禁掉 Alt 唤起');
+test('★ 桌面窗口不带原生菜单栏', () => {
+  // Tauri 窗口默认就没有 Electron 那套 File/Edit/View/Window 菜单；
+  // 这条守住的是：配置文件里不能把系统菜单挂回来，窗口也不该用原生装饰栏
+  // 之外的东西（比如自定义菜单条）。
+  const conf = read('desktop/tauri.conf.json');
+  assert.ok(!/"menu"/.test(conf), '不要配置原生菜单');
+  const lib = read('desktop/src/lib.rs');
+  assert.match(lib, /WebviewWindowBuilder::new/, '窗口由 Rust 侧创建');
 });
 
 test('★ 总览的能力要按当前模型去取', () => {
@@ -799,58 +804,63 @@ test('★ 人物页用顶部标签切换，不用左右分栏', () => {
 });
 
 
-/* ------------------------------------------- 图标设置 */
+/* ------------------------------------------- 固定默认图标 */
 
-test('★ 图标设置要在系统安全页里，能上传也能恢复默认', () => {
+test('固定默认图标，不再暴露自定义图标入口', () => {
   const sec = read('ui/src/views/security.mjs');
-  const icons = read('ui/src/views/icons.mjs');
-
-  // 入口在系统安全页：用户在自己的配置里就能找到，不用多记一个页面
-  assert.match(sec, /renderIconCards/, '系统安全页要挂图标卡片');
-
-  // 上传 / 恢复默认 / 当前状态，三个能力都要有
-  assert.match(icons, /uploadIcon/, '要能上传');
-  assert.match(icons, /resetIcon/, '要能恢复默认');
-  assert.match(icons, /iconStatus/, '要知道当前是不是自定义的');
-
-  // 尺寸要求写在界面上：用户想自己准备图时不用翻源码
-  assert.match(icons, /256×256/, '要写窗口图标尺寸');
-  assert.match(icons, /32×32/, '要写托盘图标尺寸');
-  assert.match(icons, /512×512/, '要写打包用尺寸');
+  const bridge = read('desktop/bridge.js');
+  assert.doesNotMatch(sec, /renderIconCards|views\/icons/, '安全页不该有图标卡片');
+  assert.doesNotMatch(
+    bridge,
+    /uploadIcon|resetIcon|rebuildExeIcon|iconStatus|pickIconFile/,
+    '桥接层不该暴露自定义图标接口',
+  );
+  // 图标来自打包配置，用户改不了也就不存在"换坏了"
+  const conf = read('desktop/tauri.conf.json');
+  assert.match(conf, /icons\/icon\.ico/, '安装包图标固定使用内置 ICO');
 });
 
-test('★ 图标状态要活在模块作用域', () => {
-  // 快照每 2 秒重绘，局部变量会跟着 DOM 一起消失
-  const src = read('ui/src/views/icons.mjs');
-  const fnStart = src.indexOf('export function renderIconCards');
-  const before = src.slice(0, fnStart);
-  assert.match(before, /const ui = \{/, 'state 在函数外');
-  for (const k of ['status', 'notice', 'busy']) {
-    assert.ok(before.includes(k), '要有 ' + k + ' 字段');
+test('★ 任务栏图标由打包资源决定', () => {
+  /*
+   * 实际踩过的坑：Electron 时代只改 BrowserWindow({icon})，窗口图标变了，
+   * 但任务栏那一项还是旧图标 —— 因为那用的是 exe 里嵌的资源。
+   * 换到 Tauri 后图标直接来自 tauri.conf.json 的 bundle 资源，
+   * 所以这条守的是：配置文件里必须指到那份 ICO，且文件真实存在。
+   */
+  const conf = JSON.parse(read('desktop/tauri.conf.json'));
+  const icons = conf.bundle?.icon ?? [];
+  assert.ok(
+    icons.some((p) => p.endsWith('icon.ico')),
+    `bundle 图标要含 icon.ico，实际 ${icons.join(', ')}`,
+  );
+  for (const rel of icons) {
+    assert.ok(existsSync(path.join(repoRoot, 'desktop', rel)), `图标文件缺失：${rel}`);
   }
 });
 
-test('★ 自定义图标必须能回落到内置图标', () => {
-  const icons = read('electron/icons.mjs');
-  assert.match(icons, /export function pickIconPath/, '要有回落逻辑');
-  assert.match(icons, /customPath/, '要区分自定义');
-  assert.match(icons, /builtinPath/, '要区分内置默认');
-  // 校验函数自己抛错时也不能把异常冒出去 —— 否则图标坏掉会连带启动失败
-  assert.match(icons, /catch \{[\s\S]{0,120}return builtinPath/, '校验出错也要回落');
+/* ------------------------------------------------ 图标目录的分工 */
 
-  const main = read('electron/main.mjs');
-  assert.match(main, /customIconPath\(resolvePaths\(\)\.root/, '自定义图标放数据目录');
-  assert.ok(!/customIconPath\(process\.cwd\(\)/.test(main), '不能用 cwd 算路径');
-});
-
-test('★ 启动器 exe 要嵌入图标，否则任务栏换不掉', () => {
+test('★ desktop/icons 只放打包要的尺寸，且与 assets 源图一致', () => {
   /*
-   * 实际踩到的坑：只改 BrowserWindow({icon}) 之后，窗口图标变了，
-   * 但任务栏上"固定的那一项"还是旧图标 —— 因为那用的是 exe 里嵌的资源。
+   * 两个图标目录各有各的职责，不该互相长成一模一样：
+   *   assets/          —— 源图（512 PNG）与脚本，是唯一的"真图"
+   *   desktop/icons/   —— Tauri 打包约定名的产物
+   *
+   * 曾经的问题是 desktop/icons 里多出一份 512 的 icon.png（没人引用），
+   * 以及一份和 assets 字节完全相同的 icon.ico 副本可能悄悄漂移。
+   * 所以这里同时钉住"不多生成"和"副本必须同步"。
    */
-  const build = read('scripts/build-launcher.mjs');
-  assert.match(build, /win32icon/, '要嵌 exe 图标');
-  assert.match(build, /assets', 'icon\.ico'/, '用 assets/icon.ico');
-  // ico 不存在时不能阻断构建
-  assert.match(build, /existsSync\(icoPath\)/, '图标缺失不能让编译失败');
+  const produced = readdirSync(path.join(repoRoot, 'desktop', 'icons')).sort();
+  const expected = ['128x128.png', '128x128@2x.png', '32x32.png', 'icon.ico'];
+  assert.deepEqual(produced, expected, `desktop/icons 内容应为打包所需的四个文件`);
+
+  // icon.ico 是复制品：只要 assets 换了图，这里必须跟着换，否则任务栏还是旧图标
+  const assetsIco = readFileSync(path.join(repoRoot, 'assets', 'icon.ico'));
+  const tauriIco = readFileSync(path.join(repoRoot, 'desktop', 'icons', 'icon.ico'));
+  assert.ok(assetsIco.equals(tauriIco), 'desktop/icons/icon.ico 必须与 assets/icon.ico 字节一致');
+
+  // 生成脚本不能再硬编码本机路径，否则换台机器就重跑不了
+  const gen = read('scripts/make-tauri-icons.mjs');
+  assert.ok(!/['"]D:\/Ling-bot/.test(gen), '图标脚本不能硬编码 D:/Ling-bot 绝对路径');
+  assert.match(gen, /fileURLToPath\(import\.meta\.url\)/, '要用脚本自身位置推仓库根');
 });

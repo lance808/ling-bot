@@ -14,8 +14,9 @@
  */
 
 import { getState, set, subscribe, toast } from './store.mjs';
-import { snapshot, action, setting, onEvent, meta, hasBridge } from './api.mjs';
+import { snapshot, action, setting, onEvent, meta, hasBridge, restartBackend } from './api.mjs';
 import { el, clear } from './render.mjs';
+import { snapshotQuery, usageQuery } from './contracts.mjs';
 import { renderOverview } from './views/overview.mjs';
 import { renderSessions } from './views/sessions.mjs';
 import { renderPersona, renderBehaviorLayer } from './views/persona.mjs';
@@ -82,6 +83,8 @@ const local = {
   lastTurnError: null,
   /** 词元页的时间范围选择 */
   usageRange: '24h',
+  usageData: null,
+  usageLoadedAt: 0,
   /*
    * 右侧思考面板的界面状态。
    *
@@ -99,6 +102,8 @@ const local = {
    */
   think: {
     collapsed: false,
+    days: 1,
+    before: null,
     filter: 'all',
     /** @type {Set<string>} */
     expanded: new Set(),
@@ -315,8 +320,12 @@ function paintThinkPanel(state) {
     onCollapse: (v) => setThinkCollapsed(v),
     onFilter: (f) => {
       local.think.filter = f;
-      refreshThinkOnly();
+      local.think.before = null;
+      void pull();
     },
+    onDays: (days) => { local.think.days = days; local.think.before = null; void pull(); },
+    onOlder: (before) => { local.think.before = before; void pull(); },
+    onLatest: () => { local.think.before = null; void pull(); },
     onToggleStep: (key) => {
       if (!(local.think.expanded instanceof Set)) local.think.expanded = new Set();
       if (local.think.expanded.has(key)) local.think.expanded.delete(key);
@@ -432,8 +441,15 @@ document.getElementById('btn-reconnect')?.addEventListener('click', async () => 
   toast(res?.ok ? '已请求重连' : `重连失败：${res?.message ?? ''}`);
 });
 
-document.getElementById('btn-restart')?.addEventListener('click', () => {
-  toast('已请求重启后端，窗口保持开启');
+document.getElementById('btn-restart')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const result = await restartBackend();
+    toast(result.ok ? (result.message || '已请求重启后端') : `重启失败：${result.message}`);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 /* ---------------------------------------------------------------- 环境信息 */
@@ -441,7 +457,13 @@ document.getElementById('btn-restart')?.addEventListener('click', () => {
 const env = document.getElementById('env-info');
 if (env) {
   const m = meta();
-  env.textContent = `Electron ${m.versions?.electron ?? '?'} · Node ${m.versions?.node ?? '?'} · ${m.platform ?? ''}`;
+  // 桌面壳换过一茬（Electron → Tauri），这里按可用字段拼，不写死名字
+  const shell = m.shell ?? (m.versions?.tauri ? 'Tauri' : 'Electron');
+  const shellVer = m.versions?.tauri ?? m.versions?.electron ?? '?';
+  const parts = [`${shell} ${shellVer}`];
+  if (m.versions?.node) parts.push(`Node ${m.versions.node}`);
+  if (m.platform) parts.push(m.platform);
+  env.textContent = parts.join(' · ');
 }
 
 if (!hasBridge()) {
@@ -456,22 +478,56 @@ if (!hasBridge()) {
 /* ---------------------------------------------------------------- 快照轮询 */
 
 let polling = false;
+let pullAgain = false;
+let lastSnapshotAt = 0;
+const snapshotNotice = el('div', { class: 'hint', role: 'status', hidden: true });
+view.before(snapshotNotice);
+
+function showSnapshotHealth(error = '') {
+  snapshotNotice.hidden = !error;
+  snapshotNotice.textContent = error
+    ? `数据暂未更新：${error}。${lastSnapshotAt ? `当前显示 ${new Date(lastSnapshotAt).toLocaleTimeString()} 的快照。` : '尚未取得后端快照。'}`
+    : '';
+}
+
+let usageLoading = false;
+async function loadUsage() {
+  if (usageLoading) return;
+  usageLoading = true;
+  const range = local.usageRange;
+  try {
+    const result = await action('usage.query', usageQuery(range));
+    if (range === local.usageRange) {
+      local.usageData = result.ok ? (result.range ?? result.usage?.range ?? result) : { ...usageQuery(range), covered: false, lastError: result.message };
+      local.usageLoadedAt = Date.now();
+    }
+  } finally { usageLoading = false; }
+}
 
 async function pull() {
-  if (polling) return;
+  if (polling) { pullAgain = true; return; }
   polling = true;
   try {
-    const snap = await snapshot();
+    const snap = await snapshot(snapshotQuery({
+      convKey: local.think.filter === 'current' ? currentConvOf(getState()) || null : null,
+      days: local.think.days, before: local.think.before,
+    }));
+    // Full journal aggregation is cached separately; do not rescan it every two seconds.
+    if (!snap.booting && (!local.usageData || Date.now() - local.usageLoadedAt > 30000)) await loadUsage();
+    if (snap.usage && local.usageData) snap.usage.range = local.usageData;
+    lastSnapshotAt = Date.now();
+    showSnapshotHealth();
     // 后端还在 boot()：不要把它当"空数据"渲染，避免误导成"一个群都没配"
     if (snap?.booting) {
       set({ snapshot: snap });
       return;
     }
     set({ snapshot: snap });
-  } catch {
-    // 后端可能正在重启；保持上一次快照，不刷错误
+  } catch (error) {
+    showSnapshotHealth(String(error?.message ?? error));
   } finally {
     polling = false;
+    if (pullAgain) { pullAgain = false; void pull(); }
   }
 }
 
@@ -704,6 +760,12 @@ function makeCardCtx(kind) {
     kind,
     cards: getState().snapshot?.[snapKey]?.cards ?? [],
     activeId: getState().snapshot?.[snapKey]?.activeId ?? '',
+    defaultId: getState().snapshot?.[snapKey]?.defaultId ?? '',
+    onSetDefault: async (id) => {
+      const r = await action(`${act}.setDefault`, { id });
+      if (r.ok) await pull();
+      return r;
+    },
     draft: local.cardDirty[kind]
       ? local.cardDraft[kind]
       : ((getState().snapshot?.[snapKey]?.cards ?? []).find(
@@ -719,7 +781,7 @@ function makeCardCtx(kind) {
     onSelect: async (id) => {
       const r = await action(`${act}.activate`, { id });
       // 切卡后丢弃草稿，否则会把上一张卡的内容写进新卡
-      local.cardDirty[kind] = false;
+      if (r.ok) local.cardDirty[kind] = false;
       await pull();
       return r;
     },
@@ -779,7 +841,7 @@ function makeCardCtx(kind) {
 
     onDelete: async (id) => {
       const r = await action(`${act}.delete`, { id });
-      local.cardDirty[kind] = false;
+      if (r.ok) local.cardDirty[kind] = false;
       await pull();
       return r;
     },
@@ -855,22 +917,22 @@ function render() {
     },
 
     model: {
-      onSaveSetting: async (k, v) => {
+      onSaveSetting: (k, v) => withPaintLock(async () => {
         const r = await setting(k, v);
         await pull();
         return r;
-      },
+      }),
       onSaveApiKey: (key) =>
         withPaintLock(async () => {
           const r = await action('secret.saveApiKey', { key });
           await pull();
           return r;
         }),
-      onClearApiKey: async () => {
+      onClearApiKey: () => withPaintLock(async () => {
         const r = await action('secret.clearApiKey', {});
         await pull();
         return r;
-      },
+      }),
       onTest: () => withPaintLock(() => action('llm.test', {})),
       onDetectModels: () => withPaintLock(() => action('llm.models', {})),
       onProbe: (model, probe) => withPaintLock(() => action('llm.probe', { model, probe })),
@@ -947,7 +1009,9 @@ function render() {
       range: local.usageRange,
       onRange: (r) => {
         local.usageRange = r;
+        local.usageData = null;
         render();
+        void pull();
       },
     },
     logs: {

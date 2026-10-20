@@ -280,7 +280,7 @@ function renderKind(snap, ctx, which, copy) {
           class: 'field-hint',
           text:
             scope === 'global'
-              ? `没有专属${copy.label}的群和私聊都用这张。`
+              ? `全局候选卡；设为全局默认后，没有专属${copy.label}的群和私聊才会使用。`
               : `只对${scope === 'group' ? '这个群' : '这个私聊'}生效；其它会话仍用全局那张。号码填${scope === 'group' ? '群号' : 'QQ 号'}。`,
         }),
       ]),
@@ -404,7 +404,7 @@ function renderKind(snap, ctx, which, copy) {
                   setField('nameDraft', null);
                   say(
                     r?.ok ? 'ok' : 'err',
-                    r?.ok ? `已切换到「${c.name}」，下一回合生效` : `切换失败：${r?.message ?? ''}`,
+                    r?.ok ? `正在编辑「${c.name}」；实际注入由默认卡和专属范围决定` : `切换失败：${r?.message ?? ''}`,
                   );
                 },
               },
@@ -420,9 +420,16 @@ function renderKind(snap, ctx, which, copy) {
                   class: `tag${c.scope === 'global' ? '' : ' tag-strong'}`,
                   text: c.scope === 'global' ? '全局' : describeScope(c.scope, c.scopeId),
                 }),
-                el('span', { class: 'muted', text: c.id === ctx.activeId ? '使用中' : `${c.length} 字` }),
+                el('span', { class: 'muted', text: `${c.id === ctx.activeId ? '编辑中 · ' : ''}${c.id === ctx.defaultId ? '全局默认 · ' : ''}${c.length} 字` }),
               ],
             ),
+            c.scope === 'global' && c.id !== ctx.defaultId ? el('button', {
+              class: 'btn btn-sm', type: 'button', text: '设为全局默认',
+              onclick: async () => {
+                const r = await ctx.onSetDefault(c.id);
+                say(r.ok ? 'ok' : 'err', r.ok ? `「${c.name}」已设为全局默认，下一回合生效` : `设置失败：${r.message}`);
+              },
+            }) : null,
             el('button', {
               class: 'btn btn-ghost',
               type: 'button',

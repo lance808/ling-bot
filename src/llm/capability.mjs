@@ -131,7 +131,7 @@ export async function probeVision({ baseUrl, apiKey, model, timeoutMs = 20000, s
     }
     // 4xx/5xx：看错误信息判断是不是"不支持图片"
     const msg = extractErr(res.data, res.status);
-    return { supported: false, code: `E${res.status}`, detail: msg };
+    return { supported: capabilityRejection(res.status, msg, 'vision'), code: `E${res.status}`, detail: msg };
   } catch (err) {
     // 网络层失败：没结论，不能判成"不支持"
     const e = /** @type {any} */ (err);
@@ -178,16 +178,16 @@ export function judgeVisionAnswer(data) {
     return { supported: false, detail: '模型明确表示无法处理图片' };
   }
 
-  // (2) 正式回答里有内容 → 看到了
+  // 固定红图必须得到颜色证据；普通文字不能证明图片被读取。
   if (content.length > 0) {
-    return { supported: true, detail: content.slice(0, 40) };
+    return { supported: /红色|红的|纯红|\bred\b/i.test(content) ? true : null, detail: /红色|红的|纯红|\bred\b/i.test(content) ? '识别固定红图颜色（单次探测）' : '回答没有验证目标颜色，尚不能确认视觉能力' };
   }
 
   // (3) 正式回答为空，但思考内容在描述图片 → 看到了（只是被 max_tokens 截断）
   if (reasoning.length > 0) {
     // 思考里在描述颜色/内容，就说明视觉通路是通的
     const describesImage =
-      /(red|blue|green|yellow|black|white|color|colour|square|pixel|image|picture|红|蓝|绿|黄|黑|白|色)/i.test(
+      /(\bred\b|红色|纯红)/i.test(
         reasoning,
       );
     if (describesImage) {
@@ -223,6 +223,7 @@ export async function probeImageGen({ baseUrl, apiKey, model, timeoutMs = 30000 
   if (!apiKey) return { supported: null, code: 'E3020', detail: '还没配置 API Key' };
 
   // (1) 先试标准生图端点
+  let standardRejected = false;
   const imgUrl = imagesUrlOf(baseUrl);
   try {
     const res = await postJson(
@@ -232,16 +233,16 @@ export async function probeImageGen({ baseUrl, apiKey, model, timeoutMs = 30000 
       timeoutMs,
     );
     if (res.status === 200) {
-      const n = Array.isArray(res.data?.data) ? res.data.data.length : 0;
+      const n = Array.isArray(res.data?.data) ? res.data.data.filter(hasImageEvidence).length : 0;
       if (n > 0) return { supported: true, via: 'images', detail: `返回 ${n} 张图` };
-      return { supported: false, via: 'images', detail: '接口正常但没有返回图片' };
+      return { supported: null, via: 'images', detail: '接口正常但没有可验证图片' };
     }
     // 404/405 说明这家根本没有生图端点，继续试第二种形态
     if (res.status !== 404 && res.status !== 405) {
       const msg = extractErr(res.data, res.status);
       // 有些站对不支持的模型返回 400 且信息里带 "not support"
-      if (/not\s*support|unsupported|no\s*such\s*model|不支持/i.test(msg)) {
-        return { supported: false, via: 'images', detail: msg };
+      if (capabilityRejection(res.status, msg, 'image') === false) {
+        standardRejected = true;
       }
       // 其它 4xx 也可能是模型不支持，但证据不足 → 继续试 chat 形态
     }
@@ -264,12 +265,12 @@ export async function probeImageGen({ baseUrl, apiKey, model, timeoutMs = 30000 
     );
     if (res.status === 200) {
       const msg = res.data?.choices?.[0]?.message;
-      const hasImage = Array.isArray(msg?.images) || Boolean(msg?.content && typeof msg.content !== 'string');
+      const hasImage = (Array.isArray(msg?.images) && msg.images.some(hasImageEvidence)) || (Array.isArray(msg?.content) && msg.content.some(b => /image/.test(b?.type ?? '') && hasImageEvidence(b)));
       if (hasImage) return { supported: true, via: 'chat', detail: '对话接口返回了图片' };
-      return { supported: false, via: 'chat', detail: '接口接受了请求但没有返回图片' };
+      return { supported: null, via: 'chat', detail: '接口接受了请求但没有可验证图片' };
     }
     const m = extractErr(res.data, res.status);
-    return { supported: false, via: 'chat', detail: m };
+    return { supported: standardRejected && capabilityRejection(res.status, m, 'image') === false ? false : null, via: 'chat', detail: m };
   } catch (err) {
     const e = /** @type {any} */ (err);
     return { supported: null, code: e?.code ?? 'E3012', detail: String(e?.message ?? e) };
@@ -336,6 +337,13 @@ export function inferChannel({ model, caps }) {
  * @param {Record<string, any>} capsByModel
  * @returns {Array<{id: string, channel: string, channelLabel: string, basis: string, vision: boolean|null, image: boolean|null}>}
  */
+export function endpointKey(baseUrl) {
+  const u = new URL(chatUrlOf(baseUrl));
+  u.username = ''; u.password = ''; u.hash = ''; u.search = '';
+  return u.href;
+}
+export function endpointCapabilities(all, baseUrl) { return all?.[endpointKey(baseUrl)] ?? {}; }
+
 export function describeCatalog(ids, capsByModel = {}) {
   return ids.map((id) => {
     const caps = capsByModel[id] ?? {};
@@ -384,7 +392,7 @@ export function imagesUrlOf(baseUrl) {
 async function postJson(url, apiKey, body, timeoutMs, signal) {
   /** @type {AbortSignal} */
   let sig;
-  if (signal) sig = signal;
+  if (signal) sig = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
   else sig = AbortSignal.timeout(timeoutMs);
 
   let res;
@@ -417,6 +425,19 @@ async function postJson(url, apiKey, body, timeoutMs, signal) {
 }
 
 /** 从各家不同的错误形状里抠出人能看懂的句子 */
+function capabilityRejection(status, msg, kind) {
+  if ([401, 403, 408, 409, 429].includes(status) || status >= 500) return null;
+  if (/size|dimension|resolution|width|height|参数|尺寸|分辨率/i.test(msg)) return null;
+  return /(?:model|vision|image|visual).*(?:not\s*support|unsupported)|(?:not\s*support|unsupported).*(?:model|vision|image|visual)|不支持.*(?:图片|图像|视觉|生图)|无法.*(?:图片|图像|视觉)/i.test(msg) ? false : null;
+}
+function hasImageEvidence(value) {
+  if (typeof value === 'string') return /^(https?:\/\/|data:image\/|base64:)/i.test(value);
+  if (!value || typeof value !== 'object') return false;
+  if (typeof value.b64_json === 'string' && value.b64_json.length >= 16 && /^[A-Za-z0-9+/]+={0,2}$/.test(value.b64_json)) return true;
+  if (value.image_url && typeof value.image_url === 'object') return hasImageEvidence(value.image_url);
+  return ['url', 'image_url', 'data'].some(k => typeof value[k] === 'string' && /^(https?:\/\/|data:image\/|base64:)/i.test(value[k]));
+}
+
 function extractErr(data, status) {
   const e = data?.error;
   if (typeof e === 'string') return e.slice(0, 200);

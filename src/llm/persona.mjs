@@ -86,6 +86,7 @@ export class CardStore {
     /** @type {Card[]} */
     this.cards = [];
     this.activeId = null;
+    this.defaultId = null;
   }
 
   /** 读盘（含旧格式迁移） */
@@ -107,9 +108,9 @@ export class CardStore {
         scopeId: normalizeScope(c.scope) === 'global' ? '' : String(c.scopeId ?? ''),
       }));
       this.activeId = typeof raw.activeId === 'string' ? raw.activeId : null;
-      if (!this.activeId || !this.cards.some((c) => c.id === this.activeId)) {
-        this.activeId = this.cards[0]?.id ?? null;
-      }
+      this.defaultId = typeof raw.defaultId === 'string' ? raw.defaultId : null;
+      if (!this.activeId || !this.cards.some((c) => c.id === this.activeId)) this.activeId = this.cards[0]?.id ?? null;
+      if (!this.defaultId || !this.cards.some((c) => c.id === this.defaultId && c.scope === 'global')) this.defaultId = this.cards.find(c => c.scope === 'global')?.id ?? null;
       return this;
     }
 
@@ -118,6 +119,7 @@ export class CardStore {
       const card = makeCard(this.idPrefix, this.defaultName, raw.text);
       this.cards = [card];
       this.activeId = card.id;
+      this.defaultId = card.id;
       await this.#persist();
       return this;
     }
@@ -171,7 +173,7 @@ export class CardStore {
 
   /** @returns {Card | null} */
   #globalCard() {
-    return this.cards.find((c) => c.scope === 'global') ?? null;
+    return this.cards.find((c) => c.id === this.defaultId && c.scope === 'global') ?? this.cards.find((c) => c.scope === 'global') ?? null;
   }
 
   /**
@@ -219,6 +221,7 @@ export class CardStore {
     const card = makeCard(this.idPrefix, trimmedName, String(text ?? ''), s, sid);
     this.cards.push(card);
     if (!this.activeId) this.activeId = card.id;
+    if (!this.defaultId && s === 'global') this.defaultId = card.id;
     await this.#persist();
     return { ok: true, card };
   }
@@ -304,6 +307,14 @@ export class CardStore {
     return { ok: true, activeId: this.activeId };
   }
 
+  async setDefault(id) {
+    if (!this.cards.some(c => c.id === id && c.scope === 'global')) return { ok: false, code: 'E4041', message: '全局默认必须选择一张全局卡' };
+    const old = this.defaultId;
+    this.defaultId = id;
+    try { await this.#persist(); } catch (e) { this.defaultId = old; throw e; }
+    return { ok: true, defaultId: id };
+  }
+
   /** @param {string} id */
   async activate(id) {
     if (!this.cards.some((c) => c.id === id)) {
@@ -323,6 +334,7 @@ export class CardStore {
     return {
       limit: this.limit,
       label: this.label,
+      defaultId: this.#globalCard()?.id ?? null,
       activeId: this.activeId,
       cards: this.cards.map((c) => ({
         id: c.id,
@@ -341,8 +353,10 @@ export class CardStore {
   }
 
   async #persist() {
+    if (!this.cards.some(c => c.id === this.defaultId && c.scope === 'global')) this.defaultId = this.cards.find(c => c.scope === 'global')?.id ?? null;
     await writeJsonAtomic(this.filePath, {
       version: this.version,
+      defaultId: this.defaultId,
       activeId: this.activeId,
       cards: this.cards,
     });

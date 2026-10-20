@@ -25,7 +25,7 @@ const repoRoot = path.join(__dirname, '..');
 const FROZEN_FILES = [
   'src/onebot/transport.mjs',
   'src/guard/send-gate.mjs',
-  'electron/preload.cjs',
+  'desktop/bridge.js',
   'ui/src/api.mjs',
 ];
 

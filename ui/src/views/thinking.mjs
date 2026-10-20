@@ -232,7 +232,7 @@ export function renderThinkingPanel(snap, ctx = {}) {
           el('span', {
             class: 'think-count',
             text: shown > 0 ? `${shown} 条` : '空',
-            title: data.total > shown ? `后端共记录 ${data.total} 条，这里显示最近 ${shown} 条` : '',
+            title: `留存 ${data.total} 个回合，本页 ${shown} 个思考步骤`,
           }),
           el(
             'button',
@@ -243,10 +243,10 @@ export function renderThinkingPanel(snap, ctx = {}) {
               'aria-label': '展开思考链路',
               onclick: () => ctx.onCollapse?.(false),
             },
-            [el('span', { text: '‹' })],
+            [el('span', { text: '⌄', 'aria-hidden': 'true' })],
           ),
         ]),
-        el('div', { class: 'think-folded-hint', text: '已收起，点 ‹ 展开' }),
+        el('div', { class: 'think-folded-hint', text: '已收起，点向下箭头展开' }),
       ]),
     ]);
   }
@@ -260,7 +260,7 @@ export function renderThinkingPanel(snap, ctx = {}) {
         el('span', {
           class: 'think-count',
           text: shown > 0 ? `${shown} 条` : '空',
-          title: data.total > shown ? `后端共记录 ${data.total} 条，这里显示最近 ${shown} 条` : '',
+          title: `留存 ${data.total} 个回合，本页 ${shown} 个思考步骤`,
         }),
         el(
           'button',
@@ -271,7 +271,7 @@ export function renderThinkingPanel(snap, ctx = {}) {
             'aria-label': '收起思考链路面板',
             onclick: () => ctx.onCollapse?.(true),
           },
-          [el('span', { text: '›' })],
+          [el('span', { text: '⌃', 'aria-hidden': 'true' })],
         ),
       ]),
       el('div', { class: 'think-seg' }, [
@@ -287,6 +287,11 @@ export function renderThinkingPanel(snap, ctx = {}) {
     ]),
   ]);
 
+  root.append(el('div', { class: 'row wrap' }, [
+    ...[1, 7, 30].map((days) => segBtn(`最近 ${days} 个记录日`, (ui.days ?? 1) === days, () => ctx.onDays?.(days), false)),
+    el('button', { type: 'button', class: 'btn btn-sm', text: '最新记录', disabled: !ui.before, onclick: () => ctx.onLatest?.() }),
+    el('button', { type: 'button', class: 'btn btn-sm', text: '更早记录', disabled: !snap?.thinking?.hasMore || !snap?.thinking?.nextBefore, onclick: () => ctx.onOlder?.(snap.thinking.nextBefore) }),
+  ]));
   const scroll = el('div', { class: 'think-scroll' });
 
   if (days.length === 0) {
@@ -340,7 +345,7 @@ function emptyHint(data, filter, currentConv) {
     return '还没识别到当前会话。去会话总览选一个会话，或者切回「全部会话」。';
   }
   if (filter === 'current') {
-    return `当前会话（${convLabel(currentConv)}）还没有思考记录，切到「全部会话」可以看其他会话。`;
+    return `当前查询范围内没有 ${convLabel(currentConv)} 的思考记录，可返回最新记录或扩大记录日范围。`;
   }
   return '这个时间范围内没有思考内容。非推理模型不会返回 reasoning。';
 }

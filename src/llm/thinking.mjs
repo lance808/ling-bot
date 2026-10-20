@@ -162,6 +162,7 @@ export class ThinkingStore {
 
     this.#days.clear();
     this.#dirty.clear();
+    this.lastError = null;
     const cutoff = daysAgoKey(this.#now(), this.#maxDays - 1);
 
     for (const name of names) {
@@ -180,6 +181,7 @@ export class ThinkingStore {
       }
       const day = parseDay(date, raw);
       if (day) this.#days.set(date, day);
+      else this.lastError = new Error('思考历史文件格式损坏');
     }
 
     result.loaded = this.#days.size;
@@ -253,7 +255,7 @@ export class ThinkingStore {
    *
    * 返回的是拷贝：调用方（界面快照）随便改都不会污染内存里的记录。
    *
-   * @param {{convKey?: string | null, days?: number, limit?: number}} [query]
+   * @param {{convKey?: string | null, days?: number, limit?: number, before?: string, beforeDate?: string}} [query]
    * @returns {{days: Array<{date: string, entries: object[]}>, total: number}}
    */
   view(query = {}) {
@@ -274,13 +276,22 @@ export class ThinkingStore {
       total += entries.length;
       if (entries.length > 0) perDay.push({ date, entries });
     }
-    if (perDay.length === 0) return { days: [], total: 0 };
-
-    const picked = perDay.slice(-dayCount);
+    const available = perDay.filter(d => !query.beforeDate || d.date < String(query.beforeDate));
+    let pageEnd = null;
+    if (query.before) {
+      const cursor = JSON.parse(Buffer.from(String(query.before), 'base64url').toString());
+      if (cursor.convKey !== convKey || !Number.isSafeInteger(cursor.end) || cursor.end < 0) throw new Error('思考分页游标不匹配');
+      pageEnd = cursor.end;
+    }
+    const picked = available;
     /** @type {Array<{date: string, entry: any}>} */
     const flat = [];
     for (const day of picked) for (const entry of day.entries) flat.push({ date: day.date, entry });
-    const keep = flat.length > limit ? flat.slice(-limit) : flat;
+    const end = pageEnd === null ? flat.length : Math.min(pageEnd, flat.length);
+    const dates = [...new Set(flat.slice(0, end).map(x => x.date))].slice(-dayCount);
+    let start = Math.max(0, end - limit);
+    while (start < end && !dates.includes(flat[start].date)) start++;
+    const keep = flat.slice(start, end);
 
     /** @type {Map<string, object[]>} */
     const grouped = new Map();
@@ -293,6 +304,13 @@ export class ThinkingStore {
     return {
       days: [...grouped.entries()].map(([date, entries]) => ({ date, entries })),
       total,
+      entryCount: keep.length,
+      stepCount: keep.reduce((n, x) => n + x.entry.steps.length, 0),
+      hasMore: start > 0,
+      nextBefore: start > 0 ? Buffer.from(JSON.stringify({ convKey, end: start })).toString('base64url') : null,
+      nextBeforeDate: start > 0 ? keep[0]?.date ?? null : null,
+      lastError: this.lastError ? '思考仓库读取或写入失败，历史可能不完整' : null,
+      retentionDays: this.#maxDays,
     };
   }
 

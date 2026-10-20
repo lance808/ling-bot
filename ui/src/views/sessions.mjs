@@ -20,6 +20,8 @@
 import { el, card, clock } from '../render.mjs';
 import { pickFile } from '../api.mjs';
 
+const draft = { text: '', picked: null, result: null, target: '' };
+
 /** 手动发送支持的类型 */
 const MEDIA = [
   { kind: 'image', label: '图片' },
@@ -113,19 +115,24 @@ export function renderSessions(snap, ctx) {
       el('option', { value: k, text: k.startsWith('group:') ? `群 ${k.split(':')[1]}` : `私聊 ${k.split(':')[1]}` }),
     ),
   ]);
-  /** @type {any} */ (sel).value = selected ?? '';
+  /** @type {any} */ (sel).value = allKeys.includes(draft.target) ? draft.target : selected ?? '';
+  sel.addEventListener('change', () => { draft.target = sel.value; });
 
   const result = el('div', { class: 'field-hint', text: '' });
 
   /** 当前选中的媒体（只在界面上暂存，不落盘） */
-  let picked = /** @type {{kind: string, path: string} | null} */ (null);
-  const pickedLabel = el('div', { class: 'field-hint', text: '' });
+  let picked = draft.picked;
+  const pickedLabel = el('div', { class: 'field-hint', text: picked ? `已选：${picked.kind} · ${picked.path}` : '' });
 
   const input = /** @type {HTMLTextAreaElement} */ (
     el('textarea', { placeholder: '输入要发送的文本（会经过白名单与出站审计）', rows: 3 })
   );
 
+  input.value = draft.text;
+  input.addEventListener('input', () => { draft.text = input.value; });
+
   const showResult = (/** @type {any} */ res) => {
+    draft.result = res;
     if (res?.ok) {
       result.textContent = '已发送';
       result.className = 'field-hint';
@@ -147,8 +154,12 @@ export function renderSessions(snap, ctx) {
       if (!value) return showResult({ ok: false, message: '内容为空' });
       sendTextBtn.disabled = true;
       try {
-        showResult(await ctx.onSend(target, value));
-        input.value = '';
+        const response = await ctx.onSend(target, value);
+        showResult(response);
+        if (response?.ok && draft.text.trim() === value) {
+          input.value = '';
+          draft.text = '';
+        }
       } finally {
         sendTextBtn.disabled = false;
       }
@@ -168,6 +179,7 @@ export function renderSessions(snap, ctx) {
           return;
         }
         picked = { kind: m.kind, path: String(r.path) };
+        draft.picked = picked;
         pickedLabel.textContent = `已选：${m.label} · ${r.path}`;
       },
     }),
@@ -187,6 +199,7 @@ export function renderSessions(snap, ctx) {
         showResult(res);
         if (res?.ok) {
           picked = null;
+          draft.picked = null;
           pickedLabel.textContent = '';
         }
       } finally {
@@ -195,6 +208,7 @@ export function renderSessions(snap, ctx) {
     },
   });
 
+  if (draft.result) showResult(draft.result);
   return el('div', { class: 'split' }, [
     card('会话', [el('div', {}, listBody)]),
     el('div', {}, [

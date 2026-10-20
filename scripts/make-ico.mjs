@@ -1,21 +1,19 @@
 /**
- * 从 assets/icon.png 生成 assets/icon.ico（多尺寸），供启动器嵌入。
+ * 从 assets/icon.png 生成 assets/icon.ico（多尺寸）。
  *
- * 源图由 scripts/make-symbol-icons.mjs 生成（符号化图形，不是位图照片）。
+ * 这是图标链路的第一环：assets/icon-512.png → assets/icon.ico
+ * →（scripts/make-tauri-icons.mjs）→ desktop/icons/*.png + icon.ico
+ * → 由 tauri.conf.json 打进安装包。
  *
  * ## 为什么需要这个文件
  *
- * 任务栏上显示的图标有两个来源：
- *   1. **进程窗口图标** —— Electron 的 `BrowserWindow({icon})`，这个已经是新的；
- *   2. **可执行文件图标** —— 用户双击的那个 .exe 里嵌入的资源。
- *
- * 只改第 1 个，任务栏上"固定在任务栏的那一项"和"开始菜单/资源管理器里
- * 的快捷方式"仍然是 exe 里的旧图标。所以 exe 自身必须换图标。
+ * 任务栏上显示的图标来自**可执行文件内嵌的资源**，不是窗口运行时设的属性。
+ * 换桌面壳（Electron → Tauri）之后这一点没有变，只是嵌入动作从
+ * csc 的 /win32icon: 换成了 Tauri 打包时读 bundle.icon。
  *
  * ## 为什么是 .ico 而不是 .png
  *
  * Windows 的可执行文件图标必须是 .ico（一个文件里装多个尺寸）。
- * 用 csc.exe 编译启动器时加 `/win32icon:` 就能嵌进去。
  *
  * ## 为什么用 PowerShell + System.Drawing
  *

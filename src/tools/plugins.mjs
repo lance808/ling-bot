@@ -175,7 +175,7 @@ async function loadOne(dir, dirName, allowDangerous, host) {
 
   // 生命周期钩子：插件若导出 startBridge(host)，加载完成后调用一次。
   // **失败不影响工具注册** —— 工具能用比附加通道更重要。
-  if (typeof mod.startBridge === 'function') {
+  if (typeof mod.startBridge === 'function' && (dirName !== 'dsh-bridge' || host?.getConfig?.()?.dsh?.enabled === true)) {
     try {
       const r = await mod.startBridge(host ?? {});
       if (r && r.ok === false) host?.log?.(`插件 ${dirName} 的通道未启动：${r.error}`);

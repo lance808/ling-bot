@@ -1,248 +1,58 @@
-/**
- * 用量记账 —— F7 / F10
- *
- * 落盘到 `userData/state/usage.jsonl`，一行一次调用。
- *
- * 为什么要有 `proactive` 这一列：
- * 主动唤醒是**纯消费**——没人要求它说话，钱是它自己花的。
- * 这部分必须能在「总览」里单列出来看得见，否则用户月底只会看到
- * 一个说不清来路的总额。这是产品要求，不是可选的统计。
- *
- * 另一个纪律：**无 usage 时明确标估算**，不要假装精确。
- */
-
+/** Persistent usage ledger. Recent detail is bounded; range totals scan the complete journal on demand. */
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { estimateTokens } from '../llm/client.mjs';
+import { createReadStream } from 'node:fs';
+import readline from 'node:readline';
+import { estimateTokens } from './client.mjs';
 
-/**
- * @typedef {object} UsageRecord
- * @property {number} at
- * @property {string} convKey
- * @property {string} model
- * @property {boolean} proactive
- * @property {number} promptTokens
- * @property {number} completionTokens
- * @property {number} totalTokens
- * @property {boolean} estimated
- */
-
+const count = (v) => Number.isFinite(v) && v >= 0 ? v : 0;
+function bucket() { return { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCalls: 0, cachedTokens: 0, cacheReported: 0, cachePromptTokens: 0 }; }
+function add(b, r) {
+  b.calls++; b.promptTokens += count(r.promptTokens); b.completionTokens += count(r.completionTokens); b.totalTokens += count(r.totalTokens);
+  if (r.estimated) b.estimatedCalls++;
+  if (Number.isFinite(r.cachedTokens) && r.cachedTokens >= 0) { b.cachedTokens += r.cachedTokens; b.cacheReported++; b.cachePromptTokens += count(r.promptTokens); }
+}
+function dayKey(at) { return new Date(at).toLocaleDateString('en-CA'); }
 export class UsageLedger {
-  /**
-   * @param {{filePath: string}} opts
-   */
-  constructor(opts) {
-    this.filePath = opts.filePath;
-    /** @type {UsageRecord[]} 内存里留最近若干条，供界面直接读 */
-    this.recent = [];
-    this.limit = 500;
-    /** 今日累计 */
-    this.today = newDayBucket();
-    /** 今日主动支出（单列） */
-    this.todayProactive = newDayBucket();
-    this.#dayKey = dayKey(Date.now());
+  constructor({ filePath }) { this.filePath = filePath; this.recent = []; this.limit = 500; this.today = bucket(); this.todayProactive = bucket(); this.day = dayKey(Date.now()); this.lastError = null; this.pending = Promise.resolve(); this.unpersisted = []; }
+  async scan(visit) {
+    let invalid = 0;
+    try {
+      const lines = readline.createInterface({ input: createReadStream(this.filePath, { encoding: 'utf8' }), crlfDelay: Infinity });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        try { const r = JSON.parse(line.replace(/^\uFEFF/, '')); if (!Number.isFinite(r?.at)) throw new Error(); visit(r); } catch { invalid++; }
+      }
+      return { covered: invalid === 0, invalidRecords: invalid, lastError: invalid ? '部分账本记录不可读' : null };
+    } catch (e) {
+      if (e.code === 'ENOENT') return { covered: true, invalidRecords: 0, lastError: null };
+      return { covered: false, invalidRecords: invalid, lastError: `账本读取失败（${e.code ?? 'IO'}）` };
+    }
   }
-
-  #dayKey = '';
-
-  /**
-   * 启动时把历史记录读回内存。
-   *
-   * ## 为什么必须做这件事
-   *
-   * `record()` 一直在往 jsonl 追加，但**没有人读回来** ——
-   * 于是每次打开应用「今日消耗」全是 0，前一天花掉的 token 无从累计。
-   * 落盘而不回读，等于白存。
-   *
-   * ## 只读需要的部分
-   *
-   * 文件会一直变长（一行一次调用），全量读进内存没有必要，也会越来越慢。
-   * 这里只需要两样东西：
-   *   - **今天**的记录 → 重建今日累计（跨重启后仍然连续）
-   *   - **最近 limit 条** → 界面上的「最近调用」列表
-   *
-   * 所以从文件尾部往前读：先按行切，从后往前扫，凑够 recent 上限、
-   * 或遇到明显在今天之前的记录就停。文件再大也只读尾部一截。
-   *
-   * 坏行跳过而不是整个放弃 —— 一行写坏不该让历史统计全部归零。
-   *
-   * @returns {Promise<{loaded: number, today: number}>}
-   */
   async load() {
-    let text = '';
-    try {
-      text = await fs.readFile(this.filePath, 'utf8');
-    } catch {
-      // 文件不存在 = 第一次运行，不是错误
-      return { loaded: 0, today: 0 };
-    }
-
-    const todayKey = dayKey(Date.now());
-    this.#dayKey = todayKey;
-    this.today = newDayBucket();
-    this.todayProactive = newDayBucket();
-    this.recent = [];
-
-    const lines = text.split('\n');
-    /** @type {UsageRecord[]} */
-    const tail = [];
-    let todayStarted = false;
-
-    /*
-     * 从后往前扫。
-     *
-     * 两个上限是**分开**的，这里踩过一次：
-     *
-     *   recent 最多留 limit 条 —— 这是界面显示用的
-     *   今日累计必须扫到"不再是今天"为止 —— 这是给用户看钱的
-     *
-     * 一开始写成"凑够 limit 条就整段停"，结果今天调用超过 limit 次时
-     * 今日总量会偏小（实测 600 条只累到 500 条）。花钱的数字不能少算。
-     */
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const line = lines[i].trim();
-      if (!line) continue;
-
-      /** @type {UsageRecord | null} */
-      let parsed = null;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue; // 坏行跳过，不牵连同文件的其它记录
-      }
-      if (!parsed || typeof parsed.at !== 'number') continue;
-
-      const isToday = dayKey(parsed.at) === todayKey;
-      if (isToday) {
-        addTo(this.today, parsed);
-        if (parsed.proactive) addTo(this.todayProactive, parsed);
-        todayStarted = true;
-      }
-
-      /*
-       * 停止条件。
-       *
-       * 三条都考虑到了，否则必错一边：
-       *
-       *   recent 已经凑够                    ← 列表不用再往前收
-       *   或者 今天还没出现过且列表已满       ← 今天一次没调用，不必读完整个文件
-       *   或者 今天扫完并已越过边界           ← 今天的累计齐了，再往前都是更早的日子
-       *
-       * 只按"越过今天边界"就停，会在"先昨天、再今天"的顺序下漏掉 recent；
-       * 只按 recent 满了就停，又会在今天调用超过上限时少算今天的总量
-       * （实测 600 条只累到 500 条）。花钱的数字不能少算。
-       */
-      const doneWithToday = todayStarted && !isToday;
-      if (tail.length >= this.limit && (doneWithToday || !todayStarted)) break;
-
-      // recent 独立限流：满了仍然继续往前扫今天的累计
-      if (tail.length < this.limit) tail.push(parsed);
-    }
-
-    // tail 是从后往前收集的，反转回时间正序
-    this.recent = tail.reverse();
-
-    const todayCount = this.today.calls;
-    return { loaded: this.recent.length, today: todayCount };
+    this.recent = []; this.today = bucket(); this.todayProactive = bucket(); this.day = dayKey(Date.now());
+    const status = await this.scan(r => { this.recent.push(r); if (this.recent.length > this.limit) this.recent.shift(); if (dayKey(r.at) === this.day) { add(this.today, r); if (r.proactive) add(this.todayProactive, r); } });
+    this.lastError = status.lastError;
+    return { loaded: this.recent.length, today: this.today.calls };
   }
-
-  /**
-   * 记一次调用。
-   *
-   * @param {object} input
-   * @param {string} input.convKey
-   * @param {string} input.model
-   * @param {object} input.usage
-   * @param {boolean} [input.proactive]
-   * @param {string} [input.promptText] 用于估算
-   * @param {string} [input.completionText] 用于估算
-   */
   async record(input) {
-    const now = Date.now();
-    this.#rollDay(now);
-
-    let usage = input.usage ?? null;
-    let estimated = usage?.estimated === true;
-
-    // 上游没给 usage：按字符估算并明确标注
-    if (!usage || (!usage.totalTokens && !usage.promptTokens)) {
-      const p = estimateTokens(input.promptText ?? '');
-      const c = estimateTokens(input.completionText ?? '');
-      usage = { promptTokens: p, completionTokens: c, totalTokens: p + c, estimated: true };
-      estimated = true;
-    }
-
-    /** @type {UsageRecord} */
-    const rec = {
-      at: now,
-      convKey: input.convKey,
-      model: input.model,
-      proactive: input.proactive === true,
-      promptTokens: usage.promptTokens ?? 0,
-      completionTokens: usage.completionTokens ?? 0,
-      totalTokens: usage.totalTokens ?? 0,
-      estimated,
-    };
-
-    this.recent.push(rec);
-    if (this.recent.length > this.limit) this.recent.shift();
-
-    addTo(this.today, rec);
-    if (rec.proactive) addTo(this.todayProactive, rec);
-
-    // 追加写：JSONL 不需要原子替换（追加是原子的），文件坏了也只坏一行
-    try {
-      await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      await fs.appendFile(this.filePath, `${JSON.stringify(rec)}\n`, 'utf8');
-    } catch {
-      // 记账失败不能影响对话本身
-    }
-
-    return rec;
+    const now = Date.now(); this.rollDay(now);
+    let u = input.usage;
+    if (!u || (!u.totalTokens && !u.promptTokens)) { const p = estimateTokens(input.promptText ?? ''); const c = estimateTokens(input.completionText ?? ''); u = { promptTokens: p, completionTokens: c, totalTokens: p + c, estimated: true }; }
+    const r = { at: now, convKey: input.convKey, model: input.model, proactive: input.proactive === true, promptTokens: count(u.promptTokens), completionTokens: count(u.completionTokens), totalTokens: count(u.totalTokens), estimated: u.estimated === true,
+      ...(Number.isFinite(u.cachedTokens) && u.cachedTokens >= 0 ? { cachedTokens: u.cachedTokens } : {}) };
+    this.recent.push(r); if (this.recent.length > this.limit) this.recent.shift(); add(this.today, r); if (r.proactive) add(this.todayProactive, r);
+    const write = this.pending.then(async () => { try { await fs.mkdir(path.dirname(this.filePath), { recursive: true }); await fs.appendFile(this.filePath, `${JSON.stringify(r)}\n`, 'utf8'); } catch (e) { this.lastError = `账本未持久化（${e.code ?? 'IO'}）`; this.unpersisted.push(r); } });
+    this.pending = write; await write; return r;
   }
-
-  /**
-   * 给界面看的总计。
-   *
-   * @returns {object}
-   */
-  summary() {
-    this.#rollDay(Date.now());
-    return {
-      today: { ...this.today },
-      todayProactive: { ...this.todayProactive },
-      /** 主动支出占比：用户一眼看出"有多少钱是它自己花的" */
-      proactiveRatio:
-        this.today.totalTokens > 0 ? Math.round((this.todayProactive.totalTokens / this.today.totalTokens) * 100) : 0,
-      recent: this.recent.slice(-50),
-    };
+  async range({ since = Date.now() - 86400000, until = Date.now() } = {}) {
+    const start = typeof since === 'number' ? since : Date.parse(since); const end = typeof until === 'number' ? until : Date.parse(until);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) throw Object.assign(new Error('用量时间范围非法'), { code: 'E4041' });
+    await this.pending;
+    const total = bucket(); const include = r => { if (r.at >= start && r.at <= end) add(total, r); };
+    const status = await this.scan(include); this.unpersisted.forEach(include);
+    return { ...total, records: total.calls, inputTokens: total.promptTokens, outputTokens: total.completionTokens, since: start, until: end, ...status, covered: status.covered && !this.unpersisted.length, lastError: status.lastError ?? this.lastError };
   }
-
-  /** @param {number} now */
-  #rollDay(now) {
-    const key = dayKey(now);
-    if (key === this.#dayKey) return;
-    this.#dayKey = key;
-    this.today = newDayBucket();
-    this.todayProactive = newDayBucket();
-  }
-}
-
-function newDayBucket() {
-  return { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCalls: 0 };
-}
-
-/** @param {any} bucket @param {UsageRecord} rec */
-function addTo(bucket, rec) {
-  bucket.calls += 1;
-  bucket.promptTokens += rec.promptTokens;
-  bucket.completionTokens += rec.completionTokens;
-  bucket.totalTokens += rec.totalTokens;
-  if (rec.estimated) bucket.estimatedCalls += 1;
-}
-
-/** @param {number} ts */
-function dayKey(ts) {
-  const d = new Date(ts);
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+  summary() { this.rollDay(Date.now()); return { today: { ...this.today }, todayProactive: { ...this.todayProactive }, proactiveRatio: this.today.totalTokens ? Math.round(this.todayProactive.totalTokens / this.today.totalTokens * 100) : 0, recent: this.recent.slice(-50), lastError: this.lastError, unpersisted: this.unpersisted.length }; }
+  rollDay(now) { const d = dayKey(now); if (d !== this.day) { this.day = d; this.today = bucket(); this.todayProactive = bucket(); } }
 }

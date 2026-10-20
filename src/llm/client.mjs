@@ -400,8 +400,10 @@ function pickReasoning(obj) {
 /**
  * @param {any} usage
  */
-function normalizeUsage(usage) {
+export function normalizeUsage(usage) {
+  const cached = usage?.prompt_tokens_details?.cached_tokens ?? usage?.prompt_cache_hit_tokens;
   return {
+    ...(Number.isFinite(cached) && cached >= 0 ? { cachedTokens: cached } : {}),
     promptTokens: usage?.prompt_tokens ?? 0,
     completionTokens: usage?.completion_tokens ?? 0,
     totalTokens: usage?.total_tokens ?? 0,

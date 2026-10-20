@@ -66,6 +66,11 @@ export function getTool(name) {
   return registry.get(name);
 }
 
+/** Remove only tools owned by unloaded plugins before a reload. */
+export function removePluginTools() {
+  for (const [name, tool] of registry) if (tool.plugin) registry.delete(name);
+}
+
 /** 仅供测试使用：清空注册表 */
 export function _clearToolsForTest() {
   registry.clear();

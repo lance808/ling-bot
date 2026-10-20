@@ -121,6 +121,8 @@ const state = {
    * @type {{ ok: boolean, at: number } | null}
    */
   lastTest: null,
+  notice: null,
+  endpoint: '',
   /**
    * 用户是否动过这些输入。
    *
@@ -140,6 +142,12 @@ export function renderModelSettings(snap, ctx) {
   const brain = snap?.brain ?? {};
   const configured = Boolean(brain.configured);
   const capsAll = llm.modelCapabilities ?? {};
+  if (state.endpoint !== (llm.baseUrl ?? '')) {
+    state.endpoint = llm.baseUrl ?? '';
+    state.catalog = null;
+    state.probes = {};
+    state.lastTest = null;
+  }
 
   // 用户没动过输入时，用快照刷新；动过就保留他的草稿
   if (!state.dirty) {
@@ -150,8 +158,9 @@ export function renderModelSettings(snap, ctx) {
 
   const local = state;
 
-  const msg = el('div', { class: 'muted mono', text: '' });
+  const msg = el('div', { class: state.notice?.cls ?? 'muted mono', text: state.notice?.text ?? '', role: 'status' });
   const say = (text, cls = 'muted mono') => {
+    state.notice = { text, cls };
     msg.className = cls;
     msg.textContent = text;
   };
@@ -192,6 +201,7 @@ export function renderModelSettings(snap, ctx) {
             type: 'button',
             onclick: () => {
               local.provider = p.id;
+              local.dirty = true;
               baseUrlInput.value = p.baseUrl;
               local.baseUrl = p.baseUrl;
               renderProviderCards();
@@ -217,6 +227,7 @@ export function renderModelSettings(snap, ctx) {
           type: 'button',
           onclick: () => {
             local.provider = 'custom';
+            local.dirty = true;
             // 切到自定义时**不清空**已填地址：
             // 清空会让人以为刚才的输入丢了。用户想改直接改就行。
             renderProviderCards();
@@ -252,7 +263,8 @@ export function renderModelSettings(snap, ctx) {
       if (!v) return say('地址不能为空', 'err mono');
       const r = await ctx.onSaveSetting('llm.baseUrl', v);
       if (!r?.ok) return say(`保存失败：${r?.message ?? r?.code}`, 'err mono');
-      await ctx.onSaveSetting('llm.provider', local.provider);
+      const providerResult = await ctx.onSaveSetting('llm.provider', local.provider);
+      if (!providerResult?.ok) return say(`地址已保存，但提供商标记保存失败：${providerResult?.message ?? providerResult?.code}`, 'err mono');
       local.baseUrl = v;
       local.dirty = false;
       say('✓ 地址已保存', 'ok mono');
@@ -309,7 +321,8 @@ export function renderModelSettings(snap, ctx) {
         text: '清除 Key',
         onclick: async () => {
           const r = await ctx.onClearApiKey();
-          say(r?.ok ? '已清除 Key' : '清除失败', r?.ok ? 'muted mono' : 'err mono');
+          if (r?.ok) { state.keyDraft = ''; keyInput.value = ''; state.lastTest = null; }
+          say(r?.message ?? (r?.ok ? '已清除 Key' : '清除失败'), r?.ok ? 'muted mono' : 'err mono');
         },
       })
     : null;

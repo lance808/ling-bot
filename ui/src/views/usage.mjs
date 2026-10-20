@@ -19,7 +19,8 @@
  * 那部分必须单独计数，否则用户会把它当成精确值。
  */
 
-import { el, pill, card, kv, clock } from '../render.mjs';
+import { el, pill, clock } from '../render.mjs';
+import { usageAggregate } from '../contracts.mjs';
 
 /** 时间范围选项 */
 const RANGES = [
@@ -64,7 +65,7 @@ export function renderUsage(snap, ctx = {}) {
         seg,
         el('span', {
           class: 'field-hint',
-          text: '只统计本机记录的调用；切换范围立即重算，不额外请求上游。',
+          text: '按本机完整账本统计；切换范围读取本地历史，不请求上游。',
         }),
       ]),
     ]),
@@ -86,24 +87,17 @@ export function renderUsage(snap, ctx = {}) {
     cacheReported: 0,
   };
 
-  for (const r of inRange) {
-    agg.calls += 1;
-    agg.prompt += num(r.promptTokens);
-    agg.completion += num(r.completionTokens);
-    agg.total += num(r.totalTokens);
-    if (r.estimated === true) agg.estimated += 1;
-
-    // cachedTokens 可能不存在（多数提供商不返回）——只有明确是数字才算
-    const c = r.cachedTokens;
-    if (typeof c === 'number' && Number.isFinite(c)) {
-      agg.cached += c;
-      agg.cacheReported += 1;
-    }
+  const totals = usage.range;
+  const matchesRange = totals && Math.abs(Number(totals.since) - cutoff) < 60000;
+  const complete = matchesRange && totals.covered === true;
+  if (matchesRange) {
+    Object.assign(agg, usageAggregate(totals));
   }
-
+  const cachePrompt = matchesRange ? num(totals.cachePromptTokens) : 0;
   const avgPerTurn = agg.calls > 0 ? Math.round(agg.total / agg.calls) : 0;
-  const missTokens = Math.max(0, agg.prompt - agg.cached);
-  const hitRate = agg.prompt > 0 && agg.cacheReported > 0 ? Math.round((agg.cached / agg.prompt) * 100) : null;
+  const missTokens = Math.max(0, cachePrompt - agg.cached);
+  const hitRate = cachePrompt > 0 && agg.cacheReported > 0 ? Math.round((agg.cached / cachePrompt) * 100) : null;
+  if (!complete) root.append(el('div', { class: 'hint', role: 'status', text: matchesRange ? `统计可能不完整：${totals.lastError?.message ?? totals.lastError ?? '部分历史记录无法读取'}` : '正在读取所选范围的完整账本，当前不以最近记录代替总量。' }));
 
   /* ---------------------------------------------------- 总量 */
 
@@ -113,12 +107,12 @@ export function renderUsage(snap, ctx = {}) {
       el('div', { class: 'metrics' }, [
         el('div', { class: 'metric' }, [
           el('div', { class: 'label', text: '总 token' }),
-          el('div', { class: 'value', text: fmt(agg.total) }),
-          el('div', { class: 'sub' }, [el('span', { class: 'pill pill-dim', text: `${agg.calls} 次调用` })]),
+          el('div', { class: 'value', text: matchesRange ? fmt(agg.total) : '—' }),
+          el('div', { class: 'sub' }, [el('span', { class: 'pill pill-dim', text: matchesRange ? `${agg.calls} 次调用` : '等待统计' })]),
         ]),
         el('div', { class: 'metric' }, [
           el('div', { class: 'label', text: '输入 ｜ 输出' }),
-          el('div', { class: 'value sm', text: `${fmt(agg.prompt)} ｜ ${fmt(agg.completion)}` }),
+          el('div', { class: 'value sm', text: matchesRange ? `${fmt(agg.prompt)} ｜ ${fmt(agg.completion)}` : '—' }),
           el('div', { class: 'sub' }, [
             el('span', {
               class: 'pill pill-dim',
@@ -128,7 +122,7 @@ export function renderUsage(snap, ctx = {}) {
         ]),
         el('div', { class: 'metric' }, [
           el('div', { class: 'label', text: '平均每轮' }),
-          el('div', { class: 'value', text: fmt(avgPerTurn) }),
+          el('div', { class: 'value', text: matchesRange ? fmt(avgPerTurn) : '—' }),
           el('div', { class: 'sub' }, [el('span', { class: 'pill pill-dim', text: 'token / 次调用' })]),
         ]),
         el('div', { class: 'metric' }, [
@@ -137,7 +131,7 @@ export function renderUsage(snap, ctx = {}) {
           el('div', { class: 'sub' }, [
             el('span', {
               class: `pill ${hitRate === null ? 'pill-dim' : 'pill-ok'}`,
-              text: hitRate === null ? '上游未返回缓存细节' : `命中 ${fmt(agg.cached)} / 未命中 ${fmt(missTokens)}`,
+              text: hitRate === null ? '没有可用缓存明细' : `命中 ${fmt(agg.cached)} / 未命中 ${fmt(missTokens)}（${agg.cacheReported}/${agg.calls} 次有明细）`,
             }),
           ]),
         ]),

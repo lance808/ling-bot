@@ -171,7 +171,7 @@ test('降级：没有 reasoning 时不记录、不建空文件', async () => {
 
   await store.flush();
   assert.deepEqual(await files(dir), [], '不该留下任何文件');
-  assert.deepEqual(store.view({ days: 1, limit: 50 }), { days: [], total: 0 });
+  assert.deepEqual(store.view({ days: 1, limit: 50 }), { days: [], total: 0, entryCount: 0, stepCount: 0, hasMore: false, nextBefore: null, nextBeforeDate: null, lastError: null, retentionDays: 30 });
 });
 
 /* ---------------------------------------------------------------- 按日分文件 */
@@ -407,7 +407,7 @@ test('原子写入：目录里已有的 .tmp 垃圾不会被当成数据读', as
   const store = storeAt({ dir, now });
   const r = await store.load();
   assert.equal(r.loaded, 0);
-  assert.deepEqual(store.view({ days: 1, limit: 10 }), { days: [], total: 0 });
+  assert.deepEqual(store.view({ days: 1, limit: 10 }), { days: [], total: 0, entryCount: 0, stepCount: 0, hasMore: false, nextBefore: null, nextBeforeDate: null, lastError: null, retentionDays: 30 });
 });
 
 /* ---------------------------------------------------------------- 8MB 上限 */

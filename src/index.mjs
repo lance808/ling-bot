@@ -14,6 +14,8 @@ import readline from 'node:readline';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
 import { resolvePaths, defaultToolRoots } from './config/paths.mjs';
+import { normalizeDsh } from './config/dsh.mjs';
+import { clearApiKey } from './config/credentials.mjs';
 import { validateConfig, DEFAULT_CONFIG } from './config/schema.mjs';
 import { readJson, writeJsonAtomic } from './config/atomic.mjs';
 import { Logger } from './config/logger.mjs';
@@ -24,7 +26,7 @@ import { passSendGate, checkWhitelist, RateLimiter } from './guard/send-gate.mjs
 import { auditOutbound, maskSecret } from './guard/audit.mjs';
 import { assertOrigin, ORIGIN } from './guard/origin.mjs';
 import { resolveToolSet, toOpenAiTools, RISK } from './guard/tool-gate.mjs';
-import { listTools, describeTools } from './tools/registry.mjs';
+import { listTools, describeTools, removePluginTools } from './tools/registry.mjs';
 import { registerReadonlyTools } from './tools/basic.mjs';
 import { createToolRunner } from './tools/executor.mjs';
 import { loadPlugins, describePlugins } from './tools/plugins.mjs';
@@ -38,7 +40,7 @@ import { UsageLedger } from './llm/usage.mjs';
 import { PersonaStore, RoleStore } from './llm/persona.mjs';
 import { ThinkingStore } from './llm/thinking.mjs';
 import { sealSecret, openSecret, isVaultAvailable } from './config/vault.mjs';
-import { probeVision, probeImageGen, describeCatalog, inferChannel } from './llm/capability.mjs';
+import { probeVision, probeImageGen, describeCatalog, inferChannel, endpointKey, endpointCapabilities } from './llm/capability.mjs';
 import { unlink as fsUnlink } from 'node:fs/promises';
 
 const paths = resolvePaths();
@@ -954,6 +956,7 @@ const rpc = {
             convKey: params?.convKey ? String(params.convKey) : null,
             days: 1,
             limit: 50,
+            ...(params?.thinking ?? {}),
           }),
           config: publicConfig(),
           lastError,
@@ -984,12 +987,18 @@ const rpc = {
               ...triggerLedger.snapshot(k),
             })),
           },
-          usage: usageLedger.summary(),
+          usage: usageLedger
+            ? { ...usageLedger.summary(), ...(params?.usage ? { range: await usageLedger.range(params.usage) } : {}) }
+            : { today: null, recent: [], unavailable: true },
         };
 
       case 'action': {
         const name = params?.name;
         const arg = params?.params ?? {};
+        if (name === 'usage.query') return { ok: true, range: await usageLedger.range(arg) };
+        if (name === 'thinking.query') return { ok: true, ...thinkingStore.view(arg) };
+        if (name === 'persona.setDefault') return personaStore.setDefault(arg.id);
+        if (name === 'role.setDefault') return roleStore.setDefault(arg.id);
 
         if (name === 'send-text') {
           return sendText(arg.convKey, arg.text);
@@ -1127,26 +1136,21 @@ const rpc = {
           }
           const sealed = await sealSecret(key);
           await writeJsonAtomic(paths.vaultPath, sealed);
+          const migrated = { ...config, llm: { ...config.llm, apiKey: '' } };
+          await writeJsonAtomic(paths.configPath, migrated);
+          config = migrated;
           // 立刻生效，不必重启
-          keySource = 'vault';
-          currentApiKey = key;
+          keySource = process.env.LING_LLM_KEY ? 'env' : 'vault';
+          currentApiKey = process.env.LING_LLM_KEY || key;
           rebuildLlmClient();
-          log.info('API Key 已加密保存', { len: key.length });
-          return { ok: true };
+          log.info('API Key 已保存');
+          return { ok: true, source: keySource, message: keySource === 'env' ? '本地凭据已保存，但环境变量来源优先，当前仍使用环境变量' : '凭据已保存并生效' };
         }
         if (name === 'secret.clearApiKey') {
-          // 删掉保险箱文件。这里用 unlink 而不是写空内容：
-          // 留一个空文件会让"有没有存过"变得含糊。
-          try {
-            await fsUnlink(paths.vaultPath);
-          } catch {
-            /* 本来就没有 */
-          }
-          keySource = 'none';
-          currentApiKey = '';
-          rebuildLlmClient();
-          log.info('API Key 已清除');
-          return { ok: true };
+          const r = await clearApiKey({ config, vaultPath: paths.vaultPath, unlink: fsUnlink, persist: c => writeJsonAtomic(paths.configPath, c), envKey: process.env.LING_LLM_KEY ?? '' });
+          if (r.cleared) { config = r.config; keySource = r.source; currentApiKey = process.env.LING_LLM_KEY ?? ''; rebuildLlmClient(); }
+          const { config: ignored, ...result } = r;
+          return result;
         }
         if (name === 'secret.status') {
           return {
@@ -1163,7 +1167,7 @@ const rpc = {
           try {
             const ids = await llm.listModels({});
             // 附带已知能力信息：目录里就能看出哪些已实测可读图
-            const models = describeCatalog(ids, config.llm.modelCapabilities ?? {});
+            const models = describeCatalog(ids, endpointCapabilities(config.llm.modelCapabilities, config.llm.baseUrl));
             return { ok: true, models, ids };
           } catch (err) {
             const e = /** @type {any} */ (err);
@@ -1181,6 +1185,7 @@ const rpc = {
 
           /** @type {Record<string, any>} */
           const found = {};
+          const probeEndpoint = config.llm.baseUrl;
           const want = new Set(Array.isArray(arg.probe) ? arg.probe : ['vision', 'image']);
 
           if (want.has('vision')) {
@@ -1203,14 +1208,20 @@ const rpc = {
           // 只把**有明确结论**的写进配置，null（没测出来）不写。
           // 理由：把"没测出来"记成 false，下次打开界面会显示"不支持"，
           // 而事实只是没连通——那会误导人。
+          if (config.llm.baseUrl !== probeEndpoint) return { ok: false, message: '探测期间端点已变更，结果未保存' };
           const caps = { ...(config.llm.modelCapabilities ?? {}) };
-          const cur = { ...(caps[m] ?? {}) };
+          const endpoint = endpointKey(probeEndpoint);
+          const scoped = { ...(caps[endpoint] ?? {}) };
+          const cur = { ...(scoped[m] ?? {}) };
+          cur.probes = found;
+          cur.endpoint = endpoint;
           if (typeof found.vision?.supported === 'boolean') cur.vision = found.vision.supported;
           if (typeof found.image?.supported === 'boolean') cur.image = found.image.supported;
           const ch = inferChannel({ model: m, caps: cur });
           cur.channel = ch.channel;
           cur.probedAt = new Date().toISOString();
-          caps[m] = cur;
+          scoped[m] = cur;
+          caps[endpoint] = scoped;
           config.llm.modelCapabilities = caps;
           await persistConfig();
 
@@ -1259,6 +1270,21 @@ const rpc = {
       case 'setting': {
         const key = params?.key;
         const value = params?.value;
+        if (key === 'dsh.config' || key === 'dsh') {
+          let next;
+          try { next = normalizeDsh(value, config.dsh); } catch (e) { return { ok: false, code: 'E4041', message: e.message }; }
+          const candidate = { ...config, dsh: next };
+          await writeJsonAtomic(paths.configPath, candidate);
+          config = candidate;
+          try {
+            const mod = pluginMods.find(p => p.name === 'dsh-bridge')?.mod;
+            if (!mod) return { ok: true, applied: !next.enabled, restartRequired: next.enabled, message: next.enabled ? '已保存；请启用DSH插件后重启后端' : '已保存，DSH已停用' };
+            await mod.stopBridge?.();
+            const r = next.enabled ? await mod.startBridge({ sendText, log: (msg) => log.info(msg), getConfig: () => config }) : { ok: true };
+            const dshRuntime = { applied: r?.ok !== false, restartRequired: r?.ok === false, message: r?.ok === false ? '配置已保存，但DSH监听启动失败，请检查端口后重试' : 'DSH配置已应用' };
+            return { ok: true, ...dshRuntime };
+          } catch { return { ok: true, applied: false, restartRequired: true, message: '配置已保存，但运行时应用失败，需要重启后端' }; }
+        }
 
         if (key === 'allow') {
           // 形状必须校验：直接赋值会让闸门拿到非法结构，行为变成未定义
@@ -1422,12 +1448,14 @@ const rpc = {
 function publicConfig() {
   return {
     ...config,
+    dsh: { ...config.dsh, token: maskSecret(config.dsh.token), hasToken: Boolean(config.dsh.token) },
     onebot: {
       ...config.onebot,
       accessToken: maskSecret(config.onebot.accessToken),
     },
     llm: {
       ...config.llm,
+      modelCapabilities: endpointCapabilities(config.llm.modelCapabilities, config.llm.baseUrl),
       apiKey: maskSecret(currentApiKey),
       keySource,
     },
@@ -1471,6 +1499,9 @@ async function persistConfig() {
  */
 async function reloadPlugins() {
   try {
+    for (const p of pluginMods) await p.mod.stopBridge?.();
+    pluginMods = [];
+    removePluginTools();
     const plug = await loadPlugins({
       dir: paths.pluginsDir,
       enabled: config.plugins.enabled,

@@ -20,7 +20,6 @@
  */
 
 import { el, card, kv, pill } from '../render.mjs';
-import { renderIconCards } from './icons.mjs';
 
 /**
  * 一个号码列表的编辑缓冲。
@@ -224,8 +223,8 @@ export function renderSecurity(snap, ctx = {}) {
         });
         btn.disabled = false;
         btn.textContent = copy.saveText;
-        if (r && r.ok === false) {
-          ui.lastSave[which] = { ok: false, text: `保存失败：${r.message ?? r.code}` };
+        if (r?.ok !== true) {
+          ui.lastSave[which] = { ok: false, text: `保存失败：${r?.message ?? r?.code ?? '接口未返回成功结果'}` };
         } else {
           ui.lastSave[which] = { ok: true, text: '✓ 已保存，立刻生效' };
           // 下次渲染重新从快照取，避免草稿和配置不一致
@@ -301,8 +300,6 @@ export function renderSecurity(snap, ctx = {}) {
   };
 
   return el('div', {}, [
-    ...renderIconCards({ rerender: ctx.rerender ?? (() => {}) }),
-
     listCard('allow', {
       title: '白名单（L1 准入）',
       intro: '名单外的群聊与私聊，消息根本进不来 —— 这是最靠前的一道闸，不是提示词能绕过的。',

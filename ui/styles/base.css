@@ -990,3 +990,91 @@ tbody tr:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* ------------------------------------------------------------ 科技蓝主题增强 */
+
+:root {
+  --bg: #eef5ff;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #f5f9ff;
+  --bg-hover: #e7f0ff;
+  --bg-active: #d9e8ff;
+  --bg-inset: #edf4ff;
+  --fg: #10213d;
+  --fg-dim: #3d587c;
+  --fg-faint: #526b8b;
+  --fg-invert: #ffffff;
+  --border: #cbdcf4;
+  --border-strong: #9dbbe5;
+  --accent: #1261d6;
+  --accent-hover: #084aa9;
+  --accent-soft: #dceaff;
+  --ok: #08734a;
+  --ok-soft: #d9f5e9;
+  --warn: #8a5200;
+  --warn-soft: #fff0cf;
+  --err: #b4233a;
+  --err-soft: #ffe1e7;
+  --on-accent: #ffffff;
+  --glow: 0 0 0 1px rgb(37 117 224 / 12%), 0 8px 24px rgb(22 81 160 / 9%);
+  --shadow-1: 0 1px 2px rgb(21 68 133 / 8%);
+  --shadow-2: 0 7px 18px rgb(21 68 133 / 12%);
+  --shadow-3: 0 16px 40px rgb(21 68 133 / 18%);
+}
+
+:root[data-theme='dark'] {
+  --bg: #070f1d;
+  --bg-elev: #0d192b;
+  --bg-elev-2: #12233a;
+  --bg-hover: #172e4b;
+  --bg-active: #1e3d62;
+  --bg-inset: #0a1627;
+  --fg: #e8f2ff;
+  --fg-dim: #b4cbe8;
+  --fg-faint: #91afd2;
+  --fg-invert: #07111f;
+  --border: #234364;
+  --border-strong: #3a6592;
+  --accent: #59a8ff;
+  --accent-hover: #86c1ff;
+  --accent-soft: #15375f;
+  --ok: #50d59e;
+  --ok-soft: #103a32;
+  --warn: #ffc15c;
+  --warn-soft: #443117;
+  --err: #ff8192;
+  --err-soft: #461f2a;
+  --on-accent: #07111f;
+  --glow: 0 0 0 1px rgb(89 168 255 / 18%), 0 10px 28px rgb(0 0 0 / 30%);
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 42%);
+  --shadow-2: 0 8px 20px rgb(0 0 0 / 44%);
+  --shadow-3: 0 18px 44px rgb(0 0 0 / 62%);
+}
+
+/* 让未显式选择主题时的系统回退也保持蓝黑语义 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) { --bg: #070f1d; --bg-elev: #0d192b; --bg-elev-2: #12233a; --bg-hover: #172e4b; --bg-active: #1e3d62; --bg-inset: #0a1627; --fg: #e8f2ff; --fg-dim: #b4cbe8; --fg-faint: #91afd2; --fg-invert: #07111f; --border: #234364; --border-strong: #3a6592; --accent: #59a8ff; --accent-hover: #86c1ff; --accent-soft: #15375f; --ok: #50d59e; --ok-soft: #103a32; --warn: #ffc15c; --warn-soft: #443117; --err: #ff8192; --err-soft: #461f2a; --on-accent: #07111f; }
+}
+
+body {
+  background: radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 38%), var(--bg);
+}
+
+.sidebar {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-elev) 94%, var(--accent)), var(--bg-elev));
+}
+
+.brand::before { box-shadow: 0 0 0 4px var(--accent-soft), 0 0 18px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn:focus-visible, .nav button:focus-visible, .theme-switch button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: 2px; }
+.card, .metric, .pick, .msg { box-shadow: var(--shadow-1); }
+.card:hover { box-shadow: var(--glow); }
+
+/* 让确认区参与主区布局，避免覆盖正文末行 */
+#confirm-host { flex: none; min-height: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}

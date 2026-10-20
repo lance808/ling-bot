@@ -107,27 +107,16 @@ export function renderEnvCard(env, ctx = {}) {
   const node = env.node ?? {};
   const qq = env.qq ?? {};
 
-  /* ---------------------------------------------------- 左列：三个状态 */
+  /* ---------------------------------------------------- 状态取值 */
 
   const slState = sl.installed ? (sl.running ? 'ok' : 'warn') : 'err';
-  const slText = sl.installed ? (sl.running ? '正在运行' : '已安装') : '未安装';
+  const slText = sl.installed ? '已安装' : '未安装';
 
   const nodeState = node.ok ? 'ok' : node.installed ? 'warn' : 'err';
   const nodeText = node.ok ? '已安装' : node.installed ? '版本不符' : '未安装';
 
   const qqState = qq.installed ? (qq.running ? 'ok' : 'warn') : 'err';
-  const qqText = qq.installed ? (qq.running ? '正在运行' : '已安装') : '未安装';
-
-  /** 左列一行：名字 + 版本 + 状态标签 + 可选说明 */
-  const leftCell = (name, version, pillText, tone, extra) =>
-    el('div', { class: 'env-cell' }, [
-      el('div', { class: 'env-cell-head' }, [
-        el('strong', { text: name }),
-        version ? el('span', { class: 'env-ver', text: version }) : null,
-        pill(pillText, tone),
-      ]),
-      extra ?? null,
-    ]);
+  const qqText = qq.installed ? (qq.running ? '运行中' : '已安装') : '未安装';
 
   /* ---------------------------------------------------- 大按钮工具箱 */
 
@@ -150,7 +139,7 @@ export function renderEnvCard(env, ctx = {}) {
     return btn;
   };
 
-  /* ---------------------------------------------------- 中列：QQ 启动（上） */
+  /* ---------------------------------------------------- 第 3 列：QQ 启动（上） */
 
   const qqBtn = bigBtn({
     main: qq.running ? 'QQ 已在运行' : 'QQ 启动',
@@ -177,7 +166,7 @@ export function renderEnvCard(env, ctx = {}) {
     },
   });
 
-  /* ---------------------------------------------------- 中列：SnowLuma 启动（下） */
+  /* ---------------------------------------------------- 第 3 列：SnowLuma 启动（下） */
 
   const startBtn = bigBtn({
     main: sl.running ? '已在运行' : 'SnowLuma 启动',
@@ -209,7 +198,7 @@ export function renderEnvCard(env, ctx = {}) {
     },
   });
 
-  /* ---------------------------------------------------- 右列：控制台（跨两行） */
+  /* ---------------------------------------------------- 第 4 列：控制台（跨两行） */
 
   const consoleBtn = bigBtn({
     main: 'SnowLuma 控制台',
@@ -222,26 +211,51 @@ export function renderEnvCard(env, ctx = {}) {
   });
 
   /*
-   * 三列布局：
-   *   左 = 三个状态（QQ / SnowLuma / Node）
-   *   中 = 两个按钮竖排（QQ 启动 在上，SnowLuma 启动 在下）
-   *   右 = 控制台，纵跨整列高度
+   * 四列两行的紧凑布局：
    *
-   * 为什么 QQ 放最上：它是整条链路的最外层前提 —— 没有 QQ，
-   * SnowLuma 无处注入，OneBot 也连不上。按依赖顺序排比按字母排好懂。
+   *   第 1 列（竖排）  第 2 列（状态）    第 3 列（操作）      第 4 列
+   *   Q                  SnowLuma 已装/未装    QQ 启动             SnowLuma 控制台
+   *   Q                  Node 已装/未装        SnowLuma 启动       （纵跨两行）
+   *
+   * 第 1 列的 "Q / Q" 是故意的：QQ 两个字竖着占两行，刚好把左边
+   * 那一栏的垂直空间用掉，不用再单独放一行标题。
+   *
+   * 相比上一版，这里去掉了各条的路径副行 —— 高度是主要矛盾，
+   * 路径属于排查时才需要的信息，移到「重新检测」失败时的提示里。
    */
   card.append(
     el('div', { class: 'env-grid' }, [
-      el('div', { class: 'env-col-left' }, [
-        leftCell('QQ', '', qqText, qqState, qq.exe ? el('div', { class: 'env-path', text: qq.exe }) : null),
-        leftCell('SnowLuma', sl.version ? `v${sl.version}` : '', slText, slState,
-          sl.dir ? el('div', { class: 'env-path', text: sl.dir }) : null),
-        leftCell('Node.js', node.version ? `v${node.version}` : '—', nodeText, nodeState,
-          el('div', { class: 'env-path', text: `要求 ${node.required ?? '>=24.22.0'}` })),
+      el('div', { class: 'env-qq-v', title: `QQ：${qqText}` }, [
+        el('span', { text: 'Q' }),
+        el('span', { text: 'Q' }),
+      ]),
+      el('div', { class: 'env-col-status' }, [
+        el('div', { class: 'env-cell' }, [
+          el('div', { class: 'env-cell-head' }, [
+            el('strong', { text: 'SnowLuma' }),
+            sl.version ? el('span', { class: 'env-ver', text: `v${sl.version}` }) : null,
+            pill(slText, slState),
+          ]),
+        ]),
+        el('div', { class: 'env-cell' }, [
+          el('div', { class: 'env-cell-head' }, [
+            el('strong', { text: 'Node.js' }),
+            node.version ? el('span', { class: 'env-ver', text: `v${node.version}` }) : null,
+            pill(nodeText, nodeState),
+          ]),
+        ]),
       ]),
       el('div', { class: 'env-col-mid' }, [qqBtn, startBtn]),
       el('div', { class: 'env-col-right' }, [consoleBtn]),
     ]),
+  );
+
+  /*
+   * QQ 的状态不能只靠"竖排的 QQ"暗示，所以在标题旁补一个短标签。
+   * 它比单独一行省高度，又不会让 QQ 的检测结果无处可看。
+   */
+  card.querySelector('.env-qq-v')?.append(
+    el('span', { class: `env-qq-pill pill pill-${qqState}`, text: qqText }),
   );
 
   if (!sl.installed && sl.reason) {

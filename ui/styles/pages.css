@@ -1109,33 +1109,86 @@ td { overflow-wrap: anywhere; }
 .env-head h2 { margin: 0; }
 .env-head-actions { display: flex; align-items: center; gap: 8px; }
 
-/* 三列：左=状态（三行），中=两个按钮竖排，右=控制台纵跨整列。 */
+/*
+ * 四列两行。
+ *
+ *   第1列       第2列            第3列          第4列
+ *   QQ 竖排     SnowLuma 状态    QQ 启动        控制台
+ *               Node 状态        SnowLuma 启动  （跨两行）
+ *
+ * 高度是这里的主要矛盾：上一版每条状态都带一行路径，整个块撑到
+ * 接近 200px，把「今日消耗」挤下去了。这一版只留两行。
+ *
+ * 列宽取舍：第 1 列装两个字，34px 会显得局促（字贴边、状态点没处放），
+ * 给到 52px 才像一块"牌子"；第 2 列装的是短标签，180px 起足够，
+ * 把省下的宽度让给第 1 列。
+ */
 .env-grid {
   display: grid;
-  grid-template-columns: minmax(200px, 1fr) minmax(160px, 210px) minmax(160px, 210px);
-  gap: 10px;
+  grid-template-columns: 52px minmax(150px, 1fr) minmax(140px, 200px) minmax(140px, 200px);
+  gap: 8px;
   align-items: stretch;
 }
 
-.env-col-left { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-/* 中列两个按钮上下平分高度 */
+/* QQ 竖排：两个字各占一行，用掉左栏的垂直空间 */
+.env-qq-v {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-inset);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0;
+  color: var(--fg-dim);
+  line-height: 1.12;
+  padding: 5px 0 4px;
+  position: relative;
+}
+/* 状态点：不占额外纵向空间，贴在竖排字母下方 */
+.env-qq-v::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-top: 3px;
+  background: var(--fg-faint);
+}
+.env-qq-v:has(.env-qq-pill.pill-ok)::after { background: var(--ok); }
+.env-qq-v:has(.env-qq-pill.pill-warn)::after { background: var(--warn); }
+.env-qq-v:has(.env-qq-pill.pill-err)::after { background: var(--err); }
+
+/* 竖排里的状态文字：视觉上隐藏，只给读屏和 :has() 用 */
+.env-qq-pill {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.env-col-status { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .env-col-mid { display: flex; flex-direction: column; gap: 8px; }
 .env-col-right { display: flex; }
 
 .env-cell {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 9px 12px;
+  align-items: center;
+  padding: 7px 11px;
   border: 1px solid var(--border);
   border-radius: 9px;
   background: var(--bg-inset);
   min-width: 0;
+  flex: 1;
 }
-.env-cell-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.env-cell-head strong { font-size: 13.5px; }
+.env-cell-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 0; }
+.env-cell-head strong { font-size: 13px; }
 .env-ver {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--fg-dim);
   font-variant-numeric: tabular-nums;
 }
@@ -1143,26 +1196,26 @@ td { overflow-wrap: anywhere; }
 /*
  * 竖跨两行的大按钮。
  *
- * 关键是圆角要跟着尺寸走：基础 .btn 是 7px，撑到 180px 高之后
- * 那点圆角等于没有，整个按钮就退化成一个色块。这里用 --radius-lg，
- * 再让它内部竖排（图标/主标题/副标题），看起来才像"卡片式操作区"。
+ * 关键是圆角要跟着尺寸走：基础 .btn 是 7px，撑到大尺寸之后那点圆角
+ * 等于没有，整个按钮就退化成一个色块。这里用 --radius-lg，
+ * 再让它内部竖排（主标题 + 副标题），看起来才像"卡片式操作区"。
  */
 .env-big {
   flex: 1;
   width: 100%;
   flex-direction: column;
-  gap: 3px;
-  border-radius: var(--radius-lg);
-  padding: 10px 12px;
+  gap: 1px;
+  border-radius: var(--radius);
+  padding: 6px 10px;
   justify-content: center;
   text-align: center;
   white-space: normal;
-  line-height: 1.35;
-  font-size: 13.5px;
+  line-height: 1.28;
+  font-size: 13px;
   font-weight: 600;
 }
 .env-big .env-big-sub {
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 400;
   color: var(--fg-dim);
   opacity: 0.85;
@@ -1234,11 +1287,12 @@ td { overflow-wrap: anywhere; }
 .env-note.warn { background: var(--warn-soft); color: var(--warn); }
 .env-note.err { background: var(--err-soft); color: var(--err); }
 
-/* 窗口窄时三列会挤成一条，退回两列：状态整行，两个按钮并排一行 */
-@media (max-width: 900px) {
+/* 窗口窄时四列挤不下：状态整行，两个按钮并排一行，竖排 QQ 藏起来 */
+@media (max-width: 980px) {
   .env-grid { grid-template-columns: 1fr 1fr; }
-  .env-col-left { grid-column: 1 / -1; }
+  .env-qq-v { display: none; }
+  .env-col-status { grid-column: 1 / -1; }
   .env-col-mid { grid-column: 1 / 2; }
   .env-col-right { grid-column: 2 / 3; }
-  .env-big { min-height: 52px; }
+  .env-big { min-height: 50px; }
 }

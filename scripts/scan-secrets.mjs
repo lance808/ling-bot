@@ -65,6 +65,8 @@ const PUBLIC_API_HOSTS = [
   'api.github.com',
   'github.com',
   'raw.githubusercontent.com',
+  // GitHub Releases 资产的下载域：SnowLuma 的直链落在这里
+  'objects.githubusercontent.com',
   'gitee.com',
   'localhost',
   '127.0.0.1',
@@ -97,6 +99,14 @@ function isPublicHost(host) {
    * 以及 x.com / a.com 这类单字母域名（真实服务不会只有一位）。
    */
   if (/^(x|a|b|t|new|old|evil|foo|bar|baz|host)$/.test(h)) return true;
+  /*
+   * `evil*` 开头的域名视为反例占位。
+   *
+   * 白名单校验的测试里必须能写一个"后缀相近但不同域"的地址
+   * （例如 evilnodejs.org 用来证明 ends_with(".nodejs.org") 不会误放行）。
+   * 这类名字一眼就是编的：没有真实服务会把 evil 放在域名开头。
+   */
+  if (/^evil[a-z0-9-]*\./.test(h)) return true;
   if (/^(?:[a-z]|x{2,}|example|test|foo|bar|baz|s{2,})\.(?:com|cn|net|org|io|dev|local|test)$/.test(h)) return true;
   if (/^(?:api\.)?(?:x{2,}|example|test|foo|bar)\./.test(h)) return true;
   // 内网 / 回环地址：不含身份信息，且测试要用

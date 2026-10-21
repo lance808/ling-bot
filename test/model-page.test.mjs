@@ -119,6 +119,7 @@ function snap(o = {}) {
         model: o.model ?? 'm-1',
         timeoutMs: 60000,
         provider: 'custom',
+        thinking: o.thinking,
         modelCapabilities: o.caps ?? {},
       },
     },
@@ -342,6 +343,25 @@ test('文本测试原地更新，失败后成功恢复；切模型和换Key使�
   assert.doesNotMatch(text(switched), /点「测试连接」或「探测模型」确认它真能用/);
 });
 
+test('保存思考风格后撤销旧连接验证，重绘后保持未验证', async () => {
+  const base = { configured: true, baseUrl: 'https://thinking-verification.example/v1' };
+  const { ctx } = ctxOf();
+  const root = renderModelSettings(snap({ ...base, thinking: 'auto' }), ctx);
+  await button(root, '测试连接').listeners.click();
+  assert.match(kvRow(root, '可否对话'), /\n可以\n/);
+  const row = nodes(root).find((n) => n.className === 'field-row' && text(n).includes('思考内容'));
+  const select = nodes(row).find((n) => n.tagName === 'SELECT');
+  select.value = 'openai';
+  await button(row, '保存').listeners.click();
+  assert.match(kvRow(root, '可否对话'), /未验证/);
+  const again = renderModelSettings(snap({ ...base, thinking: 'openai' }), ctx);
+  assert.match(kvRow(again, '可否对话'), /未验证/);
+  await button(again, '测试连接').listeners.click();
+  assert.match(kvRow(again, '可否对话'), /\n可以\n/);
+  const switched = renderModelSettings(snap({ ...base, thinking: 'deepseek' }), ctx);
+  assert.match(kvRow(switched, '可否对话'), /未验证/);
+});
+
 test('明确不支持图像或仅生图成功，都不宣告可以对话', async () => {
   for (const supported of [false, true]) {
     const { ctx } = ctxOf({ probeResult: { ok: true, caps: { image: supported }, probes: { image: { supported } } } });
@@ -402,4 +422,66 @@ test('★ 探测时会禁用按钮，防止连点发两次真实请求', async (
   await p;
   assert.equal(b.disabled, false, '结束后要恢复');
   assert.equal(released, 1);
+});
+
+/* ------------------------------------------- 5. 换模型后的思考开关要能改 */
+
+test('★ 思考开关在界面上可改：默认显示「OpenAI 风格」', () => {
+  /*
+   * 真 bug：换模型后上游不再返回 reasoning，思考链路从此空白，
+   * 而请求本身 200、没有任何报错。用户唯一的出路是能在这里切一下，
+   * 不然只能去改代码 —— 那就等于没有这个功能。
+   *
+   * 默认值定为 openai（reasoning_effort:"medium"）：它是最通用的写法，
+   * 让"上游要求显式开启"的模型也能拿到思考内容。
+   */
+  const root = renderModelSettings(snap({ configured: true, thinking: 'openai' }), ctxOf().ctx);
+  const sel = nodes(root).find(
+    (n) => n.tagName === 'SELECT' && options(n).some((o) => attr(o, 'value') === 'deepseek'),
+  );
+  assert.ok(sel, '要有一个思考开关下拉框');
+  assert.equal(sel.value, 'openai', '默认值应该是 OpenAI 风格');
+  const vals = options(sel).map((o) => attr(o, 'value'));
+  for (const want of ['auto', 'deepseek', 'openai', 'qwen', 'anthropic', 'off']) {
+    assert.ok(vals.includes(want), `缺选项 ${want}`);
+  }
+  // 默认值排第一项：点开看到的就是当前在用的那个
+  assert.equal(vals[0], 'openai', '默认值应该排在第一个');
+});
+
+test('★ 配置里没写 thinking 时，界面按 openai 显示（与后端默认一致）', () => {
+  // 老配置文件没有这个键，后端合并后是 openai；界面若回退成别的值，
+  // 用户会看到一个"和实际请求不符"的下拉框
+  const root = renderModelSettings(snap({ configured: true }), ctxOf().ctx);
+  const sel = nodes(root).find(
+    (n) => n.tagName === 'SELECT' && options(n).some((o) => attr(o, 'value') === 'deepseek'),
+  );
+  assert.ok(sel, '要有一个思考开关下拉框');
+  assert.equal(sel.value, 'openai');
+});
+
+test('★ 保存思考开关会把 llm.thinking 发到后端', async () => {
+  const { ctx, calls } = ctxOf();
+  const root = renderModelSettings(snap({ configured: true, thinking: 'auto' }), ctx);
+  const sel = nodes(root).find(
+    (n) => n.tagName === 'SELECT' && options(n).some((o) => attr(o, 'value') === 'deepseek'),
+  );
+  assert.ok(sel, '要有思考开关');
+  sel.value = 'deepseek';
+  // 该行里的「保存」按钮
+  const row = nodes(root).find((n) => n.className === 'field-row' && text(n).includes('思考内容'));
+  const saveBtn = nodes(row).find((n) => n.tagName === 'BUTTON' && n.textContent === '保存');
+  assert.ok(saveBtn, '思考那一行要有保存按钮');
+  await saveBtn.listeners.click();
+  assert.deepEqual(calls.save, [['llm.thinking', 'deepseek']]);
+});
+
+test('★ 配置里是未知思考值时如实显示，不静默变成第一项', () => {
+  // 静默回落到 auto 会让用户以为"我明明设过"，实际请求里什么都没有
+  const root = renderModelSettings(snap({ configured: true, thinking: '怪值' }), ctxOf().ctx);
+  const sel = nodes(root).find(
+    (n) => n.tagName === 'SELECT' && options(n).some((o) => String(attr(o, 'value') ?? '').includes('怪值')),
+  );
+  assert.ok(sel, '未识别的值也要列出来');
+  assert.equal(sel.value, '怪值');
 });

@@ -60,7 +60,16 @@ import { el, clock } from '../render.mjs';
 function readThinking(snap) {
   const raw = snap && typeof snap === 'object' ? snap.thinking : null;
   if (!raw || typeof raw !== 'object') {
-    return { ready: false, total: 0, days: [], conversations: [], dayKeys: [], hasMore: false, nextBefore: null };
+    return {
+      ready: false,
+      total: 0,
+      days: [],
+      conversations: [],
+      dayKeys: [],
+      hasMore: false,
+      nextBefore: null,
+      lastSkip: null,
+    };
   }
 
   /** @type {ThinkDay[]} */
@@ -120,7 +129,37 @@ function readThinking(snap) {
      */
     hasMore: raw.hasMore === true && typeof raw.nextBefore === 'string' && raw.nextBefore.length > 0,
     nextBefore: typeof raw.nextBefore === 'string' && raw.nextBefore ? raw.nextBefore : null,
+    /*
+     * 「最近一回合没有产生 reasoning」的标记。
+     *
+     * 后端只存内存、不落盘，所以它反映的是**本次运行**最近的状态。
+     * 这里只做形状校验：坏数据当成没有，绝不让它把面板弄崩。
+     */
+    lastSkip: readLastSkip(raw.lastSkip),
   };
+}
+
+/**
+ * @param {any} raw
+ * @returns {{convKey: string, at: number} | null}
+ */
+function readLastSkip(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const at = Number(raw.at);
+  if (!Number.isFinite(at) || at <= 0) return null;
+  return { convKey: String(raw.convKey ?? ''), at };
+}
+
+/**
+ * 最新一条记录的时间。
+ *
+ * @param {ThinkDay[]} days
+ * @returns {number} 没有记录时是 0
+ */
+function newestEntryAt(days) {
+  let newest = 0;
+  for (const d of days) for (const e of d.entries) if (e.at > newest) newest = e.at;
+  return newest;
 }
 
 /**
@@ -485,6 +524,29 @@ function renderMainColumn(data, days, selected, ui, ctx) {
   ]);
 
   const scroll = el('div', { class: 'think-scroll' });
+
+  /*
+   * 「最新一回合没有思考内容」提示。
+   *
+   * 只在**这一回合比所有已记录的内容都新**时显示：那才意味着
+   * "你刚发的这条本不该缺、但确实没有东西可记"。
+   * 如果之后又有正常记录，这个提示就没有意义了（也不该赖着不走）。
+   */
+  const skip = data.lastSkip;
+  if (skip && skip.at > newestEntryAt(data.days)) {
+    const who = skip.convKey ? `${convLabel(skip.convKey)} 的` : '';
+    scroll.append(
+      el('div', { class: 'think-note', title: '思考链路只记录模型返回的 reasoning' }, [
+        el('span', { class: 'think-note-dot', 'aria-hidden': 'true' }),
+        el('span', {
+          text:
+            `${shortStamp(skip.at)} ${who}那一回合没有产生思考内容，所以这里看不到它。` +
+            '本次响应未包含可记录的 reasoning。' +
+            '请在模型设置中检查思考参数，并确认上游会返回思考字段。',
+        }),
+      ]),
+    );
+  }
 
   if (days.length === 0) {
     scroll.append(

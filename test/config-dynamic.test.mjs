@@ -24,6 +24,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfig } from '../src/config/schema.mjs';
+import { resolveThinkingBody } from '../src/llm/client.mjs';
+
+test('未配置思考风格时默认发送 reasoning_effort: medium，保留显式选择', () => {
+  for (const saved of [{}, { llm: { model: 'deepseek-v4.1-flash' } }]) {
+    const cfg = validateConfig(saved);
+    assert.equal(cfg.llm.thinking, 'openai');
+    assert.deepEqual(resolveThinkingBody(cfg.llm.thinking), { reasoning_effort: 'medium' });
+  }
+  const explicit = validateConfig({ llm: { thinking: 'auto' } });
+  assert.equal(explicit.llm.thinking, 'auto');
+  assert.deepEqual(resolveThinkingBody(explicit.llm.thinking), {});
+});
 
 test('环境页保存的安装路径经配置序列化后仍能启动', () => {
   const saved = JSON.parse(JSON.stringify({

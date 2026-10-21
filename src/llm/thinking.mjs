@@ -129,6 +129,23 @@ export class ThinkingStore {
   /** 最近一次写盘/读盘的错误（不抛给上层，但留着可查） */
   /** @type {any} */
   lastError = null;
+  /**
+   * 最近一次"有回合但没有思考内容"的时间戳与会话。
+   *
+   * ## 为什么要在数据结构里留这个
+   *
+   * 非推理模型不会返回 reasoning，而 `record()` 按设计只能静默跳过 ——
+   * 不留空记录是对的。但代价是：**界面完全无法解释自己为什么是空的**。
+   * 实际踩过：用户换了模型（`buddy/xxx` → `xxx`），思考链路从此再不更新，
+   * 页面上还挂着昨天那条记录，看起来完全正常，日志里也一个字都没有。
+   *
+   * 所以这里记一个**仅存内存**的标记：它只用来生成一句"最近这次回合没有
+   * 产生思考内容"的提示，帮助用户把"模型不对"和"程序坏了"分开。
+   * 不落盘 —— 它是运行时诊断信息，重启后没有意义。
+   *
+   * @type {{convKey: string, at: number} | null}
+   */
+  #lastSkip = null;
 
   /**
    * @param {{dir: string, now?: () => number, maxDays?: number, maxTotalBytes?: number}} opts
@@ -211,6 +228,21 @@ export class ThinkingStore {
   }
 
   /**
+   * 记一次"回合跑完了，但没有任何思考内容"。
+   *
+   * 只存内存、只用于界面提示（见 `#lastSkip` 的说明）。它**不写文件**，
+   * 也不会让 `view()` 多出空记录 —— 数据形状保持干净，只是多了个解释。
+   *
+   * @param {{convKey?: string, at?: number}} info
+   */
+  noteNoReasoning(info = {}) {
+    this.#lastSkip = {
+      convKey: String(info?.convKey ?? ''),
+      at: Number.isFinite(info?.at) ? Number(info.at) : this.#now(),
+    };
+  }
+
+  /**
    * 记一次回合的思考。
    *
    * 没有 reasoning 就**什么都不做**：非推理模型（或上游没给）时整个功能
@@ -260,6 +292,11 @@ export class ThinkingStore {
     day.entries.push(rec);
     this.#markDirty(date);
     this.#scheduleFlush();
+    /*
+     * 真的有思考内容了，之前那条"没有思考内容"的标记就该失效。
+     * 留着它会让界面继续显示"最新一回合没有思考" —— 而那是上一回合的事。
+     */
+    this.#lastSkip = null;
     return rec;
   }
 
@@ -383,6 +420,15 @@ export class ThinkingStore {
         .sort((a, b) => b.lastAt - a.lastAt),
       /** 所有有数据的日期（升序），供"删除某一天"确认与范围提示 */
       dayKeys: [...this.#days.keys()].sort(),
+      /**
+       * 最近一次"有回合但没思考内容"的时间。
+       *
+       * 界面拿它和最新记录的时间比一下：如果它更晚，就说明"你刚发的这条
+       * 之所以没出现，是因为这一回合本来就没产生 reasoning"，
+       * 而不是记录丢了或读取失败。没有这个字段，页面只能显示成
+       * "有历史但缺最新的"，用户无从判断。
+       */
+      lastSkip: this.#lastSkip ? { ...this.#lastSkip } : null,
       lastError: this.lastError ? '思考仓库读取或写入失败，历史可能不完整' : null,
       retentionDays: this.#maxDays,
     };

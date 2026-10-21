@@ -32,7 +32,15 @@ import { createToolRunner } from './tools/executor.mjs';
 import { loadPlugins, describePlugins } from './tools/plugins.mjs';
 import { installBuiltinPlugins } from './tools/builtin-plugins.mjs';
 import { registerAllActions, snapshotRegistry, renderRegistryBanner } from './registry.mjs';
-import { LlmClient, estimateTokens } from './llm/client.mjs';
+import { LlmClient, estimateTokens, THINKING_STYLES } from './llm/client.mjs';
+
+/**
+ * 允许的思考开关取值。
+ *
+ * 单独提出来是为了让"校验"和"文档"是同一份数据 —— 手写数组迟早和
+ * client.mjs 里的表漂移，那时会出现"设置存下来了但请求没变"的怪事。
+ */
+const THINKING_STYLE_KEYS = new Set(['auto', ...Object.keys(THINKING_STYLES)]);
 import { buildMessages, DEFAULT_PERSONA } from './llm/prompt.mjs';
 import { runTurn, truncationNotice } from './llm/agent-loop.mjs';
 import { detectTrigger, decideProactive, isStrongTrigger, TriggerLedger } from './llm/triggers.mjs';
@@ -182,6 +190,7 @@ async function boot() {
     model: config.llm.model,
     apiKey,
     timeoutMs: config.llm.timeoutMs,
+    thinking: config.llm.thinking,
   });
   usageLedger = new UsageLedger({ filePath: `${paths.stateDir}/usage.jsonl` });
   /*
@@ -597,8 +606,24 @@ async function startTurn(convKey, job) {
 function recordThinking(convKey, result) {
   try {
     const steps = result?.thinkingTrace ?? [];
-    // 非推理模型：整段没有 reasoning，静默降级（不写文件、不建空记录）
-    if (!Array.isArray(steps) || steps.length === 0) return;
+    /*
+     * 非推理模型：整段没有 reasoning，静默降级（不写文件、不建空记录）。
+     *
+     * 但**不能真的悄无声息**。以前这里直接 return，于是"换了模型之后
+     * 思考链路再也不更新"这件事在日志里连一行都没有，只能靠猜测。
+     * 现在留两条线索：
+     *   1. 运行日志里一行（带上模型名，方便对上"我刚换了模型"）；
+     *   2. store 里的 lastSkip，界面据此显示"这一回合没有思考内容"。
+     */
+    if (!Array.isArray(steps) || steps.length === 0) {
+      const at = Date.now();
+      thinkingStore.noteNoReasoning?.({ convKey, at });
+      log.info('本回合没有思考内容（模型未返回 reasoning），思考链路不记录', {
+        convKey,
+        model: config?.llm?.model ?? null,
+      });
+      return;
+    }
     thinkingStore.record({
       convKey,
       at: Date.now(),
@@ -916,6 +941,7 @@ const rpc = {
       cursorIgnored: false,
       conversations: [],
       dayKeys: [],
+      lastSkip: null,
       lastError: null,
       retentionDays: thinkingStore?.maxDays ?? 30,
     };
@@ -1471,6 +1497,29 @@ const rpc = {
           return { ok: true };
         }
 
+        if (key === 'llm.thinking') {
+          /*
+           * 思考开关注入方式。
+           *
+           * 换模型后思考链路突然空了，最常见的原因就是新模型/新中转要显式
+           * 打开才返回 reasoning。这里让用户能自己切一下，不用改代码。
+           * 只接受白名单值 —— 写进请求体的东西不能随便来。
+           */
+          const v = String(value ?? '').trim();
+          if (!THINKING_STYLE_KEYS.has(v)) {
+            return {
+              ok: false,
+              code: 'E40XX',
+              message: `llm.thinking 只能是：${[...THINKING_STYLE_KEYS].join(' / ')}`,
+            };
+          }
+          config.llm.thinking = v;
+          await persistConfig();
+          rebuildLlmClient();
+          log.info('思考开关注入方式已更新', { thinking: v });
+          return { ok: true };
+        }
+
         if (key === 'qqExe') {
           /*
            * 用户手填 QQ 安装目录或 QQ.exe 路径。
@@ -1609,10 +1658,12 @@ function rebuildLlmClient() {
     model: config.llm.model,
     apiKey: currentApiKey,
     timeoutMs: config.llm.timeoutMs,
+    thinking: config.llm.thinking,
   });
   log.info('AI 接入设置已更新', {
     model: config.llm.model,
     baseUrl: config.llm.baseUrl,
+    thinking: config.llm.thinking,
     configured: llm.configured,
   });
 }

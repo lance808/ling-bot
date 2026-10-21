@@ -278,3 +278,64 @@ renderTest('editing a persona is distinct from setting its global default', asyn
   await button(root, '设为全局默认').listeners.click();
   assert.deepEqual(calls, ['b']);
 });
+
+/* ------------------------------------------- 「刚才那条怎么没出现」要能自己解释 */
+
+/** 有历史记录、并且后端报告"最近一回合没有思考内容"的时刻 */
+function snapWithSkip(skipAt) {
+  const now = Date.now();
+  const yesterday = now - 86_400_000;
+  return {
+    thinking: {
+      total: 1,
+      hasMore: false,
+      nextBefore: null,
+      days: [
+        {
+          date: '2026-10-20',
+          entries: [{ at: yesterday, convKey: 'group:1', steps: [{ n: 1, reasoning: '昨天的想法' }] }],
+        },
+      ],
+      conversations: [{ convKey: 'group:1', entries: 1, steps: 1, lastAt: yesterday }],
+      dayKeys: ['2026-10-20'],
+      lastSkip: skipAt == null ? null : { convKey: 'group:1', at: skipAt },
+    },
+  };
+}
+
+renderTest('思考链路：最新一回合没有 reasoning 时要自己说明原因', async () => {
+  /*
+   * 真实踩过的坑：换了模型之后上游不再返回 reasoning，于是这一页永远不更新，
+   * 而页面上还挂着昨天那条记录 —— 看起来完全正常，日志里也一个字都没有。
+   * 所以这条提示不是装饰，它是用户唯一能分辨"模型不对"和"程序坏了"的地方。
+   */
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+  const root = renderThinkingPanel(snapWithSkip(Date.now()), { ui: { days: 7 } });
+  assert.match(text(root), /没有产生思考内容/);
+  assert.match(text(root), /reasoning/, '要指明是 reasoning 缺失，而不是笼统说失败');
+  // 历史记录不能被这条提示顶掉
+  assert.match(text(root), /昨天的想法/);
+});
+
+renderTest('思考链路：之后又有正常记录了，那条提示就不能再显示', async () => {
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+  // 标记时间比最新记录更早 → 说明它已经过期
+  const root = renderThinkingPanel(snapWithSkip(1), { ui: { days: 7 } });
+  assert.doesNotMatch(text(root), /没有产生思考内容/);
+});
+
+renderTest('思考链路：后端没上报 lastSkip 时不显示提示（老后端兼容）', async () => {
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+  const root = renderThinkingPanel(snapWithSkip(null), { ui: { days: 7 } });
+  assert.doesNotMatch(text(root), /没有产生思考内容/);
+});
+
+renderTest('思考链路：lastSkip 字段脏掉也不能把面板弄崩', async () => {
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+  for (const bad of ['junk', 42, { at: 'not-a-number' }, { at: -1 }, [], { at: null }]) {
+    const snap = snapWithSkip(null);
+    snap.thinking.lastSkip = bad;
+    const root = renderThinkingPanel(snap, { ui: { days: 7 } });
+    assert.match(text(root), /昨天的想法/, `lastSkip=${JSON.stringify(bad)} 时历史仍要正常显示`);
+  }
+});

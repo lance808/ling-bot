@@ -27,7 +27,60 @@ const RETRYABLE_CODES = new Set([
  * @property {string} apiKey
  * @property {number} [timeoutMs]
  * @property {number} [maxRetries]
+ * @property {'auto' | 'off' | 'deepseek' | 'openai' | 'anthropic' | 'qwen'} [thinking]
+ *   思考开关注入方式，见 resolveThinkingBody()
  */
+
+/**
+ * 各家的「打开思考」写法。
+ *
+ * ## 为什么需要这张表（这里真的踩过）
+ *
+ * 请求体原本只有 `model / messages / stream`，思考内容完全依赖上游**默认**
+ * 行为。同一个人把模型从 A 换成 B，A 默认带 reasoning、B 默认不带，
+ * 于是思考链路从此一片空白 —— 而这中间没有任何报错，因为请求本身是成功的，
+ * 只是少了那个字段。
+ *
+ * `deepseek-v4.1-flash` 这类模型本身是推理模型，但不少中转要求显式
+ * 打开才会返回 `reasoning_content`。所以这里按"用哪种写法"分派，
+ * 而不是去猜模型名。
+ *
+ * 每一项是**要合并进请求体**的片段。空对象表示"什么都不加"。
+ */
+export const THINKING_STYLES = Object.freeze({
+  // DeepSeek 官方与多数兼容中转
+  deepseek: { thinking: { type: 'enabled' } },
+  // OpenAI 新式（o 系列 / gpt-5 一脉）
+  openai: { reasoning_effort: 'medium' },
+  // Anthropic 直连风格
+  anthropic: { thinking: { type: 'enabled', budget_tokens: 4096 } },
+  // 通义/百炼一脉
+  qwen: { enable_thinking: true },
+  off: {},
+});
+
+/**
+ * 算出这次请求该额外带什么"打开思考"的字段。
+ *
+ * 语义分两层，别混淆：
+ *   · **没传 / `auto`** → 不注入任何字段（本函数的行为）
+ *   · 配置项 `llm.thinking` 的**默认值**是 `openai`（见 config/schema.mjs），
+ *     所以正常运行时配置会传一个明确风格进来，走的是下面的查表分支
+ *
+ * 函数本身为什么不对 undefined 兜底成 openai：`LlmClient` 还有探测、测试这类
+ * 内部调用方，它们不该被"用户的默认偏好"悄悄改变行为。默认值放在配置层，
+ * 内部调用保持"不写就不发"的可预测性。
+ *
+ * `auto` 依然是显式选项：有些上游对不认识的字段直接 400，
+ * 那时用户需要一条"什么都不加"的退路。
+ *
+ * @param {string | undefined} style
+ * @returns {Record<string, any>}
+ */
+export function resolveThinkingBody(style) {
+  if (!style || style === 'auto') return {};
+  return { ...(THINKING_STYLES[/** @type {keyof typeof THINKING_STYLES} */ (style)] ?? {}) };
+}
 
 export class LlmError extends Error {
   /**
@@ -221,6 +274,11 @@ export class LlmClient {
       messages: req.messages,
       stream: true,
       stream_options: { include_usage: true },
+      /*
+       * 思考开关。放在最前面合并，让下面的 tools 等业务字段可以覆盖它
+       * （万一某个上游把同名键用作别的含义）。
+       */
+      ...resolveThinkingBody(this.#opts.thinking),
     };
     if (req.tools?.length) {
       body.tools = req.tools;

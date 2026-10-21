@@ -255,7 +255,7 @@ export function renderModelSettings(snap, ctx) {
   }
 
   const local = state;
-  const verificationScope = () => `${llm.baseUrl ?? ''}\n${llm.model ?? ''}\n${local.credentialRevision}`;
+  const verificationScope = () => `${llm.baseUrl ?? ''}\n${llm.model ?? ''}\n${llm.thinking ?? 'openai'}\n${local.credentialRevision}`;
   const currentTest = () => local.lastTest?.scope === verificationScope() ? local.lastTest : null;
   const dialogueHost = el('span', { class: 'row', id: 'dialogue-state' });
   const testResultHost = el('span', { class: 'row', id: 'test-result' });
@@ -1056,6 +1056,78 @@ export function renderModelSettings(snap, ctx) {
     ]),
   ]);
 
+  /*
+   * 思考内容（reasoning）的开启方式。
+   *
+   * 放这里的原因：它属于"换模型之后才需要动"的开关，不是必填项。
+   * 但必须能在界面上改 —— 否则"思考链路突然空了"只能靠改代码解决。
+   *
+   * 默认 openai（请求体加 reasoning_effort:"medium"）。这是最通用的写法，
+   * 推理模型按中等强度思考，非推理模型多数直接忽略。选中后写进配置。
+   * 顺序上把默认值放第一项：用户点开时看到的就是当前在用的那个。
+   */
+  const THINKING_OPTIONS = [
+    ['openai', 'OpenAI 风格 reasoning_effort（默认）', '请求体加 reasoning_effort:"medium"。最通用，推荐先用这个。'],
+    ['auto', '自动（不加任何字段）', '适合上游默认就返回 reasoning 的情况。若报 400 说字段不认识，切这个。'],
+    ['deepseek', 'DeepSeek 风格 thinking', '请求体加 thinking:{type:"enabled"}。'],
+    ['qwen', '通义风格 enable_thinking', '请求体加 enable_thinking:true。'],
+    ['anthropic', 'Anthropic 风格 thinking+budget', '请求体加 thinking:{type,budget_tokens}。'],
+    ['off', '不注入思考参数', '不添加思考控制字段；若上游默认返回 reasoning，仍会记录。'],
+  ];
+
+  const thinkingSelect = /** @type {HTMLSelectElement} */ (el('select', { class: 'text-input' }));
+  const currentThinking = String(llm.thinking ?? 'openai');
+  if (!THINKING_OPTIONS.some(([v]) => v === currentThinking)) {
+    // 配置里出现了未知值：仍然列出来，否则下拉框会静默显示成第一项，看着像"设错了"
+    thinkingSelect.appendChild(el('option', { value: currentThinking, text: `${currentThinking}（未识别）` }));
+  }
+  for (const [value, label] of THINKING_OPTIONS) {
+    thinkingSelect.appendChild(el('option', { value, text: label }));
+  }
+  thinkingSelect.value = currentThinking;
+
+  const thinkingHint = el('div', {
+    class: 'field-hint',
+    text: THINKING_OPTIONS.find(([v]) => v === currentThinking)?.[2] ?? '',
+  });
+  thinkingSelect.addEventListener('change', () => {
+    thinkingHint.textContent = THINKING_OPTIONS.find(([v]) => v === thinkingSelect.value)?.[2] ?? '';
+  });
+
+  const thinkingField = el('div', { class: 'field-row' }, [
+    el('label', { class: 'field-label', text: '思考内容' }),
+    el('div', { class: 'field-control' }, [
+      thinkingSelect,
+      el('div', { class: 'row' }, [
+        el('button', {
+          class: 'btn',
+          type: 'button',
+          text: '保存',
+          onclick: async () => {
+            const r = await ctx.onSaveSetting('llm.thinking', thinkingSelect.value);
+            if (r?.ok && llm.thinking !== thinkingSelect.value) {
+              llm.thinking = thinkingSelect.value;
+              invalidateVerification();
+            }
+            say(
+              r?.ok
+                ? `✓ 思考开关已设为 ${thinkingSelect.value}`
+                : `保存失败：${r?.message ?? r?.code}`,
+              r?.ok ? 'ok mono' : 'err mono',
+            );
+          },
+        }),
+      ]),
+      thinkingHint,
+      el('div', {
+        class: 'field-hint',
+        text:
+          '换模型后「思考链路」不再出现新记录时，先看这里。\n' +
+          '模型本身是推理模型、但中转要求显式打开时才返回 reasoning —— 选对应风格即可。',
+      }),
+    ]),
+  ]);
+
   /* ============================================================ 测试连接 */
 
   const testHost = el('div', {});
@@ -1261,6 +1333,7 @@ export function renderModelSettings(snap, ctx) {
         el('div', { class: 'step-gap' }),
         stepNo(5, '调优（一般不用改）'),
         timeoutField,
+        thinkingField,
 
         el('div', { class: 'spacer-10' }),
         msg,

@@ -65,6 +65,7 @@ const EMPTY_VIEW = {
   cursorIgnored: false,
   conversations: [],
   dayKeys: [],
+  lastSkip: null,
   lastError: null,
   retentionDays: 30,
 };
@@ -802,4 +803,150 @@ test('runTurn：非推理模型时 thinkingTrace 是空数组', async () => {
   });
   assert.deepEqual(res.thinkingTrace, []);
   assert.equal(res.text, '答');
+});
+
+/* ----------------------------------------------------- 「没有思考内容」也要能解释 */
+
+test('★ 没有 reasoning 时不留空记录，但要留下可解释的标记', () => {
+  /*
+   * 这条钉的是一个真实踩过的坑：用户把模型从 `buddy/xxx` 改成 `xxx` 之后，
+   * 上游不再返回 reasoning，于是思考链路永远不更新 —— 而页面上还挂着
+   * 昨天那条记录，看起来一切正常，日志里也一个字都没有。
+   *
+   * 静默跳过本身是对的（不能拿空记录塞满界面），但必须留下"为什么"。
+   */
+  const store = new ThinkingStore({ dir: 'ignored-by-this-test', now: () => 1_800_000_000_000 });
+
+  // 一开始没有标记
+  assert.equal(store.view({ days: 1 }).lastSkip, null);
+
+  store.noteNoReasoning({ convKey: 'group:111', at: 1_800_000_000_000 });
+  const skip = store.view({ days: 1 }).lastSkip;
+  assert.ok(skip, '要能读到"最近一回合没有思考内容"');
+  assert.equal(skip.convKey, 'group:111');
+  assert.equal(skip.at, 1_800_000_000_000);
+
+  // 但数据本身必须还是干净的：没有多出空记录
+  assert.deepEqual(store.view({ days: 7 }).days, []);
+  assert.equal(store.view({ days: 7 }).total, 0);
+});
+
+test('★ 真的有思考内容之后，「没有思考内容」的标记要自动失效', async () => {
+  const dir = await tmpDir();
+  const store = new ThinkingStore({ dir, now: () => 1_800_000_000_000 });
+  try {
+    store.noteNoReasoning({ convKey: 'group:111', at: 1_800_000_000_000 });
+    assert.ok(store.view({ days: 1 }).lastSkip);
+
+    store.record({ convKey: 'group:111', at: 1_800_000_001_000, steps: [{ n: 1, reasoning: '这次有' }] });
+    assert.equal(store.view({ days: 1 }).lastSkip, null, '有记录了就不该再说"没有思考内容"');
+    assert.equal(store.view({ days: 1 }).total, 1);
+  } finally {
+    await store.flush();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('没有思考内容不影响 dayKeys / conversations（只影响那句提示）', () => {
+  const store = new ThinkingStore({ dir: 'ignored-by-this-test', now: () => 1_800_000_000_000 });
+  store.noteNoReasoning({ convKey: 'group:111' });
+  const v = store.view({ days: 7 });
+  assert.deepEqual(v.dayKeys, []);
+  assert.deepEqual(v.conversations, []);
+  assert.equal(v.total, 0);
+});
+
+/* --------------------------------------------- 换模型后要自己适配 reasoning 开关 */
+
+test('★ 默认 auto 不往请求体里塞任何思考字段（不猜）', async () => {
+  /*
+   * 加错字段比不加更糟：有的上游见到不认识的键直接 400。
+   * 所以"没有明确指定"时必须完全不碰请求体。
+   */
+  const s = await sseServer([{ choices: [{ delta: { content: '好' } }] }]);
+  try {
+    const c = new LlmClient({ baseUrl: s.baseUrl, model: 'x', apiKey: 'k', timeoutMs: 5000, maxRetries: 0 });
+    await c.chat({ messages: [{ role: 'user', content: 'hi' }] });
+    const body = s.bodies[0];
+    assert.ok(body, '请求体要能解析出来');
+    assert.equal(body.thinking, undefined);
+    assert.equal(body.reasoning_effort, undefined);
+    assert.equal(body.enable_thinking, undefined);
+    // 基础字段不能因为合并而被弄丢
+    assert.equal(body.model, 'x');
+    assert.equal(body.stream, true);
+  } finally {
+    await s.close();
+  }
+});
+
+test('★ 指定 thinking 风格时，请求体里要真的带上对应字段', async () => {
+  const cases = [
+    ['deepseek', (b) => assert.deepEqual(b.thinking, { type: 'enabled' })],
+    ['openai', (b) => assert.equal(b.reasoning_effort, 'medium')],
+    ['qwen', (b) => assert.equal(b.enable_thinking, true)],
+    ['anthropic', (b) => assert.deepEqual(b.thinking, { type: 'enabled', budget_tokens: 4096 })],
+    ['off', (b) => assert.equal(b.thinking, undefined)],
+  ];
+
+  for (const [style, check] of cases) {
+    const s = await sseServer([{ choices: [{ delta: { content: '好' } }] }]);
+    try {
+      const c = new LlmClient({
+        baseUrl: s.baseUrl,
+        model: 'x',
+        apiKey: 'k',
+        timeoutMs: 5000,
+        maxRetries: 0,
+        thinking: style,
+      });
+      await c.chat({ messages: [{ role: 'user', content: 'hi' }] });
+      check(s.bodies[0]);
+      // 无论哪种风格，业务字段都必须完好
+      assert.equal(s.bodies[0].model, 'x', `${style}：model 不能被覆盖掉`);
+      assert.equal(s.bodies[0].messages.length, 1);
+    } finally {
+      await s.close();
+    }
+  }
+});
+
+test('打开思考不影响 reasoning 的解析（字段名照旧三种都认）', async () => {
+  const s = await sseServer([
+    { choices: [{ delta: { reasoning_content: '想了' } }] },
+    { choices: [{ delta: { content: '答' } }] },
+  ]);
+  try {
+    const c = new LlmClient({
+      baseUrl: s.baseUrl,
+      model: 'x',
+      apiKey: 'k',
+      timeoutMs: 5000,
+      maxRetries: 0,
+      thinking: 'deepseek',
+    });
+    const res = await c.chat({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.reasoning, '想了');
+    assert.equal(res.text, '答');
+  } finally {
+    await s.close();
+  }
+});
+
+test('未知的 thinking 值不会把请求弄坏（退回不注入）', async () => {
+  const s = await sseServer([{ choices: [{ delta: { content: '好' } }] }]);
+  try {
+    const c = new LlmClient({
+      baseUrl: s.baseUrl,
+      model: 'x',
+      apiKey: 'k',
+      timeoutMs: 5000,
+      maxRetries: 0,
+      thinking: '不存在的风格',
+    });
+    await c.chat({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(s.bodies[0].thinking, undefined, '认不出来就当没配，不能瞎发');
+  } finally {
+    await s.close();
+  }
 });

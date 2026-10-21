@@ -121,7 +121,7 @@ test('★ 空列表必须报错，不能显示成"读取成功"', async () => {
   try {
     await assert.rejects(
       () => mkClient(s.baseUrl).listModels(),
-      (err) => err instanceof LlmError && err.code === 'E3021' && /模型列表是空的/.test(err.message),
+      (err) => err instanceof LlmError && err.code === 'E3021' && err.reason === 'empty_catalog' && /服务商返回空模型目录/.test(err.message),
     );
   } finally {
     await s.close();

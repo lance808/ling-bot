@@ -45,8 +45,19 @@ const PROVIDERS = [
   { id: 'siliconflow', name: '硅基流动', baseUrl: 'https://api.siliconflow.cn/v1', note: '国内可直连' },
 ];
 
-/** 目录读不到时的兜底清单：只放几乎确定存在的 */
-const FALLBACK_MODELS = ['deepseek-v4.1', 'deepseek-v4.1-flash', 'deepseek-v4-pro'];
+/**
+ * 探测状态的三态文案。
+ *
+ * 这三态必须分开显示，理由和能力的三态一样：
+ *   - 未探测：还不知道，用户该去点按钮
+ *   - 已探测：拿到了明确结论
+ *   - 探测失败：请求没成 / 没测出结论，要去看地址和 Key
+ *
+ * 把"失败"显示成"未探测"会让人一直以为按钮没点；显示成"不支持"更糟，
+ * 那会让人以为模型坏了。
+ */
+const PROBE_LABEL = { none: '未探测', ok: '已探测', fail: '探测失败' };
+const PROBE_TONE = { none: 'dim', ok: 'ok', fail: 'err' };
 
 /** 通道标签的配色 */
 const CHANNEL_TONE = {
@@ -82,6 +93,17 @@ const CHANNEL_TONE = {
  *   probes: Record<string, any>,
  *   busy: string,
  *   dirty: boolean,
+ *   keyDraft: string,
+ *   timeoutDraft: string|null,
+ *   lastTest: { ok: boolean, at: number }|null,
+ *   notice: { text: string, cls: string }|null,
+ *   endpoint: string,
+ *   catalogSource: 'none'|'remote',
+ *   manualMode: boolean,
+ *   manualModel: string,
+ *   selectDraft: string,
+ *   probeStatus: Record<string, { state: 'none'|'ok'|'fail', at: number, message: string, detail: string }>,
+ *   lastProbe: { model: string, ok: boolean }|null,
  * }}
  */
 const state = {
@@ -121,8 +143,70 @@ const state = {
    * @type {{ ok: boolean, at: number } | null}
    */
   lastTest: null,
+  credentialRevision: 0,
   notice: null,
   endpoint: '',
+  /**
+   * 当前是否在看真实目录。
+   *
+   * 'remote' = 从服务商 /models 读到的
+   * 'none'   = 还没读，或读失败 —— 这时只能手填模型名
+   *
+   * ## 为什么不再有"内置兜底清单"
+   *
+   * 原来读不到目录时会塞进一份写死的 deepseek 列表。那造成两个问题：
+   *   1. 用户会以为这些模型是"当前服务商提供的"，照着选然后 404；
+   *   2. 界面看起来永远有 DeepSeek 可选，像是默认值被写死了。
+   * 现在读不到就老实说读不到，改成手填。
+   *
+   * @type {'none' | 'remote'}
+   */
+  catalogSource: 'none',
+  catalogError: null,
+  /**
+   * 「手填模型名」模式。
+   *
+   * 目录读到了也可以切到它 —— 中转站常常有目录里没列出来、
+   * 但实际能用的模型名。
+   */
+  manualMode: false,
+  /**
+   * 手填模型名的草稿。
+   *
+   * 和 keyDraft 同理：重绘会重建 input，值不存进模块状态就会丢。
+   *
+   * @type {string}
+   */
+  manualModel: '',
+  /**
+   * 下拉框里当前看的模型（**不等于已保存的 llm.model**）。
+   *
+   * 用户在下拉里换一个模型、还没点「用这个模型」时，不该被重绘打回旧值；
+   * 探测之后也要停留在刚探测的那个模型上。
+   *
+   * @type {string}
+   */
+  selectDraft: '',
+  /**
+   * 每个模型的探测状态。
+   *
+   * 与 `probes`（探测明细）分开：这里只放界面上要显示的三态结论。
+   *   none = 没点过
+   *   ok   = 拿到了明确结论
+   *   fail = 请求没成 / 没测出结论
+   *
+   * @type {Record<string, { state: 'none'|'ok'|'fail', at: number, message: string, detail: string }>}
+   */
+  probeStatus: {},
+  /**
+   * 最近一次探测的汇总，供「可否对话」判断。
+   *
+   * 只采纳**和已保存模型同一个**的探测结论：探测别的模型成功，
+   * 说明这个中转站通，但不说明当前配置的模型能用。
+   *
+   * @type {{ model: string, ok: boolean } | null}
+   */
+  lastProbe: null,
   /**
    * 用户是否动过这些输入。
    *
@@ -138,14 +222,28 @@ const state = {
  * @returns {HTMLElement}
  */
 export function renderModelSettings(snap, ctx) {
-  const llm = snap?.config?.llm ?? {};
+  const llm = { ...(snap?.config?.llm ?? {}) };
   const brain = snap?.brain ?? {};
-  const configured = Boolean(brain.configured);
-  const capsAll = llm.modelCapabilities ?? {};
+  let configured = Boolean(brain.configured);
+  let capsAll = llm.modelCapabilities ?? {};
   if (state.endpoint !== (llm.baseUrl ?? '')) {
     state.endpoint = llm.baseUrl ?? '';
+    /*
+     * 换了服务地址，之前读到的一切都作废。
+     *
+     * 模型目录、探测结论、测试结果全都绑在**那一个端点**上：
+     * 把 A 站的目录/结论留在界面上，用户会拿 B 站的 key 去选 A 站的模型，
+     * 然后得到一个无法解释的 404。所以这里必须一起清掉。
+     */
     state.catalog = null;
+    state.catalogSource = 'none';
+    state.catalogError = null;
     state.probes = {};
+    state.probeStatus = {};
+    state.lastProbe = null;
+    state.selectDraft = '';
+    state.manualMode = false;
+    state.manualModel = '';
     state.lastTest = null;
   }
 
@@ -157,6 +255,24 @@ export function renderModelSettings(snap, ctx) {
   }
 
   const local = state;
+  const verificationScope = () => `${llm.baseUrl ?? ''}\n${llm.model ?? ''}\n${local.credentialRevision}`;
+  const currentTest = () => local.lastTest?.scope === verificationScope() ? local.lastTest : null;
+  const dialogueHost = el('span', { class: 'row', id: 'dialogue-state' });
+  const testResultHost = el('span', { class: 'row', id: 'test-result' });
+  const paintCurrentStatus = () => {
+    const d = dialogueState();
+    dialogueHost.replaceChildren(pill(d.label, d.tone), ...(d.why ? [el('span', { class: 'muted', text: d.why })] : []));
+    const t = currentTest();
+    testResultHost.replaceChildren(pill(t ? (t.ok ? '通过' : '失败') : '未测试', t ? (t.ok ? 'ok' : 'err') : 'dim'));
+  };
+  const invalidateVerification = () => {
+    local.credentialRevision += 1;
+    local.lastTest = null;
+    local.lastProbe = null;
+    local.probes = {};
+    local.probeStatus = {};
+    paintCurrentStatus();
+  };
 
   const msg = el('div', { class: state.notice?.cls ?? 'muted mono', text: state.notice?.text ?? '', role: 'status' });
   const say = (text, cls = 'muted mono') => {
@@ -267,7 +383,32 @@ export function renderModelSettings(snap, ctx) {
       if (!providerResult?.ok) return say(`地址已保存，但提供商标记保存失败：${providerResult?.message ?? providerResult?.code}`, 'err mono');
       local.baseUrl = v;
       local.dirty = false;
-      say('✓ 地址已保存', 'ok mono');
+      /*
+       * 换了地址，之前那些"验证通过"就一文不值。
+       *
+       * 不清的话，「可否对话」会拿 A 站的成功结论替 B 站背书，
+       * 用户就又回到"绿着但发不出消息"的状态。
+       */
+      if (local.endpoint !== v) {
+        local.endpoint = v;
+        local.catalog = null;
+        local.catalogSource = 'none';
+        local.catalogError = null;
+        local.probes = {};
+        local.probeStatus = {};
+        local.lastProbe = null;
+        local.lastTest = null;
+        local.selectDraft = '';
+        local.manualMode = false;
+        local.manualModel = '';
+        llm.baseUrl = v;
+        capsAll = {};
+      }
+      paintCurrentStatus();
+      paintCatalogStatus();
+      rebuildStep4();
+      renderCapabilityDetail(local.picked);
+      say('✓ 地址已保存，请重新读取模型列表并探测', 'ok mono');
     },
   });
 
@@ -309,7 +450,15 @@ export function renderModelSettings(snap, ctx) {
       // 已经进保险箱了，内存里的草稿没有留着的理由
       state.keyDraft = '';
       keyInput.value = '';
-      keyInput.value = '';
+      configured = true;
+      invalidateVerification();
+      local.catalog = null;
+      local.catalogSource = 'none';
+      local.catalogError = null;
+      capsAll = {};
+      paintCatalogStatus();
+      rebuildStep4();
+      renderCapabilityDetail(local.selectDraft || local.picked);
       say('✓ Key 已加密保存', 'ok mono');
     },
   });
@@ -321,7 +470,10 @@ export function renderModelSettings(snap, ctx) {
         text: '清除 Key',
         onclick: async () => {
           const r = await ctx.onClearApiKey();
-          if (r?.ok) { state.keyDraft = ''; keyInput.value = ''; state.lastTest = null; }
+          if (r?.ok) {
+            state.keyDraft = ''; keyInput.value = ''; configured = false;
+            invalidateVerification();
+          }
           say(r?.message ?? (r?.ok ? '已清除 Key' : '清除失败'), r?.ok ? 'muted mono' : 'err mono');
         },
       })
@@ -331,68 +483,316 @@ export function renderModelSettings(snap, ctx) {
 
   const catalogHost = el('div', {});
 
+  /*
+   * 「模型目录」的状态行。
+   *
+   * 读成功 / 读失败都要有个常驻的结论，而不是只在按钮下面闪一句提示 ——
+   * 提示会随着下一次重绘消失，用户回头看不到"到底读没读到"。
+   */
+  const catalogStatusCell = el('span', { class: 'row', 'data-catalog-status': '1' });
+  const paintCatalogStatus = () => {
+    catalogStatusCell.replaceChildren(
+      local.catalogSource === 'remote'
+        ? pill(`已读到 ${local.catalog?.length ?? 0} 个`, 'ok')
+        : local.catalogError
+          ? pill(local.catalogError.reason === 'empty_catalog' ? '目录为空' : '读取失败', 'warn')
+          : pill('未读取', 'dim'),
+    );
+  };
+
   const loadBtn = el('button', {
     class: 'btn btn-primary',
     type: 'button',
     text: '读取模型列表',
-    onclick: async (e) => {
-      const b = /** @type {HTMLButtonElement} */ (e.target);
-      b.disabled = true;
+    onclick: async () => {
+      // 用闭包里的这个节点，不依赖 event.target —— 合成点击时它可能是 undefined
+      loadBtn.disabled = true;
       say('正在读取模型列表…');
       try {
         const r = await ctx.onDetectModels();
         if (r?.ok && Array.isArray(r.models) && r.models.length > 0) {
           local.catalog = r.models;
-          // 当前选中的模型如果不在目录里，仍然保留显示（见 renderCatalog）
-          say(`✓ 读到 ${r.models.length} 个模型`, 'ok mono');
+          local.catalogSource = 'remote';
+          local.catalogError = null;
+          // 目录读到了就把手填模式让出来（用户想手填可以再点回去）
+          local.manualMode = false;
+          say(`✓ 读到 ${r.models.length} 个模型，请选一个再点「探测模型」`, 'ok mono');
         } else {
-          local.catalog = FALLBACK_MODELS.map((id) => ({ id }));
-          say(`读取失败（${r?.message ?? r?.code ?? '未知'}），已退回内置清单`, 'err mono');
+          /*
+           * 读不到就**如实说读不到**。
+           *
+           * 这里原来会塞一份写死的 deepseek 清单当兜底，于是界面永远
+           * 有模型可选、看起来"正常的"，用户选了才发现 404 —— 而真正
+           * 的原因（地址或 Key 不对）被这层掩盖了。现在目录空着，
+           * 直接把排查方向写出来。
+           */
+          local.catalog = null;
+          local.catalogSource = 'none';
+          local.manualMode = true;
+          local.manualModel = local.manualModel || local.picked;
+          local.catalogError = { reason: r?.reason ?? null, message: String(r?.message ?? r?.code ?? '未知错误') };
+          say(
+            r?.reason === 'empty_catalog'
+              ? local.catalogError.message
+              : `读取模型列表失败（${r?.message ?? r?.code ?? '未知'}）。请检查接口地址与 API Key，或改用手填模型名`,
+            'err mono',
+          );
         }
+        paintCatalogStatus();
+        catalogHost.replaceChildren(renderCatalog());
+      } catch (err) {
+        local.catalog = null;
+        local.catalogSource = 'none';
+        local.manualMode = true;
+        local.catalogError = { reason: null, message: String(err?.message ?? err) };
+        say(`读取模型列表失败：${local.catalogError.message}。请检查接口地址与 API Key`, 'err mono');
+        paintCatalogStatus();
         catalogHost.replaceChildren(renderCatalog());
       } finally {
-        b.disabled = false;
+        loadBtn.disabled = false;
       }
     },
   });
 
   /* ============================================================ 第 4 步：选模型 + 能力 */
 
-  const renderCatalog = () => {
-    const items = local.catalog ?? local.picked
-      ? (local.catalog ?? [])
-      : [];
+  /**
+   * 某个模型现在显示的探测状态。
+   *
+   * 优先用本次会话的探测结果；没有就看配置里有没有落过盘（跨重启保留）。
+   *
+   * @param {string} modelId
+   * @returns {'none'|'ok'|'fail'}
+   */
+  const probeStateOf = (modelId) => {
+    const s = local.probeStatus[modelId];
+    if (s) return s.state;
+    const saved = capsAll[modelId];
+    if (!saved?.probedAt) return 'none';
+    /*
+     * 落了盘也算"探过"，但要看结论：
+     * 视觉或生图任一有明确布尔值 = 拿到了结论；否则只说明请求跑过、
+     * 没测出来（E3012 / E404 之类），那仍然是"探测失败"。
+     */
+    const latest = saved.probes ? Object.values(saved.probes) : [];
+    if (latest.length) return latest.some((p) => typeof p?.supported === 'boolean') ? 'ok' : 'fail';
+    return typeof saved.vision === 'boolean' || typeof saved.image === 'boolean' ? 'ok' : 'fail';
+  };
 
-    const list = (items.length > 0 ? items : FALLBACK_MODELS.map((id) => ({ id })));
+  /** 探测失败时的原因，取自最近一次结果或落盘的明细 */
+  const probeMessageOf = (modelId) => {
+    const s = local.probeStatus[modelId];
+    if (s?.message) return s.message;
+    const saved = capsAll[modelId];
+    const p = saved?.probes;
+    if (!p) return '';
+    const first = p.vision?.detail || p.image?.detail || '';
+    return first ? String(first).slice(0, 120) : '';
+  };
+
+  /**
+   * 探测状态药丸。
+   *
+   * 三态必须分开：未探测（还没点）、已探测（拿到结论）、
+   * 探测失败（请求没成，要去看地址和 Key）。
+   *
+   * @param {string} modelId
+   */
+  const probePill = (modelId) => {
+    const st = probeStateOf(modelId);
+    return pill(PROBE_LABEL[st], PROBE_TONE[st]);
+  };
+
+  /**
+   * 「探测状态」整行。
+   *
+   * 三态之外还要给下一步动作，否则用户看到红字也不知道该改什么：
+   *   未探测 → 提示去点按钮
+   *   已探测 → 只有结论，不用多说
+   *   探测失败 → 直接指出"检查接口地址与 API Key"
+   *
+   * @param {string} modelId
+   */
+  const probeRow = (modelId) => {
+    const st = probeStateOf(modelId);
+    const kids = [el('span', { class: 'muted', text: '探测状态' }), probePill(modelId)];
+    if (st === 'none') {
+      kids.push(el('span', { class: 'muted', text: '先点「探测模型」' }));
+    } else if (st === 'fail') {
+      kids.push(el('span', { class: 'err', text: '检查接口地址与 API Key' }));
+    }
+    return el('div', { class: 'row wrap', 'data-probe-row': '1' }, kids);
+  };
+
+  const renderCatalog = () => {
+    const list = Array.isArray(local.catalog) ? local.catalog : [];
+    const selectId = local.selectDraft || local.picked;
+    const useManual = local.manualMode || list.length === 0;
+
+    /* ---------------- 手填模式 ---------------- */
+
+    if (useManual) {
+      const manualInput = /** @type {HTMLInputElement} */ (
+        el('input', {
+          type: 'text',
+          class: 'text-input',
+          placeholder: '例如 deepseek-chat（填服务商文档里写的名字）',
+          autocomplete: 'off',
+          spellcheck: false,
+          value: local.manualModel || local.picked || '',
+        })
+      );
+      manualInput.addEventListener('input', () => {
+        local.manualModel = manualInput.value.trim();
+        // 输入变化立即更新当前模型的能力和探测状态。
+        local.selectDraft = local.manualModel;
+        renderCapabilityDetail(local.manualModel);
+        const row = catalogHost.querySelector('[data-probe-row]');
+        if (row) row.replaceWith(probeRow(local.manualModel));
+      });
+
+      const current = () => (manualInput.value || local.manualModel || '').trim();
+
+      const applyBtn = el('button', {
+        class: 'btn',
+        type: 'button',
+        text: '用这个模型',
+        onclick: async () => {
+          const v = current();
+          if (!v) return say('先填模型名', 'err mono');
+          const r = await ctx.onSaveSetting('llm.model', v);
+          if (!r?.ok) return say(`保存失败：${r?.message ?? r?.code}`, 'err mono');
+          local.picked = v;
+          llm.model = v;
+          paintCurrentStatus();
+          local.selectDraft = v;
+          local.manualModel = v;
+          say(`✓ 已切换到 ${v}`, 'ok mono');
+          catalogHost.replaceChildren(renderCatalog());
+        },
+      });
+
+      const probeBtn = el('button', {
+        class: 'btn',
+        type: 'button',
+        text: '探测模型',
+        title: '会发一次极小的真实请求（一张 64×64 图片 / 一次 1 张生图），消耗极少额度',
+        onclick: async () => {
+          const model = current();
+          if (!model) return say('先填模型名，再点「探测模型」', 'err mono');
+          probeBtn.disabled = true;
+          say(`正在探测 ${model}（会发真实请求，约几秒）…`);
+          try {
+            await runProbe(model);
+          } finally {
+            probeBtn.disabled = false;
+          }
+        },
+      });
+
+      /*
+       * 主按钮只有一个（和下拉模式同一套规则）：
+       * 名字还没保存 → 「用这个模型」；已保存但没验证 → 「探测模型」。
+       */
+      const paintBtnTone = () => {
+        const v = current();
+        const saved = Boolean(v) && v === local.picked;
+        const verified = saved && probeStateOf(v) === 'ok';
+        applyBtn.className = `btn${saved ? '' : ' btn-primary'}`;
+        probeBtn.className = `btn${saved && !verified ? ' btn-primary' : ''}`;
+      };
+      paintBtnTone();
+      manualInput.addEventListener('input', paintBtnTone);
+
+      return el('div', {}, [
+        el('div', { class: 'field-row' }, [
+          el('label', { class: 'field-label', text: '模型（手填）' }),
+          el('div', { class: 'field-control' }, [
+            manualInput,
+            el('div', { class: 'row' }, [applyBtn, probeBtn]),
+            probeRow(local.selectDraft || local.picked || ''),
+            (() => {
+              const m = probeMessageOf(local.selectDraft || local.picked || '');
+              return m ? el('div', { class: 'field-hint err', text: m }) : null;
+            })(),
+            el('div', {
+              class: 'field-hint',
+              text:
+                local.catalogError?.reason === 'empty_catalog'
+                  ? '服务商的 /models 返回了空目录。请在服务商控制台检查令牌分组与模型权限；也可手填已确认可用的模型名。'
+                  : list.length === 0
+                    ? '先点上方「读取模型列表」。若服务商不提供目录，也可手填其文档中的模型名。'
+                    : '中转站常有目录里没列的模型名，可以直接填。',
+            }),
+          ]),
+        ]),
+        capabilityHost,
+      ]);
+    }
+
+    /* ---------------- 目录下拉模式 ---------------- */
 
     // 当前值不在列表里：补一项，否则下拉会跳到第一项，用户以为模型被偷改了
-    const hasPicked = list.some((m) => m.id === local.picked);
-    const merged = hasPicked || !local.picked
+    const hasCurrent = list.some((m) => m.id === selectId);
+    const merged = hasCurrent || !selectId
       ? list
-      : [{ id: local.picked, channel: null, channelLabel: '当前值', basis: '不在目录里' }, ...list];
+      : [{ id: selectId, channel: null, channelLabel: '当前值', basis: '不在目录里' }, ...list];
 
     const select = /** @type {HTMLSelectElement} */ (el('select', { class: 'text-input' }));
     for (const m of merged) {
       const caps = local.probes[m.id]?.caps ?? capsAll[m.id] ?? {};
-      const ch = m.channelLabel ?? inferLabel(m.id, caps);
+      const ch = local.probes[m.id] || caps.probedAt ? inferLabel(m.id, caps) : (m.channelLabel ?? inferLabel(m.id, caps));
       const flags = [];
       if (caps.vision === true) flags.push('读图✓');
       if (caps.vision === false) flags.push('读图✗');
       if (caps.image === true) flags.push('生图✓');
+      const st = probeStateOf(m.id);
+      if (st === 'fail') flags.push('探测失败');
       const tail = flags.length ? ` · ${flags.join(' ')}` : '';
       select.appendChild(el('option', { value: m.id, text: `${m.id}｜${ch}${tail}` }));
     }
-    if (local.picked) select.value = local.picked;
+    select.value = selectId || merged[0]?.id || '';
+
+    /*
+     * 下拉一变就记进 selectDraft。
+     *
+     * 不记的话，2 秒一次的整页重绘会用回 local.picked —— 用户刚选中的
+     * 模型跳回旧的，接着「探测」就探了另一个模型。这正是"点了探测模型、
+     * 选模型部分没更新"的一半原因。
+     */
+    select.addEventListener('change', () => {
+      local.selectDraft = select.value;
+      renderCapabilityDetail(select.value);
+      const row = catalogHost.querySelector('[data-probe-row]');
+      if (row) row.replaceWith(probeRow(select.value));
+      paintBtnTone();
+    });
 
     const applyBtn = el('button', {
-      class: 'btn btn-primary',
+      class: 'btn',
       type: 'button',
       text: '用这个模型',
       onclick: async () => {
-        const r = await ctx.onSaveSetting('llm.model', select.value);
+        const v = select.value;
+        const r = await ctx.onSaveSetting('llm.model', v);
         if (!r?.ok) return say(`保存失败：${r?.message ?? r?.code}`, 'err mono');
-        local.picked = select.value;
-        say(`✓ 已切换到 ${select.value}`, 'ok mono');
+        local.picked = v;
+        llm.model = v;
+        paintCurrentStatus();
+        local.selectDraft = v;
+        say(`✓ 已切换到 ${v}`, 'ok mono');
+        catalogHost.replaceChildren(renderCatalog());
+      },
+    });
+
+    const manualBtn = el('button', {
+      class: 'btn btn-ghost',
+      type: 'button',
+      text: '手填',
+      title: '目录里没有想要的模型时，直接填名字',
+      onclick: () => {
+        local.manualMode = true;
+        local.manualModel = select.value || local.picked || '';
         catalogHost.replaceChildren(renderCatalog());
       },
     });
@@ -400,46 +800,127 @@ export function renderModelSettings(snap, ctx) {
     const probeBtn = el('button', {
       class: 'btn',
       type: 'button',
-      text: '探测能力',
-      title: '会发一次极小的真实请求（一张 1×1 图片 / 一次 1 张生图），消耗极少额度',
-      onclick: async (e) => {
-        const b = /** @type {HTMLButtonElement} */ (e.target);
-        b.disabled = true;
-        say('正在探测（会发真实请求，约几秒）…');
+      text: '探测模型',
+      title: '会发一次极小的真实请求（一张 64×64 图片 / 一次 1 张生图），消耗极少额度',
+      onclick: async () => {
+        const model = select.value;
+        if (!model) return say('先选一个模型', 'err mono');
+        probeBtn.disabled = true;
+        say(`正在探测 ${model}（会发真实请求，约几秒）…`);
         try {
-          const r = await ctx.onProbe(select.value, ['vision', 'image']);
-          if (!r?.ok) {
-            say(`探测失败：${r?.message ?? r?.code}`, 'err mono');
-          } else {
-            local.probes[select.value] = { caps: r.caps, probes: r.probes };
-            const v = r.probes?.vision;
-            const g = r.probes?.image;
-            const fmt = (x, yes, no) =>
-              x?.supported === true ? yes : x?.supported === false ? no : '没测出来';
-            say(
-              `读图：${fmt(v, '✓ 支持', '✗ 不支持')}｜生图：${fmt(g, '✓ 支持', '✗ 不支持')}｜通道：${r.channel?.label ?? '-'}`,
-              'muted mono',
-            );
-            catalogHost.replaceChildren(renderCatalog());
-            renderCapabilityDetail(select.value);
-          }
+          await runProbe(model);
         } finally {
-          b.disabled = false;
+          probeBtn.disabled = false;
         }
       },
     });
+
+    /*
+     * 主按钮只有一个。
+     *
+     * 三步是递进的：选模型 → 保存 → 探测。所以：
+     *   - 选择还没保存 → 「用这个模型」是主按钮
+     *   - 已保存但没探测过 / 探测失败 → 「探测模型」是主按钮
+     *   - 两个都做完了 → 都退成普通按钮
+     *
+     * 原来两个都写死 btn-primary，一屏两个蓝按钮，看不出下一步该点哪个。
+     */
+    const paintBtnTone = () => {
+      const saved = select.value === local.picked;
+      const verified = saved && probeStateOf(select.value) === 'ok';
+      applyBtn.className = `btn${saved ? '' : ' btn-primary'}`;
+      probeBtn.className = `btn${saved && !verified ? ' btn-primary' : ''}`;
+    };
+    paintBtnTone();
+
+    const msgLine = probeMessageOf(select.value);
 
     return el('div', {}, [
       el('div', { class: 'field-row' }, [
         el('label', { class: 'field-label', text: '模型' }),
         el('div', { class: 'field-control' }, [
           select,
-          el('div', { class: 'row' }, [applyBtn, probeBtn]),
+          el('div', { class: 'row' }, [applyBtn, probeBtn, manualBtn]),
+          probeRow(select.value),
+          msgLine ? el('div', { class: 'field-hint err', text: msgLine }) : null,
+          el('div', {
+            class: 'field-hint',
+            text: '先选模型，再点「探测模型」—— 探测前不知道它能不能读图 / 生图。',
+          }),
         ]),
       ]),
       capabilityHost,
     ]);
   };
+
+  /**
+   * 执行一次探测，并把三态结论写到界面上。
+   *
+   * 抽成一个函数，是因为手填模式和下拉模式都要用它，而这段逻辑
+   * （成功 / 失败 / 抛异常）以前散在按钮回调里，改一处漏一处。
+   *
+   * @param {string} modelId
+   */
+  const runProbe = async (modelId) => {
+    /** @type {any} */
+    let r = null;
+    try {
+      r = await ctx.onProbe(modelId, ['vision', 'image']);
+    } catch (err) {
+      r = { ok: false, code: 'E50XX', message: String(/** @type {any} */ (err)?.message ?? err) };
+    }
+
+    if (!r?.ok) {
+      const message = String(r?.message ?? r?.code ?? '未知错误');
+      local.probeStatus[modelId] = { state: 'fail', at: Date.now(), message, detail: message };
+      local.lastProbe = { model: modelId, ok: false };
+      say(`探测失败：${message}。请检查接口地址与 API Key`, 'err mono');
+    } else {
+      local.probes[modelId] = { caps: r.caps, probes: r.probes };
+      local.selectDraft = modelId;
+
+      const v = r.probes?.vision;
+      const g = r.probes?.image;
+      const known = typeof v?.supported === 'boolean' || typeof g?.supported === 'boolean';
+      const reason = [v, g]
+        .filter((x) => x && x.supported !== true && x.detail)
+        .map((x) => String(x.detail).slice(0, 120))
+        .join('；');
+
+      local.probeStatus[modelId] = {
+        state: known ? 'ok' : 'fail',
+        at: Date.now(),
+        message: known ? '' : reason || '没测出结论',
+        detail: reason,
+      };
+      local.lastProbe = { model: modelId, ok: known };
+
+      const fmt = (x) => (x?.supported === true ? '✓ 支持' : x?.supported === false ? '✗ 不支持' : '没测出来');
+      say(
+        known
+          ? `✓ 已探测 ${modelId}｜读图：${fmt(v)}｜生图：${fmt(g)}｜通道：${r.channel?.label ?? '-'}`
+          : `探测失败：没能得到结论（${reason || '超时或网络错误'}）。请检查接口地址与 API Key`,
+        known ? 'ok mono' : 'err mono',
+      );
+    }
+
+    /*
+     * 探测之后**必须重建第 4 步整块**。
+     *
+     * 原来只替换了下拉（catalogHost.replaceChildren(renderCatalog())），
+     * 但下拉里的每项文字（读图✓ / 探测失败）和能力详情都是按探测结果
+     * 现算的 —— 不重建就还是旧文案。用户看到的就是"点了探测，选择模型
+     * 那部分没更新"。
+     */
+    rebuildStep4();
+    renderCapabilityDetail(modelId);
+  };
+
+  /** 选中模型变化时，能力卡片要跟着换 */
+  const rebuildStep4 = () => {
+    catalogHost.replaceChildren(renderCatalog());
+  };
+
 
   /* ---- 能力详情 ---- */
 
@@ -449,6 +930,7 @@ export function renderModelSettings(snap, ctx) {
     const p = local.probes[modelId];
     const caps = p?.caps ?? capsAll[modelId] ?? {};
     const ch = inferChannelLabel(modelId, caps);
+    const st = probeStateOf(modelId);
 
     /** 三态渲染：true/false/null 必须分别显示 */
     const tri = (v, yesText, noText) => {
@@ -457,7 +939,22 @@ export function renderModelSettings(snap, ctx) {
       return pill('未测', 'dim');
     };
 
+    /*
+     * 还没探测时，这张卡片顶部就必须有一句"去点探测"。
+     *
+     * 否则打开页面看到的是一张填满「未测」的表 —— 用户不知道该先点按钮，
+     * 容易以为"这个模型什么都不支持"。这正是要在探测之前先提示的原因。
+     */
+    const prompt =
+      st === 'none'
+        ? el('div', { class: 'field-hint' }, [
+            el('strong', { text: `还没探测 ${modelId}。` }),
+            el('span', { text: '点上方「探测模型」才知道它到底能不能读图 / 生图。' }),
+          ])
+        : null;
+
     const rows = [
+      kv('探测状态', pill(PROBE_LABEL[st], PROBE_TONE[st])),
       kv('通道', pill(ch.label, CHANNEL_TONE[ch.channel] ?? 'dim')),
       kv('判断依据', el('span', { class: 'muted', text: ch.basis })),
       kv('读图（视觉）', tri(caps.vision, '✓ 支持', '✗ 不支持')),
@@ -471,17 +968,20 @@ export function renderModelSettings(snap, ctx) {
     // 探测失败的具体原因要看得到，否则"没测出来"等于没说
     const detailLines = [];
     for (const [k, label] of [['vision', '读图'], ['image', '生图']]) {
-      const r = p?.probes?.[k];
+      const r = (p?.probes ?? caps.probes)?.[k];
       if (r && r.supported !== true && r.detail) {
         detailLines.push(`${label}：${r.detail}`);
       }
     }
+    const sessionMsg = local.probeStatus[modelId]?.message;
+    if (sessionMsg && !detailLines.some((l) => l.includes(sessionMsg))) detailLines.push(sessionMsg);
 
     capabilityHost.replaceChildren(
       card('模型能力', [
+        prompt,
         el('div', { class: 'list' }, rows),
         detailLines.length > 0
-          ? el('div', { class: 'field-hint', text: detailLines.join('\n') })
+          ? el('div', { class: 'field-hint err', text: detailLines.join('\n') })
           : null,
         el('div', {
           class: 'field-hint',
@@ -495,12 +995,16 @@ export function renderModelSettings(snap, ctx) {
 
   /* ---- 初始渲染 ---- */
 
-  if (local.picked) {
-    renderCapabilityDetail(local.picked);
+  paintCatalogStatus();
+
+  // 用 selectDraft：用户可能刚在下拉里换了一个但还没保存，重绘不该把它打回去
+  const initialModel = local.selectDraft || local.picked;
+  if (initialModel) {
+    renderCapabilityDetail(initialModel);
   } else {
     capabilityHost.replaceChildren(
       card('模型能力', [
-        el('div', { class: 'muted', text: '先读取模型列表并选一个模型，再点「探测能力」。' }),
+        el('div', { class: 'muted', text: '先读取模型列表（或手填模型名）并选中一个模型，再点「探测模型」。' }),
       ]),
     );
   }
@@ -575,23 +1079,24 @@ export function renderModelSettings(snap, ctx) {
       testBtn.disabled = true;
       testBtn.textContent = '测试中…';
 
+      const scope = verificationScope();
       try {
         const r = await ctx.onTest();
         if (r?.ok) {
           out.className = 'ok mono';
           out.textContent = `✓ 通了：${r.reply ?? ''}（${r.ms ?? '?'}ms，${r.model ?? ''}）`;
           // 只记结论；长句不持久化（状态行要一眼扫完）
-          state.lastTest = { ok: true, at: Date.now() };
+          state.lastTest = { ok: true, at: Date.now(), scope };
         } else {
           out.className = 'err mono';
           out.textContent = `✖ ${r?.code ?? 'E50XX'} ${r?.message ?? '失败'}`;
-          state.lastTest = { ok: false, at: Date.now() };
+          state.lastTest = { ok: false, at: Date.now(), scope };
         }
       } catch (err) {
         // ctx.onTest 抛异常（IPC 断了之类）也要让人看到，不能静默
         out.className = 'err mono';
         out.textContent = `✖ 请求失败：${String(err?.message ?? err)}`;
-        state.lastTest = { ok: false, at: Date.now() };
+        state.lastTest = { ok: false, at: Date.now(), scope };
       } finally {
         testBtn.disabled = false;
         testBtn.textContent = '测试连接';
@@ -604,10 +1109,7 @@ export function renderModelSettings(snap, ctx) {
          *
          * 这里只替换那一行，不重绘整页：不打断输入、也不丢别处的状态。
          */
-        const row = document.getElementById('test-result');
-        const fresh = testResultCell();
-        // testResultCell 返回的节点已经带同一个 id，直接替换即可
-        row?.replaceWith(fresh);
+        paintCurrentStatus();
       }
     },
   });
@@ -617,25 +1119,50 @@ export function renderModelSettings(snap, ctx) {
   const stepNo = (n, title) => el('div', { class: 'step-title', text: `${n}. ${title}` });
 
   /**
-   * 「测试结果」那一行的内容：药丸 + 具体信息。
+   * 「可否对话」的真实状态。
    *
-   * 只给一个"通过/失败"信息量不够——失败时用户最需要知道**为什么**失败
-   * （603 超时？404 模型名？401 key 无效？）。所以药丸后面跟上原文。
+   * ## 原来错在哪
+   *
+   * 原来是 `configured ? 可以 : 缺少 Key` —— 只要保险箱里有一把 key
+   * 就永远是绿的。可"填了 key"和"能对话"是两件事：地址写错、模型名
+   * 不存在、key 限流，全都表现为绿的「可以」，然后在 QQ 里发消息没反应。
+   *
+   * ## 现在的判据
+   *
+   * 先检查 Key、模型、地址，再采用当前配置最近一次文本对话测试。
+   * 切换模型、地址或凭据后需要重新验证；图像能力结论只用于能力标签。
+   * 没有匹配的文本测试结果时显示「未验证」。
+   *
+   * 第 4 种必须单独一态：什么都没试过就显示"可以"正是这个 bug 的来源，
+   * 而显示"不可以"又太绝对 —— 它可能完全正常，只是没人测过。
+   *
+   * @returns {{ label: string, tone: 'ok'|'warn'|'err'|'dim', why: string }}
    */
-  function testResultCell() {
-    const r = state.lastTest;
-    if (!r) return el('span', { class: 'row', id: 'test-result' }, [pill('未测试', 'dim')]);
-    /*
-     * 这里只放结论，不放那一长串原文。
-     *
-     * 「通了：通了（2134ms，deepseek-v4.1-flash）」放在这一行会把它撑得很宽，
-     * 也不该进"常驻状态"——状态行要一眼扫完。长句留在按钮下方那个临时区域，
-     * 需要细节时看那里。
-     */
-    return el('span', { class: 'row', id: 'test-result' }, [
-      pill(r.ok ? '通过' : '失败', r.ok ? 'ok' : 'err'),
-    ]);
+  function dialogueState() {
+    const model = llm.model || '';
+    if (!configured) {
+      return { label: '缺少 Key', tone: 'warn', why: '先在下面第 2 步填 API Key' };
+    }
+    if (!model) {
+      return { label: '缺少模型', tone: 'warn', why: '先在第 4 步选一个模型' };
+    }
+    if (!llm.baseUrl) {
+      return { label: '缺少地址', tone: 'warn', why: '先在第 1 步填接口地址' };
+    }
+
+    // 图像能力结论不证明文本对话可用。只采用当前配置的真实对话测试。
+    const verified = currentTest();
+    if (verified) {
+      return verified.ok
+        ? { label: '可以', tone: 'ok', why: '测试连接已通过' }
+        : { label: '不可以', tone: 'err', why: '测试连接失败，见测试结果' };
+    }
+
+    // 4. 有 key 有模型，但没人验过
+    return { label: '未验证', tone: 'warn', why: '' };
   }
+
+  paintCurrentStatus();
 
   return el('div', { class: 'cols' }, [
     el('div', {}, [
@@ -649,8 +1176,14 @@ export function renderModelSettings(snap, ctx) {
            * 这里把它变成一条常驻数据 —— 和「可否对话」「模型」平级，
            * 每次重绘都从 state.lastTest 画回来。
            */
-          kv('测试结果', testResultCell()),
-          kv('可否对话', configured ? pill('可以', 'ok') : pill('缺少 Key', 'warn')),
+          kv('测试结果', testResultHost),
+          /*
+           * 「可否对话」必须反映**真实可用性**，不能只看有没有 key。
+           *
+           * 原样是 configured ? 可以 : 缺少 Key，于是一把填错的 key 也让
+           * 它常年显示绿的「可以」。三种状态的分法见 dialogueState()。
+           */
+          kv('可否对话', dialogueHost),
           kv('模型', llm.model || pill('未设置', 'warn')),
           kv('地址', llm.baseUrl || pill('未设置', 'warn')),
           kv(
@@ -711,10 +1244,12 @@ export function renderModelSettings(snap, ctx) {
         el('div', { class: 'field-row' }, [
           el('label', { class: 'field-label', text: '模型目录' }),
           el('div', { class: 'field-control' }, [
-            el('div', { class: 'row' }, [loadBtn]),
+            el('div', { class: 'row' }, [loadBtn, catalogStatusCell]),
             el('div', {
               class: 'field-hint',
-              text: '请求服务商的 /models 接口，拿到它实际提供的模型。读不到时退回内置清单。',
+              text:
+                '请求服务商的 /models 接口，拿到它实际提供的模型。\n' +
+                '读不到就如实空着，不塞内置清单——那会让人以为这些模型是服务商提供的。',
             }),
           ]),
         ]),

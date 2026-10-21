@@ -32,7 +32,7 @@ const RETRYABLE_CODES = new Set([
 export class LlmError extends Error {
   /**
    * @param {string} message
-   * @param {{code?: string, status?: number, retryable?: boolean}} [meta]
+   * @param {{code?: string, status?: number, retryable?: boolean, reason?: string}} [meta]
    */
   constructor(message, meta = {}) {
     super(message);
@@ -40,6 +40,7 @@ export class LlmError extends Error {
     this.code = meta.code ?? 'E30XX';
     this.status = meta.status ?? null;
     this.retryable = meta.retryable ?? false;
+    this.reason = meta.reason ?? null;
   }
 }
 
@@ -158,7 +159,13 @@ export class LlmClient {
 
     // 解析成功但一个都没有：说明接口形状不对，同样是错，不能当"成功但为空"
     if (ids.length === 0) {
-      throw new LlmError(`模型列表是空的（${this.modelsUrl()}），这个地址可能不支持 /models`, { code: 'E3021' });
+      if (Array.isArray(data) || Array.isArray(data?.data)) {
+        throw new LlmError(
+          `服务商返回空模型目录（${this.modelsUrl()}）。当前 Key 未列出可用模型，请到服务商控制台检查令牌分组与模型权限，或手填服务商确认可用的模型名。`,
+          { code: 'E3021', reason: 'empty_catalog' },
+        );
+      }
+      throw new LlmError(`模型列表格式无法识别（${this.modelsUrl()}），需要 {data:[{id}]} 或模型数组`, { code: 'E3021' });
     }
 
     // 去重并排序：目录乱序时下拉框会跳来跳去

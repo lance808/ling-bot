@@ -344,7 +344,7 @@ test('★ 测试结果要常驻，不能闪一下就没', () => {
   assert.match(src, /lastTest/, '结果要存在模块级 state');
   assert.match(src, /kv\('测试结果'/, '当前状态卡片里要有这一行');
   assert.match(src, /id: 'test-result'/, '这一行要能原地更新');
-  assert.match(src, /row\?\.replaceWith\(fresh\)/, '拿到结果后要原地刷新');
+  assert.match(src, /testResultHost\.replaceChildren/, '拿到结果后要原地刷新');
   // 必须是第一行（在「可否对话」之前）
   const iTest = src.indexOf("kv('测试结果'");
   const iDialogue = src.indexOf("kv('可否对话'");
@@ -355,8 +355,8 @@ test('★ 常驻结果只放结论，长句留在临时区', () => {
   // 状态行要一眼扫完；「通了：通了（2134ms，deepseek-v4.1-flash）」
   // 那种长句会把它撑宽，不该进常驻状态。
   const src = read('ui/src/views/model.mjs');
-  const i = src.indexOf('function testResultCell');
-  const block = src.slice(i, src.indexOf('\n  }', i));
+  const i = src.indexOf('const paintCurrentStatus');
+  const block = src.slice(i, src.indexOf('\n  };', i));
   assert.match(block, /通过/, '要有通过');
   assert.match(block, /失败/, '要有失败');
   assert.ok(!/text: r\.text/.test(block), '常驻行不放原文');
@@ -963,4 +963,55 @@ test('识别失败时仍会提示用户怎么指定路径', () => {
   const block = src.slice(i, i + 500);
   assert.match(block, /选目录/, '失败提示要告诉用户点哪里');
   assert.match(block, /env-note warn/, '失败提示要显眼');
+});
+
+/* ------------------------------------------------ 界面不闪（踩过的坑） */
+
+/*
+ * 症状：每 2 秒整页闪一次，卡片阴影消失又出现。
+ *
+ * 两个原因，各留一条断言，免得以后被人"优化"回去：
+ *   1. 轮询无条件 set() → 整页重建，卡片阴影的过渡被打断重放
+ *   2. 卡片本身带 box-shadow 过渡 → 重建一次就闪一次
+ */
+
+test('★ 轮询不强制重绘（内容没变就不重建整页）', () => {
+  const app = read('ui/src/app.mjs');
+
+  // 轮询必须是 force=false：否则指纹比较形同虚设
+  assert.match(
+    app,
+    /setInterval\(\(\) => void pull\(false\), 2000\)/,
+    '每 2 秒的轮询必须传 force=false，否则每轮都整页重建',
+  );
+
+  // 比较与提前返回必须在 pull() 里
+  assert.match(app, /const fingerprint = snapshotFingerprint\(snap\)/, 'pull 要先算指纹');
+  assert.match(
+    app,
+    /if \(!force && fingerprint === lastSnapshotFingerprint\)\s*\{[\s\S]*?set\(\{ snapshot: snap \}, \{ notify: false \}\);\s*return;/,
+    '没可见变化时仍要静默刷新快照，再跳过 DOM 重建',
+  );
+
+  // 用户操作之后的那次 pull 必须强制重绘，否则"点了没反应"
+  assert.match(app, /async function pull\(force = true\)/, 'pull 默认应强制，只有轮询传 false');
+  assert.match(app, /if \(force\) pullAgainForce = true/, '排队中的强制请求不能被轮询吞掉');
+});
+
+test('★ 卡片不加 box-shadow 过渡（重建一次就闪一次）', () => {
+  for (const file of ['ui/styles/base.css', 'ui/styles/pages.css']) {
+    const css = read(file);
+    // 找出所有对 .card 声明 transition 的地方
+    const offenders = [];
+    const re = /([^{}]*)\{([^}]*)\}/g;
+    let m;
+    while ((m = re.exec(css)) !== null) {
+      const [, sel, body] = m;
+      if (!/\.card\b/.test(sel)) continue;
+      if (/transition[^;]*box-shadow/.test(body) || /box-shadow[^;]*transition/.test(body)) {
+        offenders.push(sel.trim());
+      }
+    }
+    assert.deepEqual(offenders, [], `${file} 里 .card 不该对 box-shadow 做过渡`);
+  }
 });

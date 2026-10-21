@@ -32,6 +32,16 @@ export function renderConfirmBar(pending, ctx) {
 
       // 倒计时：让人知道"不点就会自动拒绝"
       const timer = setInterval(() => {
+        /*
+         * 这一条已经被重绘换掉了（clear(confirmHost) 之后再重建）。
+         *
+         * 不清理的话旧 timer 会一直跑到 60 秒，往一个已经不在文档里的
+         * 节点上写 textContent —— 白烧 CPU，也看不出任何症状。
+         */
+        if (!deadline.isConnected) {
+          clearInterval(timer);
+          return;
+        }
         const left = Math.max(0, Math.ceil(((p.timeoutMs ?? 60_000) - (Date.now() - started)) / 1000));
         deadline.textContent = left > 0 ? `${left}s 后自动拒绝` : '已过期';
         if (left <= 0) clearInterval(timer);

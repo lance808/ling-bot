@@ -81,6 +81,11 @@ const PUBLIC_API_HOSTS = [
   'registry.npmjs.org',
   'npmjs.com',
   'schema.tauri.app',
+  // README 中的官方运行环境和构建工具文档
+  'microsoft.com',
+  'visualstudio.com',
+  'rust-lang.org',
+  'tauri.app',
 ];
 
 /**

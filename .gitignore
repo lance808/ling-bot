@@ -21,6 +21,8 @@ secrets.json
 state/
 usage.jsonl
 persona.json
+role.json
+thinking/
 
 # 编辑器与本机杂项
 .DS_Store
@@ -76,7 +78,6 @@ secret.vault
 .tmp-start.*
 .tmp-*/
 .tmp-*
-!role.json
 
 # 图标生成的中间产物（脚本可随时重跑，只保留 assets/ 下的成品）
 assets/*-report.txt
@@ -84,3 +85,20 @@ assets/*-x[0-9]*.png
 
 .gitmsg.txt
 commit-msg.tmp
+
+# 私钥、证书容器与本机数据库
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+
+# 测试覆盖率与调试产物
+coverage/
+.nyc_output/
+*.dmp

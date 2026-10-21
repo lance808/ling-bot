@@ -17,6 +17,7 @@ import { getState, set, subscribe, toast } from './store.mjs';
 import { snapshot, action, setting, onEvent, meta, hasBridge, restartBackend } from './api.mjs';
 import { el, clear } from './render.mjs';
 import { snapshotQuery, usageQuery } from './contracts.mjs';
+import { snapshotFingerprint } from './snapshot-diff.mjs';
 import { renderOverview } from './views/overview.mjs';
 import { renderSessions } from './views/sessions.mjs';
 import { renderPersona, renderBehaviorLayer } from './views/persona.mjs';
@@ -321,11 +322,12 @@ function paintThinkPanel(state) {
     onFilter: (f) => {
       local.think.filter = f;
       local.think.before = null;
-      void pull();
+      // force：筛选条件变了但结果可能一模一样，指纹相同会跳过重绘 → 点了没反应
+      void pull(true);
     },
-    onDays: (days) => { local.think.days = days; local.think.before = null; void pull(); },
-    onOlder: (before) => { local.think.before = before; void pull(); },
-    onLatest: () => { local.think.before = null; void pull(); },
+    onDays: (days) => { local.think.days = days; local.think.before = null; void pull(true); },
+    onOlder: (before) => { local.think.before = before; void pull(true); },
+    onLatest: () => { local.think.before = null; void pull(true); },
     onToggleStep: (key) => {
       if (!(local.think.expanded instanceof Set)) local.think.expanded = new Set();
       if (local.think.expanded.has(key)) local.think.expanded.delete(key);
@@ -479,15 +481,64 @@ if (!hasBridge()) {
 
 let polling = false;
 let pullAgain = false;
+/**
+ * 排队中的那次重跑是否需要强制重绘。
+ *
+ * 必须是独立变量：轮询进行到一半时用户点了「保存」，那次 pull(true)
+ * 只会设 pullAgain；如果重跑时一律用轮询的 force=false，用户刚做完的
+ * 操作就没有一次重绘落地 —— 又是"点了没反应"。
+ */
+let pullAgainForce = false;
 let lastSnapshotAt = 0;
+
+/**
+ * 屏幕上是哪一份快照的指纹（由 render() 维护）。
+ *
+ * 相同就说明这次轮询没有用户看得见的变化 —— 不收、不重绘。
+ * 见 snapshot-diff.mjs 里的说明。
+ */
+let lastSnapshotFingerprint = '';
+
 const snapshotNotice = el('div', { class: 'hint', role: 'status', hidden: true });
 view.before(snapshotNotice);
 
 function showSnapshotHealth(error = '') {
-  snapshotNotice.hidden = !error;
-  snapshotNotice.textContent = error
+  const text = error
     ? `数据暂未更新：${error}。${lastSnapshotAt ? `当前显示 ${new Date(lastSnapshotAt).toLocaleTimeString()} 的快照。` : '尚未取得后端快照。'}`
     : '';
+  // 每 2 秒都会走这里，没变化就别写 DOM（写 textContent 也会触发一次布局）
+  if (snapshotNotice.textContent === text && snapshotNotice.hidden === !error) return;
+  snapshotNotice.hidden = !error;
+  snapshotNotice.textContent = text;
+}
+
+/**
+ * toast 的 4 秒窗口。
+ *
+ * 原来是靠"下一次重绘"来收起它的，于是收起时机跟着 2 秒轮询走。
+ * 现在没变化就不重绘了，必须自己计时 —— 否则提示会一直挂在屏幕上。
+ *
+ * @type {ReturnType<typeof setTimeout> | null}
+ */
+let toastTimer = null;
+
+function syncToast() {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  const s = getState();
+  const left = s.toast ? 4000 - (Date.now() - s.toast.at) : 0;
+  if (left <= 0) {
+    toastEl.hidden = true;
+    return;
+  }
+  toastEl.hidden = false;
+  toastEl.textContent = s.toast.text;
+  toastTimer = setTimeout(() => {
+    toastEl.hidden = true;
+    toastTimer = null;
+  }, left);
 }
 
 let usageLoading = false;
@@ -504,8 +555,24 @@ async function loadUsage() {
   } finally { usageLoading = false; }
 }
 
-async function pull() {
-  if (polling) { pullAgain = true; return; }
+/**
+ * 拉一次快照。
+ *
+ * @param {boolean} [force] 是否无条件重绘。
+ *   默认 **true**：调用方都是"刚做完一件事，必须让用户看见结果"
+ *   （保存配置、点测试连接、确认工具调用……），这些地方不能省这一次重绘。
+ *
+ *   只有 2 秒轮询传 false —— 那才是需要"没变化就别碰 DOM"的地方。
+ *   定时器不能直接把 pull 传进去：setInterval 会把毫秒数当参数塞进来，
+ *   非 0 即真，等于永远强制重绘。
+ */
+async function pull(force = true) {
+  if (polling) {
+    pullAgain = true;
+    // 只要排队中的任意一次要求强制，重跑就必须强制（见 pullAgainForce）
+    if (force) pullAgainForce = true;
+    return;
+  }
   polling = true;
   try {
     const snap = await snapshot(snapshotQuery({
@@ -517,22 +584,40 @@ async function pull() {
     if (snap.usage && local.usageData) snap.usage.range = local.usageData;
     lastSnapshotAt = Date.now();
     showSnapshotHealth();
-    // 后端还在 boot()：不要把它当"空数据"渲染，避免误导成"一个群都没配"
-    if (snap?.booting) {
-      set({ snapshot: snap });
+
+    /*
+     * 内容没变就别碰 DOM —— 这是"每 2 秒闪一下"的根因。
+     *
+     * 原来这里无条件 set()，于是每轮都 clear(view) 整页重建。重建期间
+     * 滚动容器的高度塌成 0、卡片节点全部重新插入，贴着视口边缘的
+     * box-shadow 被裁掉又画回来，看起来就是"阴影消失再出现"。
+     *
+     * 指纹的记账在 render() 里（那边才知道这一份到底有没有落到 DOM 上），
+     * 所以这里只做比较。
+     */
+    const fingerprint = snapshotFingerprint(snap);
+    if (!force && fingerprint === lastSnapshotFingerprint) {
+      // 去重只跳过重绘；统计时间边界仍须更新，否则换页后会误判账本过期。
+      set({ snapshot: snap }, { notify: false });
       return;
     }
+
     set({ snapshot: snap });
   } catch (error) {
     showSnapshotHealth(String(error?.message ?? error));
   } finally {
     polling = false;
-    if (pullAgain) { pullAgain = false; void pull(); }
+    if (pullAgain) {
+      const nextForce = pullAgainForce;
+      pullAgain = false;
+      pullAgainForce = false;
+      void pull(nextForce);
+    }
   }
 }
 
-setInterval(pull, 2000);
-pull();
+setInterval(() => void pull(false), 2000);
+void pull();
 
 /* ---------------------------------------------------------------- 事件订阅 */
 
@@ -884,8 +969,17 @@ function render() {
    */
   const pageChanged = lastRenderedPage !== page.id;
   if (!pageChanged && (isEditing() || activeOps > 0)) {
+    /*
+     * 这一次没落到 DOM 上，所以**不记指纹**。
+     *
+     * 记了的话，等用户从输入框挪开焦点，就没有任何一轮再来补这次重绘 ——
+     * 数据已经变了、界面还停在旧值，而且此后再也不会刷新（后面的快照
+     * 指纹都和这份"已记账"的一样）。不记的话，下一轮轮询仍然判定为
+     * "有变化"，会再走一遍 set() → render()，那时输入结束，自然就刷新了。
+     */
     refreshThinkOnly();
     syncThemeButtons();
+    syncToast();
     return;
   }
   lastRenderedPage = page.id;
@@ -1083,16 +1177,27 @@ function render() {
     }),
   );
 
-  if (s.toast && Date.now() - s.toast.at < 4000) {
-    toastEl.hidden = false;
-    toastEl.textContent = s.toast.text;
-  } else {
-    toastEl.hidden = true;
-  }
+  /*
+   * toast 的收起改成自己计时。
+   *
+   * 原来是"每 2 秒重绘时顺带判断一次"，现在没变化就不重绘了，
+   * 靠重绘收尾会让提示一直挂着 —— 所以计时器必须在 syncToast 里。
+   */
+  syncToast();
 
   syncThinkToggle();
 
   syncThemeButtons();
+
+  /*
+   * 记下"屏幕上这一份"的指纹。
+   *
+   * 必须在这里记，不能放在 pull() 里：只有走完整页重建，DOM 才真的
+   * 和这份快照对齐。上面那个输入保护的分支会提前 return（不记），
+   * 于是下一轮轮询仍判定"有变化"，再试一次 —— 用户在打字时不该被
+   * 重建打断，但也不能因此永久停在旧数据上。
+   */
+  if (s.snapshot) lastSnapshotFingerprint = snapshotFingerprint(s.snapshot);
 }
 
 subscribe(render);

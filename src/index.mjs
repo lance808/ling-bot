@@ -1178,8 +1178,9 @@ const rpc = {
         }
         if (name === 'llm.models') {
           // 读服务商实际提供的模型列表（只读，不改任何配置）。
-          // 失败就让上层退回内置清单——这里不抛错，因为"读不到目录"不该
-          // 阻断整个页面。
+          // 失败就如实回 ok:false，由界面切成"手填模型名"——这里不抛错，
+          // 因为"读不到目录"不该阻断整个页面；但也**不能**塞一份内置清单
+          // 当兜底，那会让人以为这些模型是服务商提供的。
           try {
             const ids = await llm.listModels({});
             // 附带已知能力信息：目录里就能看出哪些已实测可读图
@@ -1187,7 +1188,7 @@ const rpc = {
             return { ok: true, models, ids };
           } catch (err) {
             const e = /** @type {any} */ (err);
-            return { ok: false, code: e?.code ?? 'E3021', message: String(e?.message ?? e) };
+            return { ok: false, code: e?.code ?? 'E3021', reason: e?.reason ?? null, message: String(e?.message ?? e) };
           }
         }
         if (name === 'llm.probe') {

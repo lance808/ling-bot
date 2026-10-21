@@ -1000,7 +1000,19 @@ select.text-input {
 .topbar h1 { font-size: 18px; letter-spacing: .2px; }
 .topbar-sub { color: var(--fg-dim); }
 .view { scrollbar-gutter: stable; }
-.card { background: linear-gradient(145deg, var(--bg-elev), color-mix(in srgb, var(--bg-elev) 96%, var(--accent))); transition: box-shadow .18s ease; }
+/*
+ * 卡片**不做** box-shadow 过渡。
+ *
+ * 这里原本是 `transition: box-shadow .18s ease`，本意是让 hover 的
+ * 光晕柔和一点。但卡片会被整页重建（每 2 秒轮询），新节点的
+ * box-shadow 从"无"到"有"正好落在过渡的起点上 —— 于是每 2 秒
+ * 阴影淡出再淡入一次，看起来就是"阴影部分消失又出现"。
+ *
+ * 重绘那一侧已经改成"内容没变就不重建"（见 app.mjs 的 snapshotFingerprint），
+ * 这里再去掉过渡，是第二道保险：万一将来又有谁触发重建，
+ * 阴影也是立刻到位，不会闪。
+ */
+.card { background: linear-gradient(145deg, var(--bg-elev), color-mix(in srgb, var(--bg-elev) 96%, var(--accent))); }
 .card h2 { color: var(--fg-dim); font-size: 13px; letter-spacing: .3px; }
 .metric { background: linear-gradient(140deg, var(--bg-elev-2), color-mix(in srgb, var(--bg-elev-2) 94%, var(--accent))); min-width: 0; }
 .metric .label { color: var(--fg-dim); }

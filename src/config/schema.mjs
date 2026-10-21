@@ -7,6 +7,9 @@
 
 /** 默认配置。所有可调项集中在这里，便于对照文档。 */
 export const DEFAULT_CONFIG = Object.freeze({
+  // 环境页允许保存安装位置；必须声明，否则下次启动会被未知键校验拒绝。
+  qqExe: '',
+  snowlumaDir: '',
   onebot: {
     wsUrl: 'ws://127.0.0.1:3001',
     accessToken: '',
@@ -115,7 +118,7 @@ export const DEFAULT_CONFIG = Object.freeze({
  *   - `llm.modelCapabilities` → `{ [模型名]: { vision, image, ... } }`
  *
  * 它们的默认值是 `{}`，于是递归合并会把每个模型名都判成"未知配置项"。
- * 后果不是报个警告就完了 —— 用户点一次「探测能力」，配置里就多一个模型名，
+ * 后果不是报个警告就完了 —— 用户点一次「探测模型」，配置里就多一个模型名，
  * **下次启动直接 E40XX 起不来**。
  *
  * 所以这些节点整块接受，只校验它确实是个对象。

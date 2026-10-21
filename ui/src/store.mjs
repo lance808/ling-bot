@@ -39,10 +39,11 @@ function emit() {
 
 /**
  * @param {Partial<typeof state>} patch
+ * @param {{ notify?: boolean }} [options] 数据刷新但不影响可见内容时，可跳过订阅通知。
  */
-export function set(patch) {
+export function set(patch, { notify = true } = {}) {
   Object.assign(state, patch);
-  emit();
+  if (notify) emit();
 }
 
 /** @param {string} text */

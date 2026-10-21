@@ -17,7 +17,19 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const exeName = process.platform === 'win32' ? 'ling-bot-desktop.exe' : 'ling-bot-desktop';
-const built = path.join(repoRoot, 'desktop', 'target', 'release', exeName);
+
+/**
+ * 产物目录。
+ *
+ * 默认是 cargo 自己的 `desktop/target`，但允许用 CARGO_TARGET_DIR 覆盖 ——
+ * 有些环境下仓库内的 target 目录不可写（构建缓存被占用/被沙箱挡住），
+ * 只能把 target 放到别处。此时脚本必须去同一个地方找产物，
+ * 否则会出现"明明构建成功，却报找不到 exe"。
+ */
+const cargoTargetDir = process.env.CARGO_TARGET_DIR
+  ? path.resolve(repoRoot, process.env.CARGO_TARGET_DIR)
+  : path.join(repoRoot, 'desktop', 'target');
+const built = path.join(cargoTargetDir, 'release', exeName);
 const target = path.join(repoRoot, process.platform === 'win32' ? 'Ling-bot.exe' : 'Ling-bot');
 
 const checkOnly = process.argv.includes('--check');

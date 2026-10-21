@@ -25,6 +25,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfig } from '../src/config/schema.mjs';
 
+test('环境页保存的安装路径经配置序列化后仍能启动', () => {
+  const saved = JSON.parse(JSON.stringify({
+    qqExe: 'C:/Apps/QQ/QQ.exe',
+    snowlumaDir: 'C:/Apps/SnowLuma',
+  }));
+  const cfg = validateConfig(saved);
+  assert.equal(cfg.qqExe, saved.qqExe);
+  assert.equal(cfg.snowlumaDir, saved.snowlumaDir);
+  assert.throws(() => validateConfig({ qqExee: saved.qqExe }), /未知配置项/);
+});
+
 test('★ modelCapabilities 里的模型名不算未知配置项', () => {
   const cfg = validateConfig({
     llm: {

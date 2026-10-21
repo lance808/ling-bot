@@ -864,3 +864,57 @@ test('★ desktop/icons 只放打包要的尺寸，且与 assets 源图一致', 
   assert.ok(!/['"]D:\/Ling-bot/.test(gen), '图标脚本不能硬编码 D:/Ling-bot 绝对路径');
   assert.match(gen, /fileURLToPath\(import\.meta\.url\)/, '要用脚本自身位置推仓库根');
 });
+
+/* --------------------------------------------------- 体检卡提示条必须会消失 */
+
+/*
+ * 这一组守的是一个实际发生过的 bug：启动 SnowLuma 成功后，
+ * 「已启动 SnowLuma（PID …），等它完成注入后点控制台」这句话
+ * 一直挂在界面上不走。
+ *
+ * 根因有两层，缺一条都修不好：
+ *   1. 提示存在模块级 ui.hint 里，而卡片每次重绘都会把它原样画回来，
+ *      没有任何地方把它清掉；
+ *   2. 就算加了计时器，回调里如果调的是卡片闭包中那个 paintHint，
+ *      画的是**已经脱离文档的旧节点** —— 界面上什么都不会变。
+ *      必须通过 activePaintHint 画到"现在挂着的那张卡"上。
+ */
+
+test('★ 体检卡提示条带自动消失计时器', () => {
+  const src = read('ui/src/views/env.mjs');
+  assert.match(src, /hintTimer\s*=\s*setTimeout/, '提示条必须有自动消失的计时器');
+  // 计时器变量要在模块作用域：放卡片闭包里会随重绘一起丢掉
+  assert.match(src, /^let hintTimer/m, 'hintTimer 必须是模块级变量');
+});
+
+test('★ 自动消失要画到当前存活的卡片上，不能用闭包里的旧节点', () => {
+  const src = read('ui/src/views/env.mjs');
+  assert.match(src, /^let activePaintHint/m, '必须有模块级的当前绘制指针');
+
+  /*
+   * 取计时器回调那一小段，确认里面用的是 activePaintHint。
+   * 这里刻意检查"回调里不出现裸的 paintHint()" —— 那正是当初的写法。
+   */
+  const i = src.indexOf('hintTimer = setTimeout');
+  assert.ok(i > 0, '找不到计时器');
+  const block = src.slice(i, i + 600);
+  assert.match(block, /activePaintHint\(\)/, '计时器回调必须调用 activePaintHint()');
+  assert.ok(
+    !/\n\s*paintHint\(\);/.test(block),
+    '计时器回调不能直接调 paintHint()（会画到已脱离文档的旧节点上）',
+  );
+});
+
+test('提示按语气分不同存活时间，出错的多留一会儿', () => {
+  const src = read('ui/src/views/env.mjs');
+  // 找 12_000 / 8_000 / 5_000 这组：err 最长
+  assert.match(src, /12_000[\s\S]{0,80}8_000[\s\S]{0,80}5_000/, '应有 err/warn/ok 三档时长');
+});
+
+test('重新检测会清掉待触发的自动消失，避免误清后续提示', () => {
+  const src = read('ui/src/views/env.mjs');
+  const i = src.indexOf("text: '重新检测'");
+  assert.ok(i > 0);
+  const block = src.slice(i, i + 700);
+  assert.match(block, /clearTimeout\(hintTimer\)/, '重新检测时应取消未触发的计时器');
+});

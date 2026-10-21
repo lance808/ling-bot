@@ -61,11 +61,36 @@ export function renderEnvCard(env, ctx = {}) {
   const platform = env?.platform ?? defaultPlatform();
   let pickPlatform = defaultPlatform();
 
-  /** 操作结果提示条 */
+  /**
+   * 操作结果提示条。
+   *
+   * 必须会自己消失。之前它是模块级状态 ui.hint，卡片每次重绘都会
+   * 把它原样画回来，于是"已启动 SnowLuma…"这类一次性提示会一直挂在
+   * 界面上不走 —— 用户以为还有事没做完。
+   *
+   * 现在按语气给不同的存活时间：成功提示看两眼就够了，
+   * 出错的多留一会儿，因为用户要读完才知道怎么改。
+   */
   const note = el('div', { class: 'env-note', hidden: true });
   const say = (text, tone) => {
-    ui.hint = { text: String(text ?? ''), tone: tone ?? 'dim' };
+    const t = tone ?? 'dim';
+    ui.hint = { text: String(text ?? ''), tone: t };
     paintHint();
+    // 上一次的计时器要清掉，否则旧提示会把新提示提前抹掉
+    if (hintTimer) clearTimeout(hintTimer);
+    hintTimer = setTimeout(
+      () => {
+        ui.hint = null;
+        hintTimer = null;
+        /*
+         * 关键：不能直接调这里的 paintHint —— 卡片可能已经被重建，
+         * 这个闭包里的 note 早就脱离文档了，清掉它界面上什么都不会变
+         * （这正是提示一直不消失的根因）。要画在**当前挂着的那张**卡上。
+         */
+        activePaintHint();
+      },
+      t === 'err' ? 12_000 : t === 'warn' ? 8_000 : 5_000,
+    );
   };
   const paintHint = () => {
     const h = ui.hint;
@@ -74,12 +99,20 @@ export function renderEnvCard(env, ctx = {}) {
     note.textContent = h.text;
     note.className = `env-note ${h.tone === 'err' ? 'err' : h.tone === 'warn' ? 'warn' : 'ok'}`;
   };
+  // 让模块级计时器能找到"当前存活卡片"的绘制函数
+  activePaintHint = paintHint;
 
   /* ---------------------------------------------------- 头部 */
 
   const refreshBtn = el('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: '重新检测' });
   refreshBtn.addEventListener('click', () => {
     ui.hint = null;
+    // 手动重新检测时把待触发的自动消失也取消：留着它会在稍后
+    // 误清掉新一轮操作产生的提示
+    if (hintTimer) {
+      clearTimeout(hintTimer);
+      hintTimer = null;
+    }
     ctx.onRefresh?.();
   });
 
@@ -498,6 +531,25 @@ let cachedEnv = null;
 let probedAt = 0;
 /** 正在探测中，避免并发重复请求 */
 let inflightProbe = null;
+
+/**
+ * 提示条的自动消失计时器。
+ *
+ * 放在模块作用域而不是卡片闭包里：卡片会被整体重建，
+ * 闭包里的计时器就跟着丢了，而 ui.hint 是模块级的 ——
+ * 结果就是提示永远留在界面上。
+ * @type {ReturnType<typeof setTimeout> | null}
+ */
+let hintTimer = null;
+
+/**
+ * 当前存活卡片的提示条绘制函数。
+ *
+ * 卡片重建后，旧闭包里的 note 已经脱离文档，往它上面画等于没画。
+ * 计时器一律通过这个指针画到"现在挂着的那张卡"上。
+ * @type {() => void}
+ */
+let activePaintHint = () => {};
 
 /** 探针比较重（要连端口、要问 GitHub），短时间内不重复跑 */
 const PROBE_TTL_MS = 30_000;

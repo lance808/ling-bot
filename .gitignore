@@ -59,6 +59,8 @@ build/
 
 # Rust 编译缓存（体积大，且可随时重建）
 desktop/target/
+# 有时 CARGO_TARGET_DIR 被设成相对路径，缓存会落到仓库根（实测 2.8GB）
+/.cargo-target/
 
 # Tauri 构建时生成的 schema（每次构建自动重写，不必入库）
 desktop/gen/

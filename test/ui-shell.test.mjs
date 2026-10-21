@@ -918,3 +918,49 @@ test('重新检测会清掉待触发的自动消失，避免误清后续提示',
   const block = src.slice(i, i + 700);
   assert.match(block, /clearTimeout\(hintTimer\)/, '重新检测时应取消未触发的计时器');
 });
+
+/* --------------------------------------------------- QQ 路径行平时不显示 */
+
+/*
+ * 自动识别准确命中时（本机就是：注册表给出 D:\QQ\QQ.exe），
+ * 那条「QQ 路径」输入框纯属噪音 —— 大多数人不需要知道 QQ 装在哪，
+ * 摆着反而像在要求他填什么。
+ *
+ * 但它是"自动识别够不到"时的唯一出路，所以不能删，只能藏起来。
+ * 这一组钉住显示条件：只有识别失败、或用户自己指定过，才出现。
+ */
+
+test('★ QQ 路径行只在识别失败或用户手动指定过时显示', () => {
+  const src = read('ui/src/views/env.mjs');
+  assert.match(
+    src,
+    /const showQQPath = !qq\.installed \|\| qq\.source === 'manual'/,
+    '显示条件应为：未识别到 QQ，或来源是用户手动指定',
+  );
+  assert.match(src, /if \(showQQPath\) \{/, 'QQ 路径行必须受 showQQPath 控制');
+
+  /*
+   * append 必须发生在 showQQPath 那个 if 块里面。
+   * 只看"有没有这行 append"是不够的 —— 缩进正确也可能在 if 外面，
+   * 所以按位置判断：append 的下标要落在 if 块的范围里。
+   */
+  const ifIdx = src.indexOf('if (showQQPath) {');
+  const appendIdx = src.indexOf('card.append(qqPathRow)');
+  assert.ok(ifIdx > 0 && appendIdx > 0, '找不到 if 块或 append');
+  assert.ok(appendIdx > ifIdx, 'qqPathRow 的 append 必须在 if (showQQPath) 块内部');
+
+  // 块内不能提前闭合（否则 append 实际上跑到外面去了）
+  const between = src.slice(ifIdx, appendIdx);
+  const opens = (between.match(/\{/g) ?? []).length;
+  const closes = (between.match(/\}/g) ?? []).length;
+  assert.ok(opens > closes, 'append 必须仍在 if 块的花括号内');
+});
+
+test('识别失败时仍会提示用户怎么指定路径', () => {
+  const src = read('ui/src/views/env.mjs');
+  const i = src.indexOf('if (!qq.installed)');
+  assert.ok(i > 0, '缺少识别失败时的提示');
+  const block = src.slice(i, i + 500);
+  assert.match(block, /选目录/, '失败提示要告诉用户点哪里');
+  assert.match(block, /env-note warn/, '失败提示要显眼');
+});

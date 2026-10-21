@@ -329,82 +329,79 @@ export function renderEnvCard(env, ctx = {}) {
    * 同时装了新旧两版、注册表被清理过。与其把识别逻辑堆到无限长去猜，
    * 不如给一个明确入口让人自己指。
    *
-   * 平时它不显眼（只是一个可编辑的路径行），识别失败时才提示得重一些。
+   * 但**平时不显示**：自动识别准确命中时，那一行只是噪音 ——
+   * 大多数人不需要知道 QQ 装在哪，摆着反而像要他填什么。
+   * 只在两种情况下出现：
+   *   - 没识别到（或者他上次填的路径失效了）→ 他必须自己指
+   *   - 他自己指定过 → 得能看见、能改回来
    */
-  const qqSourceText = {
-    manual: '手动指定',
-    registry: '注册表识别',
-    candidate: '常见目录',
-  }[qq.source] ?? '未识别';
+  const showQQPath = !qq.installed || qq.source === 'manual';
 
-  const qqPathInput = el('input', {
-    class: 'env-input',
-    type: 'text',
-    value: qq.badPath ?? qq.exe ?? '',
-    placeholder: '例如 D:\\QQ （安装目录）或 D:\\QQ\\QQ.exe',
-    spellcheck: 'false',
-    // 用户手动指过就直接亮出来；否则只是"当前识别到的"
-    title: qq.badPath
-      ? '这个路径下没找到 QQ.exe，改一下或点「重新检测」'
-      : '可以填安装目录，也可以直接填 QQ.exe 的完整路径；留空表示自动识别',
-  });
+  if (showQQPath) {
+    const qqSourceText = {
+      manual: '手动指定',
+      registry: '注册表识别',
+      candidate: '常见目录',
+    }[qq.source] ?? '未识别';
 
-  const saveQQPath = async (value) => {
-    const r = await setting('qqExe', value);
-    if (!r.ok) {
-      say(r.message ?? '保存失败', 'err');
-      return false;
-    }
-    return true;
-  };
+    const qqPathInput = el('input', {
+      class: 'env-input',
+      type: 'text',
+      value: qq.badPath ?? qq.exe ?? '',
+      placeholder: '例如 D:\\QQ （安装目录）或 D:\\QQ\\QQ.exe',
+      spellcheck: 'false',
+      title: qq.badPath
+        ? '这个路径下没找到 QQ.exe，改一下或点「重新检测」'
+        : '可以填安装目录，也可以直接填 QQ.exe 的完整路径；留空表示自动识别',
+    });
 
-  const qqPathRow = el('div', { class: 'env-pathbar' }, [
-    el('span', { class: 'env-pathbar-label', text: 'QQ 路径' }),
-    qqPathInput,
-    (() => {
-      const b = el('button', { class: 'btn btn-sm', type: 'button', text: '选目录' });
+    const saveQQPath = async (value) => {
+      const r = await setting('qqExe', value);
+      if (!r.ok) {
+        say(r.message ?? '保存失败', 'err');
+        return false;
+      }
+      return true;
+    };
+
+    const pickBtn = (label, kind, hint) => {
+      const b = el('button', { class: 'btn btn-sm', type: 'button', text: label });
       b.addEventListener('click', async () => {
-        const picked = await pickFile('dir');
+        const picked = await pickFile(kind);
         if (picked.canceled || !picked.path) return;
         qqPathInput.value = picked.path;
         if (await saveQQPath(picked.path)) {
-          say(`已记住 QQ 目录：${picked.path}`, 'ok');
+          say(`${hint}${picked.path}`, 'ok');
           ctx.onProbe?.();
         }
       });
       return b;
-    })(),
-    (() => {
-      const b = el('button', { class: 'btn btn-sm', type: 'button', text: '选 QQ.exe' });
-      b.addEventListener('click', async () => {
-        const picked = await pickFile('exe');
-        if (picked.canceled || !picked.path) return;
-        qqPathInput.value = picked.path;
-        if (await saveQQPath(picked.path)) {
-          say(`已记住 QQ 路径：${picked.path}`, 'ok');
-          ctx.onProbe?.();
-        }
-      });
-      return b;
-    })(),
-    el('span', { class: 'env-pathbar-src', text: qqSourceText }),
-  ]);
+    };
 
-  // 回车即保存，输入框旁边不需要再多一个按钮
-  qqPathInput.addEventListener('keydown', async (e) => {
-    if (e.key !== 'Enter') return;
-    e.preventDefault();
-    if (await saveQQPath(qqPathInput.value)) {
-      say('已保存 QQ 路径', 'ok');
-      ctx.onProbe?.();
-    }
-  });
+    const qqPathRow = el('div', { class: 'env-pathbar' }, [
+      el('span', { class: 'env-pathbar-label', text: 'QQ 路径' }),
+      qqPathInput,
+      pickBtn('选目录', 'dir', '已记住 QQ 目录：'),
+      pickBtn('选 QQ.exe', 'exe', '已记住 QQ 路径：'),
+      el('span', { class: 'env-pathbar-src', text: qqSourceText }),
+    ]);
 
-  card.append(qqPathRow);
+    // 回车即保存，输入框旁边不需要再多一个按钮
+    qqPathInput.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (await saveQQPath(qqPathInput.value)) {
+        say('已保存 QQ 路径', 'ok');
+        ctx.onProbe?.();
+      }
+    });
+
+    card.append(qqPathRow);
+  }
 
   /*
    * 识别失败时把话说明白：用户最需要知道的是"去哪儿找"。
-   * 只在他看得见的地方多写一句，正常时不占地方。
+   * 正常识别到时这条不出现，界面保持干净。
    */
   if (!qq.installed) {
     card.append(

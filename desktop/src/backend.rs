@@ -15,13 +15,20 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 use serde_json::{json, Value};
 
 const BACKOFF_MS: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 30_000];
 const MAX_FAILURES: u32 = 5;
+
+/// 退出时给后端的优雅退出窗口。
+///
+/// 后端收到 shutdown 后要落盘思考记录，需要一点时间；但用户已经点了
+/// 「退出」，这里不能无限等 —— 超时就强杀，宁可丢最后一条展示数据，
+/// 也不能让窗口和进程赖着不走。
+const GRACEFUL_MS: u64 = 800;
 
 /// 去掉 Windows 的 `\\?\`（verbatim）前缀。
 ///
@@ -133,8 +140,25 @@ impl Backend {
     }
 
     pub fn start(&self) {
-        if self.inner.child.lock().map(|c| c.is_some()).unwrap_or(false) {
-            return;
+        /*
+         * 守卫：已有存活子进程就不重复启动。
+         *
+         * 但"槽里有 Child"不等于"进程还活着" —— restart() 杀完之后，
+         * 回收线程可能还没来得及把它清掉。这时直接 return 会让重启
+         * 变成"什么都没发生"，所以这里用 try_wait 探一下真实状态：
+         * 已退出就地回收，然后继续启动。
+         */
+        {
+            let mut guard = match self.inner.child.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if let Some(child) = guard.as_mut() {
+                match child.try_wait() {
+                    Ok(None) => return,
+                    _ => *guard = None,
+                }
+            }
         }
         self.inner.stopping.store(false, Ordering::SeqCst);
 
@@ -215,25 +239,51 @@ impl Backend {
         }
         let _ = pid;
 
-        // 等待进程退出，然后决定是否重启
+        /*
+         * 等待进程退出，然后决定是否重启。
+         *
+         * 这里**不能**在持锁状态下调用 child.wait()：wait() 会阻塞到子进程
+         * 结束，等于 child 锁被后端的整个生命周期占着。那样一来托盘「退出」
+         * 里的 stop() 永远拿不到锁、kill() 发不出去，退出流程就卡死在主线程，
+         * 前台 exe 和后台 node 都赖着不走 —— 正是本次要修的问题。
+         *
+         * 改成短间隔 try_wait()：只在探测的那一瞬间持锁，stop()/restart()
+         * 随时能拿到进程句柄。
+         */
         let this = self.clone();
-        std::thread::spawn(move || this.wait_exit());
+        std::thread::spawn(move || loop {
+            let status = {
+                let mut guard = match this.inner.child.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                match guard.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(st)) => Some(st),
+                        Ok(None) => None,
+                        Err(_) => None,
+                    },
+                    // 槽被 restart()/stop() 取走了，没人再需要这个线程
+                    None => return,
+                }
+            };
+
+            match status {
+                Some(st) => {
+                    // 真正退出了：清槽并收尾
+                    if let Ok(mut guard) = this.inner.child.lock() {
+                        *guard = None;
+                    }
+                    this.after_exit(Some(st));
+                    return;
+                }
+                None => std::thread::sleep(Duration::from_millis(150)),
+            }
+        });
     }
 
-    fn wait_exit(self) {
-        let status = {
-            let mut guard = match self.inner.child.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            match guard.as_mut() {
-                Some(child) => child.wait().ok(),
-                None => return,
-            }
-        };
-        if let Ok(mut guard) = self.inner.child.lock() {
-            *guard = None;
-        }
+    /// 子进程退出后的收尾：清状态、失败在途请求、按需退避重启。
+    fn after_exit(&self, status: Option<std::process::ExitStatus>) {
         if let Ok(mut stdin) = self.inner.stdin.lock() {
             *stdin = None;
         }
@@ -362,18 +412,43 @@ impl Backend {
     pub fn restart(&self) {
         self.inner.failures.store(0, Ordering::SeqCst);
         self.inner.stopping.store(false, Ordering::SeqCst);
-        let mut guard = match self.inner.child.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
+
+        /*
+         * 先 kill 再等它真的没了，然后才拉起新的。
+         *
+         * 之前是 kill 完 sleep 200ms 就 start()，而 start() 里看到槽里
+         * 还有 Child 就直接 return —— 旧进程还没退干净，重启就静默失败。
+         * 现在：kill → 轮询确认槽清空 → 再 start，最多等 2 秒兜底。
+         */
+        {
+            let mut guard = match self.inner.child.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill();
+            }
         }
-        drop(guard);
-        // 退出回调里会因 stopping=false 触发退避重启；这里主动拉起来更快
+
         let this = self.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            let deadline = Instant::now() + Duration::from_millis(2_000);
+            while Instant::now() < deadline {
+                let gone = this
+                    .inner
+                    .child
+                    .lock()
+                    .map(|g| g.is_none())
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // 回收线程没赶上就自己清，避免 start() 被旧句柄挡住
+            if let Ok(mut guard) = this.inner.child.lock() {
+                *guard = None;
+            }
             this.start();
         });
         self.emit_lifecycle("backend-restarting", json!({ "delayMs": 200, "attempt": 0 }));
@@ -386,10 +461,85 @@ impl Backend {
 
     pub fn stop(&self) {
         self.inner.stopping.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.inner.child.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
+
+        /*
+         * 先试优雅退出：写一行 shutdown，让后端自己 close 连接、落盘再 exit。
+         *
+         * 这比直接 kill 好：thinkingStore 的落盘是防抖的，硬杀会丢掉最后
+         * 一条思考记录。但用户已经点了「退出」，所以只等 GRACEFUL_MS，
+         * 超时立刻强杀，绝不无限等。
+         */
+        let graceful_sent = {
+            let mut guard = match self.inner.stdin.lock() {
+                Ok(g) => g,
+                Err(_) => return self.kill_tree(),
+            };
+            match guard.as_mut() {
+                Some(stdin) => {
+                    let line = json!({ "jsonrpc": "2.0", "id": 0, "method": "shutdown" });
+                    let _ = stdin
+                        .write_all(format!("{line}\n").as_bytes())
+                        .and_then(|_| stdin.flush());
+                    // 关掉 stdin：后端的 readline 会读到 EOF，也是退出的信号
+                    let _ = stdin.flush();
+                    true
+                }
+                None => false,
             }
+        };
+
+        if graceful_sent {
+            let deadline = Instant::now() + Duration::from_millis(GRACEFUL_MS);
+            while Instant::now() < deadline {
+                // child 已被 wait 线程取走就说明退干净了
+                let gone = self
+                    .inner
+                    .child
+                    .lock()
+                    .map(|g| g.is_none())
+                    .unwrap_or(true);
+                if gone {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        self.kill_tree();
+    }
+
+    /// 强杀后端进程树。
+    ///
+    /// 只 kill 直接子进程是不够的：后端可能派生 PowerShell（DPAPI）之类的
+    /// 孙进程，父进程被杀了它们会变成孤儿继续占着管道。taskkill /T 会把
+    /// 整棵树带走。
+    fn kill_tree(&self) {
+        let pid = {
+            let mut guard = match self.inner.child.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match guard.as_mut() {
+                Some(child) => {
+                    let pid = child.id();
+                    let _ = child.kill();
+                    pid
+                }
+                None => return,
+            }
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // /F 强制、/T 连同子进程树；进程已经没了也无所谓，忽略失败
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(0x0800_0000)
+                .output();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
         }
     }
 

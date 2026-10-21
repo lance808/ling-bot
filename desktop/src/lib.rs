@@ -107,10 +107,26 @@ pub fn run() {
                     }
                     "quit" => {
                         app.state::<Runtime>().quitting.store(true, Ordering::SeqCst);
-                        if let Some(be) = app.try_state::<Backend>() {
-                            be.stop();
-                        }
-                        app.exit(0);
+                        /*
+                         * 退出必须把后端真的收干净，不能"发个信号就走"。
+                         *
+                         * 之前这里是 be.stop() 之后立刻 app.exit(0)。而
+                         * stop() 内部要拿 child 锁，等待线程当时正持锁阻塞在
+                         * child.wait() 上 —— 托盘回调直接卡死，app.exit(0)
+                         * 永远执行不到，前台 exe 与后台 node 双双残留。
+                         *
+                         * 现在 stop() 只在探测瞬间持锁，且会"优雅退出→超时
+                         * 强杀进程树"走完整条路径，回来后这里再退出应用。
+                         * 退出动作放到独立线程：它可能要等几百毫秒，不能
+                         * 卡住托盘菜单回调所在的 UI 线程。
+                         */
+                        let quit_handle = app.clone();
+                        std::thread::spawn(move || {
+                            if let Some(be) = quit_handle.try_state::<Backend>() {
+                                be.stop();
+                            }
+                            quit_handle.exit(0);
+                        });
                     }
                     _ => {}
                 })
@@ -180,6 +196,21 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("无法启动 Ling-bot 桌面端");
+        .build(tauri::generate_context!())
+        .expect("无法启动 Ling-bot 桌面端")
+        .run(|app, event| {
+            /*
+             * 最后一道保险：不管退出是从托盘、快捷键还是系统关机发起的，
+             * 只要应用真的走到退出这一步，后端就必须跟着走。
+             *
+             * 没有这一层时，任何绕过托盘 quit 的退出路径（比如注销、
+             * 关机、任务栏关闭）都会把 node 留成孤儿进程 —— 用户看到的
+             * 就是"程序关了，后台还在"。
+             */
+            if let tauri::RunEvent::Exit = event {
+                if let Some(be) = app.try_state::<Backend>() {
+                    be.stop();
+                }
+            }
+        });
 }

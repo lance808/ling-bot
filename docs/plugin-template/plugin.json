@@ -1,0 +1,78 @@
+{
+  "id": "plugin-template",
+  "name": "插件模板",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "最小可运行插件模板：一个工具 + 三个配置项（text / number / password）。复制整个目录改名即可开始写自己的插件。",
+  "author": "ling-bot",
+  "runtime": "process",
+  "entry": "index.mjs",
+  "permissions": ["qq.read"],
+  "config": [
+    {
+      "key": "prefix",
+      "label": "前缀",
+      "type": "text",
+      "default": "",
+      "required": false,
+      "maxLength": 40,
+      "placeholder": "（可留空）",
+      "help": "回显时加在文字前面的内容。改这里不用改代码，保存后立即生效。"
+    },
+    {
+      "key": "repeat",
+      "label": "重复次数",
+      "type": "number",
+      "default": 1,
+      "required": false,
+      "min": 1,
+      "max": 5,
+      "integer": true,
+      "help": "演示 number 类型：范围与整数约束由宿主校验，非法值保存不进去。"
+    },
+    {
+      "key": "apiKey",
+      "label": "示例密钥",
+      "type": "password",
+      "secret": true,
+      "required": false,
+      "maxLength": 512,
+      "help": "演示敏感字段：值只进加密保险箱、界面不回显、不进日志，插件从 ctx.secrets 读取（不写默认值）。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "hello",
+      "description": "把传入的文字带上配置的前缀回显，用来验证插件通道是否工作。",
+      "needs": "qq",
+      "risk": "R0",
+      "timeoutMs": 10000,
+      "params": {
+        "text": {
+          "type": "string",
+          "required": true,
+          "maxLength": 4000,
+          "description": "要回显的文字"
+        }
+      }
+    }
+  ],
+  "notes": [
+    {
+      "title": "怎么用这个模板",
+      "lines": [
+        "把整个目录复制到 <用户数据目录>/plugins/<新 id>/，目录名必须等于 plugin.json 里的 id。",
+        "改 plugin.json 的 id / name / description / config / tools，改 index.mjs 的 callTool 逻辑。",
+        "插件页「重新扫描」→ 填配置 → 启用；AI 就能调用 plugin_hello。"
+      ]
+    },
+    {
+      "title": "两条容易踩的规则",
+      "lines": [
+        "工具名会自动加 plugin_ 前缀：清单里写 hello，模型看到的是 plugin_hello。",
+        "清单里不要写 origins / confirm / run —— 前两个由宿主按 needs 与 risk 推导，执行逻辑必须放在 index.mjs 的 callTool 里。"
+      ]
+    }
+  ],
+  "ui": null
+}

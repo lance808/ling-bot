@@ -86,14 +86,64 @@ renderTest('usage page uses journal aggregate rather than the bounded recent det
   assert.match(text(root), /99,999/);
 });
 
-renderTest('DSH saves one transaction and never submits the snapshot mask', async () => {
-  const { renderDsh } = await import('../ui/src/views/dsh.mjs');
+renderTest('plugin config saves one transaction and never submits the secret back', async () => {
+  /*
+   * 两个要点：
+   *  1) 一次保存只发一个 action（不是每个字段发一次）；
+   *  2) 密钥字段即使快照里有值也不回传 —— 前端拿到的 value 恒为空，
+   *     用户没重新输入就不该出现在提交里（否则等于把掩码写回去）。
+   */
+  const { renderPlugins } = await import('../ui/src/views/plugins.mjs');
   const calls = [];
-  const root = renderDsh({ config: { dsh: { token: 'masked-value', enabled: false, admins: [], port: 3458 } } }, { onSaveSetting: async (...args) => { calls.push(args); return { ok: true }; } });
-  await button(root, '保存').listeners.click();
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], 'dsh.config');
-  assert.equal(calls[0][1].token, '');
+  const snap = {
+    plugins: {
+      items: [
+        {
+          id: 'dsh-bridge',
+          name: 'DSH 接入',
+          version: '1.0.0',
+          description: '双向通道',
+          apiVersion: '1',
+          runtime: 'in-process',
+          enabled: true,
+          status: 'ready',
+          statusText: '运行中',
+          error: null,
+          tools: [],
+          config: [
+            { key: 'port', label: '端口', type: 'number', value: 3458, min: 1, max: 65535, integer: true },
+            {
+              key: 'token',
+              label: '令牌',
+              type: 'password',
+              secret: true,
+              required: true,
+              value: '',
+              hasSecret: true,
+            },
+          ],
+          log: [],
+        },
+      ],
+      stats: { total: 1, ready: 1, error: 0, disabled: 0 },
+      dirs: { plugins: 'D:/plugins' },
+      allowDangerous: false,
+    },
+  };
+  const root = renderPlugins(snap, {
+    onSaveConfig: async (...args) => {
+      calls.push(args);
+      return { ok: true, message: 'ok' };
+    },
+    rerender() {},
+  });
+  await button(root, '保存配置').listeners.click();
+  assert.equal(calls.length, 1, '一次保存只发一个请求');
+  assert.equal(calls[0][0], 'dsh-bridge');
+  // 密钥没被重新输入 → 不该进 secrets
+  assert.equal('token' in (calls[0][2] ?? {}), false, '没重新输入就不该提交密钥');
+  // 普通配置照常提交
+  assert.equal(calls[0][1].port, '3458');
 });
 
 renderTest('failed sends retain draft across snapshot rerenders', async () => {

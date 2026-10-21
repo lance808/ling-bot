@@ -369,20 +369,33 @@ test('★ events.mjs 产出的字段名与插件读取的一致', async () => {
 
 /* ------------------------------------ handleMessage 的作用域（踩过的坑） */
 
-test('★ handleMessage 里不能引用未定义的 log', async () => {
-  // 真踩过的坑：在 handleMessage 里写了 `log?.()`，但那个函数的作用域
+test('★ 消息接管路径里不能引用未定义的 log', async () => {
+  // 真踩过的坑：在消息处理里写了 `log?.()`，但那个函数的作用域
   // 里没有 log（它只是 startBridge 的参数）。运行时抛 "log is not defined"，
   // 而上层把异常吞掉、消息转给 AI —— 表现是"回复了但没反应"。
+  //
+  // v1 契约下 `export async function handleMessage` 只是兼容垫片，
+  // 真正的实现是 onMessage()。所以断言要落在**实际处理消息的那个函数**上。
   const src = await (await import('node:fs/promises')).readFile(
     new URL('../plugins/dsh-bridge/index.mjs', import.meta.url),
     'utf8',
   );
-  const i = src.indexOf('export async function handleMessage');
-  const end = src.indexOf('\n}', i);
-  const body = src.slice(i, end > i ? end : i + 4000);
 
-  // 先用别名接住，才能安全使用
-  assert.match(body, /const log = rt\.log/, '要从 rt 取 log');
+  // 1) 垫片必须委托给 onMessage，而不是自己另写一套
+  const shimStart = src.indexOf('export async function handleMessage');
+  assert.ok(shimStart > 0, '兼容垫片应当存在');
+  const shimBody = src.slice(shimStart, src.indexOf('\n}', shimStart));
+  assert.match(shimBody, /onMessage\(/, '垫片要委托给 onMessage');
+
+  // 2) onMessage 里必须先接住 log 才能用
+  const i = src.indexOf('async function onMessage');
+  assert.ok(i > 0, 'onMessage 应当存在');
+  const end = src.indexOf('\n}', src.indexOf('return false;', i));
+  const body = src.slice(i, end > i ? end : i + 6000);
+  assert.match(body, /const log = rt\.log/, '要从 rt 取 log，而不是依赖外层参数');
+
+  // 3) 垫片本身不能出现裸的 log 调用（它拿不到 rt 之外的 log）
+  assert.ok(!/\blog\?\.\(/.test(shimBody), '垫片里不能直接用 log');
 });
 
 test('★ 插件异常要带上位置信息（便于排查）', async () => {

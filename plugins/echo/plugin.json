@@ -1,0 +1,51 @@
+{
+  "id": "echo",
+  "name": "回声",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "最小示例插件：把文字原样回显（可加前缀），附带一组配置项演示自动表单。",
+  "author": "ling-bot",
+  "runtime": "process",
+  "entry": "index.mjs",
+  "permissions": ["qq.read"],
+  "config": [
+    {
+      "key": "prefix",
+      "label": "前缀",
+      "type": "text",
+      "default": "",
+      "required": false,
+      "maxLength": 40,
+      "placeholder": "（可留空）",
+      "help": "回显时加在文字前面的内容。用来验证「改配置不用改代码」。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "echo",
+      "description": "把传入的文字原样回显。用于验证插件通道是否工作。",
+      "needs": "qq",
+      "risk": "R0",
+      "timeoutMs": 10000,
+      "params": {
+        "text": {
+          "type": "string",
+          "required": true,
+          "maxLength": 4000,
+          "description": "要回显的文字"
+        }
+      }
+    }
+  ],
+  "notes": [
+    {
+      "title": "这是最小示例",
+      "lines": [
+        "它演示「声明放 plugin.json、行为放 index.mjs」：工具的参数、权限、超时都在清单里，执行逻辑在 callTool。",
+        "它没有声明 origins / confirm —— 宿主按 needs: qq 推导成「主人私聊 + 主人所在群」，按 risk: R0 推导成自动执行。",
+        "配置项 prefix 保存后立即生效（宿主会 dispose 再 init）。"
+      ]
+    }
+  ],
+  "ui": null
+}

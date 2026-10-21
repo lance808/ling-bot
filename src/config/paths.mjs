@@ -59,8 +59,23 @@ export function resolvePaths(root) {
      * 清理能力（超期/超量自动删）只作用于这里，不会误伤会话与用量。
      */
     thinkingDir: path.join(resolvedRoot, 'thinking'),
-    /** 插件根目录：每个插件一个子目录，入口 index.mjs */
+    /** 插件根目录：每个插件一个子目录，内含 plugin.json + 入口 */
     pluginsDir: path.join(resolvedRoot, 'plugins'),
+    /**
+     * 插件凭据保险箱：`{ "<pluginId>": { "<configKey>": <sealed> } }`。
+     *
+     * 与 `vaultPath`（LLM key）分开：那个文件的格式是单个 sealed 对象，
+     * 而且删除它等于"清除 API Key"这个用户可见动作。插件凭据是另一回事，
+     * 混在一起会让"清 key"顺手把插件令牌也清了。
+     */
+    pluginSecretsPath: path.join(resolvedRoot, 'plugin-secrets.vault'),
+    /**
+     * 插件运行数据：每个插件一个子目录。
+     *
+     * **刻意不放在 `plugins/<id>/` 里面**：升级插件要整体替换插件目录，
+     * 数据放里面就等于每次更新都清缓存。
+     */
+    pluginDataDir: path.join(resolvedRoot, 'plugin-data'),
   };
 }
 

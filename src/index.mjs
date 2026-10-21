@@ -14,7 +14,6 @@ import readline from 'node:readline';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
 import { resolvePaths, defaultToolRoots } from './config/paths.mjs';
-import { normalizeDsh } from './config/dsh.mjs';
 import { clearApiKey } from './config/credentials.mjs';
 import { validateConfig, DEFAULT_CONFIG } from './config/schema.mjs';
 import { readJson, writeJsonAtomic } from './config/atomic.mjs';
@@ -26,11 +25,12 @@ import { passSendGate, checkWhitelist, RateLimiter } from './guard/send-gate.mjs
 import { auditOutbound, maskSecret } from './guard/audit.mjs';
 import { assertOrigin, ORIGIN } from './guard/origin.mjs';
 import { resolveToolSet, toOpenAiTools, RISK } from './guard/tool-gate.mjs';
-import { listTools, describeTools, removePluginTools } from './tools/registry.mjs';
+import { listTools, describeTools } from './tools/registry.mjs';
 import { registerReadonlyTools } from './tools/basic.mjs';
 import { createToolRunner } from './tools/executor.mjs';
-import { loadPlugins, describePlugins } from './tools/plugins.mjs';
 import { installBuiltinPlugins } from './tools/builtin-plugins.mjs';
+import { PluginManager } from './plugins/manager.mjs';
+import { migrateLegacyDsh } from './plugins/legacy.mjs';
 import { registerAllActions, snapshotRegistry, renderRegistryBanner } from './registry.mjs';
 import { LlmClient, estimateTokens, THINKING_STYLES } from './llm/client.mjs';
 
@@ -99,10 +99,17 @@ const pendingTurns = new Map();
 /** 待人工确认的 R2/R3 工具调用 */
 /** @type {Map<string, {resolve: Function, timer: NodeJS.Timeout, req: object}>} */
 const pendingConfirms = new Map();
-/** 插件加载结果（界面要能看到"装了但没启用"） */
-let pluginState = { loaded: [], skipped: [] };
-/** @type {Array<{name: string, mod: any}>} 已加载插件的模块，供消息入口调用生命周期钩子 */
-let pluginMods = [];
+/**
+ * 插件管理器：骨架改造后所有插件相关的事都归它管
+ * （扫描/校验/启停/配置/工具登记/诊断）。
+ *
+ * 这里刻意不再保留"直接抓着插件模块调钩子"的做法：
+ * 一旦插件可能跑在子进程里，宿主就不能持有它的模块对象了 ——
+ * 统一走管理器，两种运行时才有同一套行为。
+ *
+ * @type {PluginManager | null}
+ */
+let plugins = null;
 /** 人格卡仓库：它是谁（性格、说话风格） */
 const personaStore = new PersonaStore({ filePath: paths.personaPath });
 /**
@@ -126,6 +133,30 @@ const thinkingStore = new ThinkingStore({ dir: paths.thinkingDir });
 async function boot() {
   const userConfig = (await readJson(paths.configPath)) ?? {};
   config = validateConfig(userConfig);
+
+  /*
+   * 旧配置迁移：`config.dsh` → 插件 `dsh-bridge` 的配置与启用状态。
+   *
+   * 必须在加载插件**之前**做：管理器读的是 `plugins.config`，
+   * 迁移晚一步，老用户升级后的第一轮启动里 DSH 就是"没配置"状态。
+   *
+   * 迁移失败不能拦住启动（少一个可选功能 << 起不来）。
+   */
+  try {
+    const migrated = await migrateLegacyDsh({
+      config,
+      secretsPath: paths.pluginSecretsPath,
+      log: (msg, meta) => (meta?.level === 'warn' ? log.warn(msg) : log.info(msg)),
+    });
+    if (migrated.migrated) {
+      config = migrated.config;
+      await writeJsonAtomic(paths.configPath, config);
+    }
+  } catch (err) {
+    log.warn('旧 DSH 配置迁移失败（不影响启动，可在插件页重新配置）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
 
   // API Key 的三种来源，优先级从高到低：
   //   1. 环境变量 —— 便于临时换 key 测试，也便于 CI
@@ -239,22 +270,29 @@ async function boot() {
   }
 
   // 插件：空 enabled = 一个都不加载（默认关闭，光放文件不生效）
-  const plug = await loadPlugins({
-    dir: paths.pluginsDir,
-    enabled: config.plugins.enabled,
-    allowDangerous: config.plugins.allowDangerous,
-    log: (msg) => log.info(msg),
-    // 宿主能力显式传入：插件拿不到全局，只能用它该用的那几样
-    host: {
-      sendText: (convKey, text) => sendText(convKey, text),
-      log: (msg, meta) => log.info(`[plugin] ${msg}`, meta),
-      // 插件每次要用配置时现取，改设置后立刻生效，不必重启
-      getConfig: () => config,
+  plugins = new PluginManager({
+    pluginsDir: paths.pluginsDir,
+    userDataRoot: paths.root,
+    secretsPath: paths.pluginSecretsPath,
+    getConfig: () => config,
+    persistConfig: async (next) => {
+      config = next;
+      await writeJsonAtomic(paths.configPath, config);
     },
+    log: (level, message, fields) => {
+      if (level === 'error') log.error(message, fields);
+      else if (level === 'warn') log.warn(message, fields);
+      else log.info(message, fields);
+    },
+    // 宿主发送闸门：插件发的每一条消息都要过白名单/审计/限流
+    sendText: (convKey, text) => sendText(convKey, text),
+    // 打包后由桌面壳把内置 node.exe 的路径传进来；开发期用当前 node
+    nodePath: process.env.LING_NODE_PATH || undefined,
   });
-  pluginState = plug;
-  pluginMods = plug.loaded.filter((x) => x.ok && x.mod).map((x) => ({ name: x.name, mod: x.mod }));
-  log.info('插件面清单：\n' + describePlugins(plug.loaded, plug.skipped));
+
+  const plug = await plugins.loadAll();
+  log.info('插件面清单：\n' + describePluginSurface(await plugins.snapshot()));
+  log.info('插件加载结果', { loaded: plug.loaded, failed: plug.failed, skipped: plug.skipped });
 
   log.info('扩展面清单：\n' + renderRegistryBanner());
   log.info(llm.configured ? '模型已配置' : '模型未配置（llm.apiKey 为空），对话将不可用', {
@@ -263,6 +301,11 @@ async function boot() {
 
   startOneBot();
   startStatusPoll();
+  /*
+   * 父进程看护：外壳被强杀（不走 shutdown、也不发信号）时，
+   * 后端要能自己发现并退出，否则会变成占着端口的孤儿进程。
+   */
+  startParentWatch();
   rpc.notify('ready', { version: '0.1.0-p0' });
 }
 
@@ -333,8 +376,7 @@ function handleEvent(evt) {
 
     // 插件优先接管（例如 DSH 指令、审批回复）。
     // 有插件明确处理了就**不走 AI 回合**，避免"已经执行了还在回一句废话"。
-    void dispatchToPlugins(evt);
-  } else if (evt.kind === 'self-sent') {
+    void dispatchToPlugins(evt);  } else if (evt.kind === 'self-sent') {
     rpc.notify('self-sent', evt);
   } else if (evt.kind === 'poke') {
     rpc.notify('poke', evt);
@@ -353,29 +395,32 @@ function handleEvent(evt) {
  * 为什么串行而不是并发：多个插件同时接管同一条消息会发出两条回复。
  * 串行 + 首个接管即停，行为是可预测的。
  *
+ * 接管能力只对 in-process 运行时开放（子进程拿不到宿主的发送闸门与事件流），
+ * 这一限制由管理器统一执行，这里不必再判断。
+ *
  * @param {object} evt
  */
 async function dispatchToPlugins(evt) {
-  for (const p of pluginMods) {
-    if (typeof p.mod?.handleMessage !== 'function') continue;
+  if (plugins) {
     try {
-      const handled = await p.mod.handleMessage(evt, (convKey, text) => sendText(convKey, text));
+      const handled = await plugins.dispatchMessage(evt);
       if (handled) {
-        log.info('消息已被插件接管', { plugin: p.name, convKey: evt.convKey });
+        log.info('消息已被插件接管', { convKey: evt.convKey });
         return;
       }
     } catch (err) {
-      // 插件抛异常不能让消息彻底丢掉，继续走正常流程。
-      //
-      // 但**必须留下足够的信息**：这里曾经只记了 message，而真正的
-      // 原因（`log is not defined`）只是一句话，很容易被当成"插件没写对"
-      // 而不是"插件崩了"。所以把堆栈第一行也带上——排查时那一行往往就够。
+      /*
+       * 插件抛异常不能让消息彻底丢掉，继续走正常流程。
+       *
+       * 但**必须留下足够的信息**：这里曾经只记了 message，而真正的
+       * 原因（`log is not defined`）只是一句话，很容易被当成"插件没写对"
+       * 而不是"插件崩了"。所以把堆栈第一行也带上——排查时那一行往往就够。
+       */
       const e = /** @type {any} */ (err);
       const where = String(e?.stack ?? '')
         .split('\n')[1]
         ?.trim();
       log.warn('插件处理消息异常，继续走 AI', {
-        plugin: p.name,
         error: String(e?.message ?? e),
         ...(where ? { at: where } : {}),
       });
@@ -1026,12 +1071,17 @@ const rpc = {
           messages: messages.slice(-100),
           counts: { messages: messages.length, toolCalls: toolCallLog.length },
           registry: snapshotRegistry(),
-          plugins: {
-            loaded: pluginState.loaded,
-            skipped: pluginState.skipped,
-            enabled: config.plugins.enabled,
-            allowDangerous: config.plugins.allowDangerous,
-          },
+          /*
+           * 插件面快照。
+           *
+           * 每次快照都现算（含 stat 每个 plugin.json 以发现"包被更新了"）。
+           * 插件数量是个位数，2 秒一次的开销可以忽略。
+           *
+           * **失败必须兜底**：插件面算不出来不能让整份快照失败 ——
+           * 那样用户连消息列表都看不到，症状是"界面拉取失败"，
+           * 而真正的问题只在一个可选面板上。
+           */
+          plugins: await pluginSnapshotSafe(),
           persona,
           /*
            * 传已知会话过去，界面就能显示"这张卡现在命中哪些会话"。
@@ -1113,6 +1163,73 @@ const rpc = {
           client?.close();
           startOneBot();
           return { ok: true };
+        }
+        /*
+         * ---- 插件管理动作 ----
+         *
+         * 这些动作是"插件页"的全部后端能力。它们**只操作插件管理器**，
+         * 不直接碰插件模块：这样 in-process 与 process 两种运行时
+         * 才有完全一致的行为（否则迟早出现"同进程插件能停、子进程停不掉"）。
+         */
+        if (name === 'plugin.enable') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const id = String(arg?.id ?? '').trim();
+          if (!isPluginId(id)) return { ok: false, code: 'E4041', message: '插件 id 不合法' };
+          const r = await plugins.enable(id);
+          log.info('插件已启用', { id, ok: r.ok, status: r.status });
+          return r;
+        }
+        if (name === 'plugin.disable') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const id = String(arg?.id ?? '').trim();
+          if (!isPluginId(id)) return { ok: false, code: 'E4041', message: '插件 id 不合法' };
+          const r = await plugins.disable(id);
+          log.info('插件已停用', { id, cancelled: r.cancelled });
+          return r;
+        }
+        if (name === 'plugin.saveConfig') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const id = String(arg?.id ?? '').trim();
+          if (!isPluginId(id)) return { ok: false, code: 'E4041', message: '插件 id 不合法' };
+          const r = await plugins.saveConfig(id, {
+            config: arg?.config && typeof arg.config === 'object' ? arg.config : {},
+            secrets: arg?.secrets && typeof arg.secrets === 'object' ? arg.secrets : {},
+          });
+          log.info('插件配置已保存', { id, ok: r.ok, applied: r.applied, restartRequired: r.restartRequired });
+          return r;
+        }
+        if (name === 'plugin.test') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const id = String(arg?.id ?? '').trim();
+          if (!isPluginId(id)) return { ok: false, code: 'E4041', message: '插件 id 不合法' };
+          return plugins.test(id);
+        }
+        if (name === 'plugin.reload') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const id = String(arg?.id ?? '').trim();
+          if (!isPluginId(id)) return { ok: false, code: 'E4041', message: '插件 id 不合法' };
+          const r = await plugins.reload(id);
+          log.info('插件已重载', { id, ok: r.ok, status: r.status });
+          return r;
+        }
+        if (name === 'plugin.rescan') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const r = await plugins.rescan();
+          log.info('插件目录已重新扫描', { added: r.added, removed: r.removed, total: r.total });
+          return r;
+        }
+        if (name === 'plugin.install') {
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          /*
+           * 安装来源只接受**本机路径**，不接受 URL。
+           * 接受 URL 等于给界面开了一个"替你去下载并解压任意压缩包"的能力，
+           * 而它跑在有网络、有磁盘权限的机器上。要装就先把包下载到本地。
+           */
+          const src = String(arg?.path ?? '').trim();
+          if (!src) return { ok: false, code: 'E4041', message: '缺少插件包路径' };
+          const r = await plugins.install(src);
+          log.info('插件安装结果', { id: r.id, ok: r.ok, version: r.version });
+          return r;
         }
         /*
          * 环境体检：SnowLuma / Node 装没装、跑没跑。
@@ -1398,20 +1515,40 @@ const rpc = {
       case 'setting': {
         const key = params?.key;
         const value = params?.value;
+        /*
+         * 旧 DSH 设置通道 —— **保留但只做迁移**。
+         *
+         * 骨架改造后 DSH 是普通插件，配置走 `plugin.saveConfig`。
+         * 但旧版界面、旧脚本、以及用户书签里的调用可能还在发这个 key。
+         * 直接删掉会让它们收到"未支持的设置项"，而用户看到的是
+         * "保存失败"，却不知道去哪改 —— 所以这里转成插件配置再走同一条路。
+         *
+         * @deprecated 用 action `plugin.saveConfig`（id: 'dsh-bridge'）
+         */
         if (key === 'dsh.config' || key === 'dsh') {
-          let next;
-          try { next = normalizeDsh(value, config.dsh); } catch (e) { return { ok: false, code: 'E4041', message: e.message }; }
-          const candidate = { ...config, dsh: next };
-          await writeJsonAtomic(paths.configPath, candidate);
-          config = candidate;
-          try {
-            const mod = pluginMods.find(p => p.name === 'dsh-bridge')?.mod;
-            if (!mod) return { ok: true, applied: !next.enabled, restartRequired: next.enabled, message: next.enabled ? '已保存；请启用DSH插件后重启后端' : '已保存，DSH已停用' };
-            await mod.stopBridge?.();
-            const r = next.enabled ? await mod.startBridge({ sendText, log: (msg) => log.info(msg), getConfig: () => config }) : { ok: true };
-            const dshRuntime = { applied: r?.ok !== false, restartRequired: r?.ok === false, message: r?.ok === false ? '配置已保存，但DSH监听启动失败，请检查端口后重试' : 'DSH配置已应用' };
-            return { ok: true, ...dshRuntime };
-          } catch { return { ok: true, applied: false, restartRequired: true, message: '配置已保存，但运行时应用失败，需要重启后端' }; }
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+          const v = value && typeof value === 'object' ? value : {};
+          /** @type {Record<string, any>} */
+          const cfg = {};
+          /** @type {Record<string, any>} */
+          const secrets = {};
+          if (Number.isInteger(v.port)) cfg.port = v.port;
+          if (Array.isArray(v.admins)) cfg.admins = v.admins.map((x) => String(x).trim()).filter(Boolean).join(',');
+          if (typeof v.sessionId === 'string') cfg.sessionId = v.sessionId.trim();
+          if (typeof v.token === 'string' && v.token.trim() !== '') secrets.token = v.token.trim();
+          if (v.clearToken === true) secrets.token = '';
+
+          // enabled 语义映射成插件的启用/停用（旧界面用同一个开关控制两件事）
+          if (v.enabled === true) await plugins.enable('dsh-bridge');
+          const saved = await plugins.saveConfig('dsh-bridge', { config: cfg, secrets });
+          if (v.enabled === false) await plugins.disable('dsh-bridge');
+          return {
+            ok: saved.ok,
+            applied: saved.applied === true,
+            restartRequired: saved.restartRequired === true,
+            message: saved.message ?? 'DSH 配置已保存',
+            code: saved.code,
+          };
         }
 
         if (key === 'allow') {
@@ -1570,6 +1707,10 @@ const rpc = {
            *
            * 形状必须是字符串数组：直接赋非法值会让加载器拿到 undefined，
            * 表现成"插件全没了"，而用户以为自己只关了一个。
+           *
+           * 现在它委托给管理器：逐个比对前后差异，只对变化的那几个
+           * 走 enable/disable。全量重载会中断所有插件的在途调用 ——
+           * 用户只关掉一个插件，不该把另一个正在干活的插件也掐了。
            */
           if (!Array.isArray(value)) {
             return { ok: false, code: 'E40XX', message: 'plugins.enabled 必须是数组' };
@@ -1579,19 +1720,23 @@ const rpc = {
           for (const item of value) {
             const s = String(item ?? '').trim();
             if (!s) continue;
-            // 插件名会被拼进路径，这里挡掉穿越和分隔符
-            if (/[\\/]|\.\./.test(s)) {
-              return { ok: false, code: 'E40XX', message: '插件名不合法：' + s };
+            // 插件 id 会被拼进路径，这里挡掉穿越和分隔符
+            if (!isPluginId(s)) {
+              return { ok: false, code: 'E40XX', message: '插件 id 不合法：' + s };
             }
             if (!names.includes(s)) names.push(s);
           }
+          if (!plugins) return { ok: false, code: 'E40XX', message: '插件管理器未就绪' };
+
           const before = [...config.plugins.enabled];
-          config.plugins.enabled = names;
-          await persistConfig();
-          // 改了启用列表要立刻重载，否则用户点了"禁用"还要等下次重启
-          await reloadPlugins();
-          log.info('插件启用列表已更新', { before, after: names });
-          return { ok: true };
+          const toEnable = names.filter((x) => !before.includes(x));
+          const toDisable = before.filter((x) => !names.includes(x));
+
+          for (const id of toDisable) await plugins.disable(id);
+          for (const id of toEnable) await plugins.enable(id);
+
+          log.info('插件启用列表已更新', { before, after: names, enabled: toEnable, disabled: toDisable });
+          return { ok: true, enabled: toEnable, disabled: toDisable };
         }
 
         if (key === 'plugins.allowDangerous') {
@@ -1608,6 +1753,7 @@ const rpc = {
           const wasOn = config.plugins.allowDangerous === true;
           config.plugins.allowDangerous = value;
           await persistConfig();
+          // 风险档变了要重新加载：原来被拒的插件现在可能能跑（或反过来必须停）
           await reloadPlugins();
           log.warn('插件危险权限已变更', { before: wasOn, after: value });
           return { ok: true };
@@ -1673,40 +1819,94 @@ async function persistConfig() {
 }
 
 /**
- * 重新加载插件面。
+ * 重新加载整个插件面。
  *
- * 为什么要这一步：plugins.enabled 和 plugins.allowDangerous 改了之后，
- * 不重新加载就只有重启才生效 —— 而用户在界面上点"禁用"的那一刻，
- * 期望的是**立刻**停掉，不是"下次启动时生效"。
+ * 为什么要这一步：`plugins.allowDangerous` 改了之后，某些插件可能
+ * 从"被拒"变成"可加载"（或反过来必须停掉）—— 不重载就只有重启才生效，
+ * 而用户在界面上点开关的那一刻，期望的是**立刻**生效。
  *
  * 加载失败不能抛出去：用户点了一个开关，不该让整个设置保存失败。
- * 单个插件的错误由 loadPlugins 自己收集到 skipped 里。
+ * 单个插件的错误由管理器自己收集到各自的状态里。
  */
 async function reloadPlugins() {
+  if (!plugins) return;
   try {
-    for (const p of pluginMods) await p.mod.stopBridge?.();
-    pluginMods = [];
-    removePluginTools();
-    const plug = await loadPlugins({
-      dir: paths.pluginsDir,
-      enabled: config.plugins.enabled,
-      allowDangerous: config.plugins.allowDangerous,
-      log: (msg) => log.info(msg),
-      host: {
-        sendText: (convKey, text) => sendText(convKey, text),
-        log: (msg, meta) => log.info(`[plugin] ${msg}`, meta),
-        getConfig: () => config,
-      },
-    });
-    pluginState = plug;
-    pluginMods = plug.loaded.filter((x) => x.ok && x.mod).map((x) => ({ name: x.name, mod: x.mod }));
-    log.info('插件面已重新加载', {
-      loaded: plug.loaded.filter((x) => x.ok).length,
-      skipped: plug.skipped.length,
-    });
+    const r = await plugins.loadAll();
+    log.info('插件面已重新加载', { loaded: r.loaded, failed: r.failed, skipped: r.skipped });
   } catch (err) {
     log.error('插件重新加载失败', { message: String(/** @type {any} */ (err)?.message ?? err) });
   }
+}
+
+/**
+ * 插件 id 的形状。
+ *
+ * 它会拼进磁盘路径，所以必须挡掉分隔符与 `..`；
+ * 与 manifest.mjs 的 ID_RE 保持一致（这里再挡一次是因为 RPC 参数不可信）。
+ *
+ * @param {string} id
+ * @returns {boolean}
+ */
+function isPluginId(id) {
+  return /^[a-z][a-z0-9-]{1,40}$/.test(String(id ?? ''));
+}
+
+/**
+ * 取插件快照，失败时给一个形状合法的空视图。
+ *
+ * 为什么兜底：插件面是可选面板，它算不出来绝不能连累整份快照 ——
+ * 那样用户连消息列表、连接状态一起看不到，症状是「界面拉取失败」。
+ *
+ * @returns {Promise<object>}
+ */
+async function pluginSnapshotSafe() {
+  if (!plugins) {
+    return {
+      enabled: config?.plugins?.enabled ?? [],
+      allowDangerous: config?.plugins?.allowDangerous === true,
+      loaded: [],
+      skipped: [],
+      items: [],
+      stats: { total: 0, ready: 0, error: 0, disabled: 0 },
+      dirs: { plugins: paths.pluginsDir, data: paths.root },
+    };
+  }
+  try {
+    return await plugins.snapshot();
+  } catch (err) {
+    log.warn('插件快照生成失败，本次返回空视图', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+    return {
+      enabled: config?.plugins?.enabled ?? [],
+      allowDangerous: config?.plugins?.allowDangerous === true,
+      loaded: [],
+      skipped: [],
+      items: [],
+      stats: { total: 0, ready: 0, error: 0, disabled: 0 },
+      dirs: { plugins: paths.pluginsDir, data: paths.root },
+      error: String(/** @type {any} */ (err)?.message ?? err),
+    };
+  }
+}
+
+/**
+ * 插件面清单（启动日志用）。
+ *
+ * @param {any} snap
+ * @returns {string}
+ */
+function describePluginSurface(snap) {
+  const items = Array.isArray(snap?.items) ? snap.items : [];
+  if (items.length === 0) return '（未安装任何插件）';
+  return items
+    .map((p) => {
+      const tools = (p.tools ?? []).map((t) => t.fullName ?? t.name).join(', ') || '无工具';
+      const mark = p.status === 'ready' ? '✓' : p.enabled ? '✖' : '·';
+      const detail = p.status === 'ready' ? tools : `${p.statusText}${p.error ? ` ${p.error.code}` : ''}`;
+      return `  ${mark} ${String(p.id).padEnd(16)} ${String(p.version).padEnd(8)} ${detail}`;
+    })
+    .join('\n');
 }
 
 /** 人格注入上限（与界面显示一致，F8） */
@@ -1805,7 +2005,113 @@ function write(obj) {
 /* ---------------------------------------------------------------- 主循环 */
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
+
+/** 是否收到过至少一行 stdin（见 rl.on('close') 里的说明） */
+let sawStdinLine = false;
+
+/*
+ * stdin 关闭 = 父进程没了，必须自己退出。
+ *
+ * ## 为什么这条比信号更重要
+ *
+ * 正常退出（托盘「退出」）走的是 shutdown JSON，这条路是好的。
+ * 但外壳被强杀 / 崩溃 / 任务管理器结束时，Windows 不会给 node 发
+ * SIGTERM —— 进程直接消失。
+ *
+ * 没有兜底时：后端会一直活着。表现就是"程序关了，后台还在"：
+ * 端口被占、下次启动报 E4064 端口被占用，而且用户找不到是谁占的。
+ *
+ * ## 为什么不能只靠 stdin
+ *
+ * 实测过两条路都不够：
+ *
+ *   1. 只监听 `rl.on('close')` —— 外壳被 Stop-Process 强杀时，
+ *      管道句柄随进程一起没了，但 node 这边的 readline 不一定
+ *      立刻收到 EOF（取决于句柄继承），这条回调可能根本不触发。
+ *   2. 只看"stdin 关了就退出" —— 调试时父进程根本没接管道，
+ *      一启动就自杀，把开发场景也杀了。
+ *
+ * 所以真正的判据只有一个：**父进程还在不在**，而且要主动去问。
+ * 见下面的 parentWatch。
+ */
+rl.on('close', () => {
+  if (!sawStdinLine) return;
+  if (isParentAlive()) {
+    log.warn('stdin 已关闭，但父进程仍在运行，继续提供服务');
+    return;
+  }
+  log.info('父进程已退出，后端自行收尾');
+  shutdown(0).catch(() => process.exit(0));
+});
+
+/**
+ * 父进程是否还活着。
+ *
+ * Windows 上 `process.kill(pid, 0)` 只做存在性探测、不发信号。
+ *
+ * 任何非 ESRCH 的异常都保守地当作"还在"：宁可留一个需要手工清理的
+ * 进程，也不要因为一次探测抖动就把用户正在用的服务停掉。
+ *
+ * @returns {boolean}
+ */
+function isParentAlive() {
+  const ppid = process.ppid;
+  if (!ppid || ppid <= 1) return false;
+  try {
+    process.kill(ppid, 0);
+    return true;
+  } catch (err) {
+    // EPERM = 进程存在但没权限（仍算活着）；ESRCH = 不存在
+    return /** @type {any} */ (err)?.code === 'EPERM';
+  }
+}
+
+/** 父进程存活检查间隔：够快（用户不会觉得"关不掉"），又不至于太吵 */
+const PARENT_WATCH_MS = 3000;
+
+/**
+ * 心跳式父进程看护。
+ *
+ * 这是兜住"外壳被强杀"的**唯一可靠**手段：不依赖管道 EOF、不依赖
+ * 信号（Windows 根本没有 SIGTERM 给子进程），只定期问一句"我爸还在吗"。
+ *
+ * ## 为什么必须有它
+ *
+ * 后端在真实运行时是**被事件循环撑住**的（OneBot WebSocket、定时器）。
+ * 外壳一声不响地消失后，这些句柄不会跟着断，进程就一直活着占着端口。
+ * 用户看到的是"程序关了，后台还在"，而且任务管理器里只有一个 node.exe，
+ * 根本看不出它是谁。
+ *
+ * ## 为什么第一条指令之后才开始看
+ *
+ * 外壳启动后端后会立刻发 snapshot。在此之前把"父进程不在"当作
+ * 正常情况处理（调试、被别的工具拉起），避免误杀。
+ *
+ * @param {number} everyMs
+ */
+function startParentWatch(everyMs = PARENT_WATCH_MS) {
+  const timer = setInterval(() => {
+    if (!sawStdinLine) return;
+    if (isParentAlive()) return;
+    log.warn('父进程已消失，后端自行退出（避免成为孤儿进程占着端口）');
+    void shutdown(0).catch(() => process.exit(0));
+  }, everyMs);
+  /*
+   * 必须 unref。
+   *
+   * 这个定时器是**兜底检查**，不是用来撑住进程的：如果后端此刻
+   * 已经没有任何存活句柄（没有 OneBot 连接、没有插件子进程），
+   * 它本来就该自然退出 —— 那种情况下不会产生孤儿，也用不着看护。
+   *
+   * 反过来，把它当成"保活句柄"才是错的：一个本该退出的后端会被
+   * 硬撑住，那正好制造出我们要防的那种孤儿。
+   */
+  timer.unref?.();
+  return timer;
+}
+
 rl.on('line', async (line) => {
+  sawStdinLine = true;
   if (!line.trim()) return;
   let req;
   try {
@@ -1831,6 +2137,17 @@ rl.on('line', async (line) => {
 async function shutdown(code) {
   log.info('后端正在退出', { code });
   client?.close();
+  /*
+   * 插件先收尾：子进程不关会变成孤儿进程，继续占着端口。
+   *
+   * 放在 thinkingStore.flush() 之前 —— 插件可能有"退出时落盘"的需求，
+   * 而它们比一条展示数据更需要确定性。
+   */
+  try {
+    await plugins?.shutdown();
+  } catch (err) {
+    log.warn('插件收尾失败（不影响退出）', { message: String(/** @type {any} */ (err)?.message ?? err) });
+  }
   /*
    * 退出前显式落盘一次。
    *

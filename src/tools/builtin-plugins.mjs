@@ -31,7 +31,27 @@ const SRC_ROOT = path.resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 const FACTORY_DIR = path.join(SRC_ROOT, 'plugins');
 
 /** 随包分发的内置插件清单。只列目录名。 */
-export const BUILTIN_PLUGINS = ['dsh-bridge'];
+export const BUILTIN_PLUGINS = ['dsh-bridge', 'echo'];
+
+/**
+ * 一个目录算不算"装好了的插件"。
+ *
+ * 判据是 `plugin.json`，不是入口文件：骨架改造后**清单是唯一事实来源**，
+ * 只有入口没有清单的目录在新加载器眼里是 `E4060`（缺清单）。
+ * 所以"要不要铺"也必须按清单判断，否则会出现
+ * "目录里有 index.mjs → 判定已安装 → 永远不补清单 → 插件永远加载失败"。
+ *
+ * @param {string} dir
+ * @returns {Promise<boolean>}
+ */
+async function isInstalled(dir) {
+  try {
+    await fs.access(path.join(dir, 'plugin.json'));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 递归复制。
@@ -106,7 +126,7 @@ export async function installBuiltinPlugins(opts) {
 
     try {
       const exists = await fs
-        .access(path.join(from, 'index.mjs'))
+        .access(path.join(from, 'plugin.json'))
         .then(() => true)
         .catch(() => false);
       if (!exists) {
@@ -115,8 +135,22 @@ export async function installBuiltinPlugins(opts) {
         continue;
       }
 
-      const already = await fs
-        .access(path.join(to, 'index.mjs'))
+      const already = await isInstalled(to);
+
+      /*
+       * 目录存在但**没有 plugin.json** = 骨架改造前的旧版安装。
+       *
+       * 这种目录必须整目录覆盖，不能走"不覆盖已有文件"的路。
+       * 真踩到过：旧版只有 index.mjs（工具带 run 的老接口），
+       * `isInstalled` 因为没清单判成"没装过"，于是只补了 plugin.json、
+       * 老 index.mjs 被 EEXIST 跳过 —— 结果是"新清单 + 旧代码"，
+       * 加载时报 E4041「声明了 tools 但入口没有实现 callTool()」。
+       *
+       * 更隐蔽的是它只发生一次：第二次启动时 plugin.json 已经在，
+       * 判定变成"已安装"，于是这个坏状态被永久固化，再也不会自愈。
+       */
+      const hasOldDir = await fs
+        .access(to)
         .then(() => true)
         .catch(() => false);
 
@@ -124,19 +158,42 @@ export async function installBuiltinPlugins(opts) {
       //
       // 不覆盖是为了保住用户手动改的插件；但那样一来**程序自己的升级也进不去**，
       // 症状是"代码改了、重启了、行为没变"——非常难查（我踩过一次）。
-      // 所以：出厂版本 > 已装版本时才覆盖，否则一个字节都不动。
+      // 所以：出厂版本 > 已装版本时才覆盖，或者这是旧版目录时（必须迁移）。
       const factoryVer = await readVersion(from);
       const installedVer = already ? await readVersion(to) : '';
-      const upgrade = already && factoryVer !== installedVer && factoryVer !== '0';
+      const upgrade = (already && factoryVer !== installedVer && factoryVer !== '0') || (!already && hasOldDir);
 
       await copyMissing(from, to, upgrade);
 
-      if (!already) {
-        out.installed.push(name);
-        log(`内置插件 ${name} 已安装到 ${to}`);
-      } else if (upgrade) {
+      /*
+       * 升级后清掉可能残留的旧文件。
+       *
+       * 新结构下入口仍是 index.mjs，但插件目录里的文件会变（比如删掉了
+       * 某个 lib、换了入口名）。`copyMissing` 只增不减，残留的旧文件
+       * 可能被误 import —— 那是最难查的一类"改了没生效"。
+       *
+       * 只在**升级**时做，且只删"出厂源里没有、而旧版本标记里有的"文件，
+       * 避免误删用户自己加的文件。这里保守处理：只删 `index.js` 这种
+       * 明确的旧命名，其余交给用户。
+       */
+      if (upgrade) {
+        try {
+          await fs.unlink(path.join(to, 'index.js'));
+        } catch {
+          /* 不存在就是最好的情况 */
+        }
+      }
+
+      if (upgrade && already) {
         out.installed.push(name);
         log(`内置插件 ${name} 已升级 ${installedVer || '0'} → ${factoryVer}`);
+      } else if (upgrade) {
+        // 旧版目录（有入口没清单）被整体覆盖成新结构
+        out.installed.push(name);
+        log(`内置插件 ${name} 已从旧版结构迁移到插件清单格式`);
+      } else if (!already) {
+        out.installed.push(name);
+        log(`内置插件 ${name} 已安装到 ${to}`);
       } else {
         out.skipped.push(name);
         log(`内置插件 ${name} 已是最新（${installedVer || '0'}），未覆盖`);

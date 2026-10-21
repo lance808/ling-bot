@@ -71,6 +71,27 @@ export function removePluginTools() {
   for (const [name, tool] of registry) if (tool.plugin) registry.delete(name);
 }
 
+/**
+ * 注销指定插件登记的全部工具。
+ *
+ * 停用插件必须是**立刻**让工具消失，而不是等下一次重启：
+ * 否则"已停用"的插件在下一个回合仍可被模型调用 —— 那是最危险的状态，
+ * 界面上写着停用、实际还在跑。
+ *
+ * @param {string} pluginId
+ * @returns {number} 注销的工具数
+ */
+export function removeToolsOfPlugin(pluginId) {
+  let n = 0;
+  for (const [name, tool] of registry) {
+    if (tool.plugin === pluginId) {
+      registry.delete(name);
+      n++;
+    }
+  }
+  return n;
+}
+
 /** 仅供测试使用：清空注册表 */
 export function _clearToolsForTest() {
   registry.clear();

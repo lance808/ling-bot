@@ -1,0 +1,104 @@
+{
+  "id": "dsh-bridge",
+  "name": "DSH 接入",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "把 DSH（DeepSeek Harness）接进 Ling-bot：提供 dsh_ask / dsh_pending 工具，并在本机回环端口上接收 DSH 的审批与提问，转发到管理员私聊。",
+  "author": "ling-bot",
+  "runtime": "in-process",
+  "trusted": true,
+  "entry": "index.mjs",
+  "handleMessage": true,
+  "permissions": ["host.net.loopback", "qq.read", "qq.send"],
+  "config": [
+    {
+      "key": "port",
+      "label": "监听端口",
+      "type": "number",
+      "default": 3458,
+      "min": 1,
+      "max": 65535,
+      "integer": true,
+      "required": false,
+      "help": "桥只在 127.0.0.1 上监听。默认 3458；被占用时改这里，DSH 侧留空地址会自动读取端口发现文件。"
+    },
+    {
+      "key": "token",
+      "label": "共享令牌",
+      "type": "password",
+      "secret": true,
+      "required": true,
+      "generate": "token",
+      "maxLength": 512,
+      "help": "DSH 侧插件与桥共享的 Bearer 令牌。点「生成」得到一个随机值，再把同一份填到 DSH 侧；不填则桥不启动。"
+    },
+    {
+      "key": "admins",
+      "label": "管理员 QQ",
+      "type": "text",
+      "required": true,
+      "maxLength": 300,
+      "pattern": "\\d{4,15}(?:[\\s,，、]+\\d{4,15})*",
+      "placeholder": "12345678, 87654321",
+      "help": "接收审批/提问私聊的 QQ 号，多个用逗号分隔。第一个是默认收件人；只有这些号码的私聊回复会被当作审批结论。"
+    },
+    {
+      "key": "sessionId",
+      "label": "默认 DSH 会话",
+      "type": "text",
+      "required": false,
+      "maxLength": 512,
+      "help": "可选。/dsh 指令和 dsh_ask 不指定会话时投给它；留空表示由 DSH 侧决定。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "dsh_ask",
+      "description": "把一句话交给 DSH 执行（DSH 会真的动手，可能写文件或跑命令）。返回「已投递」，答复稍后发到管理员私聊。",
+      "needs": "host",
+      "risk": "R1",
+      "timeoutMs": 30000,
+      "params": {
+        "text": {
+          "type": "string",
+          "required": true,
+          "maxLength": 4000,
+          "description": "要交给 DSH 的指令"
+        },
+        "sessionId": {
+          "type": "string",
+          "required": false,
+          "description": "投给哪个 DSH 会话；省略则用默认会话"
+        }
+      }
+    },
+    {
+      "name": "dsh_pending",
+      "description": "查看 DSH 当前有哪些操作在等管理员审批（只读）。",
+      "needs": "host",
+      "risk": "R0",
+      "timeoutMs": 10000,
+      "params": {}
+    }
+  ],
+  "notes": [
+    {
+      "title": "怎么用",
+      "lines": [
+        "填好共享令牌与管理员 QQ 并启用后，桥会监听 127.0.0.1 上的配置端口。",
+        "DSH 侧插件把 bridgeUrl 留空时会读取 ~/.ling-bot/bridge.json 里的实际端口，因此换端口不用两边各改一次。",
+        "审批/提问会以带编号的消息发到管理员私聊：引用那条消息回数字即可。",
+        "管理员私聊里也可以用 /dsh 指令 或「同意 3」「拒绝 3」「待审批」「免打扰 30分钟」。"
+      ]
+    },
+    {
+      "title": "安全边界",
+      "lines": [
+        "端口只绑 127.0.0.1，且所有路由都要求 Bearer 令牌；没配令牌时桥根本不启动。",
+        "群聊消息一律不接管——否则群里任何人都能遥控 DSH。",
+        "审批只回传 DSH 的 allowed-once / rejected，不发明「以后都同意」这种 DSH 不知情的放行状态。"
+      ]
+    }
+  ],
+  "ui": null
+}

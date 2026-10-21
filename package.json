@@ -16,6 +16,7 @@
     "smoke": "node scripts/smoke.mjs",
     "e2e:llm": "node scripts/llm-e2e.mjs",
     "e2e:real": "node scripts/e2e-real.mjs",
+    "e2e:plugins": "node scripts/e2e-plugins.mjs",
     "live": "node scripts/live-probe.mjs",
     "live:llm": "node scripts/live-llm.mjs",
     "scan:secrets": "node scripts/scan-secrets.mjs",

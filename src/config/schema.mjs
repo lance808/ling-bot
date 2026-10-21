@@ -89,7 +89,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   },
   plugins: {
     /**
-     * 允许加载的插件名（目录名）。**空数组 = 一个都不加载**。
+     * 允许加载的插件 id（目录名）。**空数组 = 一个都不加载**。
      * 光把插件放进 plugins/ 目录不会生效，必须在这里点名。
      *
      * 默认带 `dsh-bridge`：它是随包内置的默认插件（需求 2 的入口）。
@@ -99,13 +99,33 @@ export const DEFAULT_CONFIG = Object.freeze({
     enabled: ['dsh-bridge'],
     /** 是否允许插件声明 R2/R3 工具（默认关闭） */
     allowDangerous: false,
+    /**
+     * 各插件的**普通配置**（非敏感）。
+     *
+     * 形状：`{ [pluginId]: { [configKey]: value } }`
+     *
+     * 为什么放在主配置里而不是每个插件一个文件：配置的读写必须走同一套
+     * 原子写与校验（I5/I9），多开一套文件格式就等于多一处可以写坏的地方。
+     * 敏感字段不在这里 —— 它们进 `plugin-secrets.vault`（见 paths.mjs）。
+     *
+     * 这是**动态字典**：键由磁盘上的插件决定，所以整块接受（见 DYNAMIC_MAPS）。
+     */
+    config: {},
   },
   /**
    * DSH 双向接入（需求 2）。
    *
-   * 默认**全部关闭**：不是每个人都在同时跑 DSH，
-   * 而且这一步会让本机的 AI 能通过 QQ 被远程指挥——
-   * 必须由用户显式打开，不能默认生效。
+   * ## 已迁移为插件配置，这里只保留"读旧配置"的能力
+   *
+   * 从插件骨架改造后，DSH 接入是 `dsh-bridge` 这个普通插件，
+   * 它的配置在 `plugins.config['dsh-bridge']` 里，启用状态在 `plugins.enabled`。
+   *
+   * 但这个块**不能直接删**：老用户的 `config.json` 里还有它，
+   * 而 `mergeStrict` 对未知键是 fail-fast —— 删掉字段等于让人开不了机。
+   * 所以保留声明，启动时由 `migrateLegacyDsh()` 搬到新位置，
+   * 搬完写回时会留下一个空块（无害）。
+   *
+   * @deprecated 用 `plugins.config['dsh-bridge']`
    */
   dsh: {
     /** 总开关。关着的时候端口都不起 */
@@ -147,7 +167,15 @@ export const DEFAULT_CONFIG = Object.freeze({
  *
  * @type {Set<string>}
  */
-const DYNAMIC_MAPS = new Set(['llm.modelCapabilities']);
+const DYNAMIC_MAPS = new Set([
+  'llm.modelCapabilities',
+  /**
+   * 插件普通配置：键是插件 id（由磁盘上的插件决定），值是该项自己的配置。
+   * 不加进来会出现"装一个插件 → 配置里多一个 id → 下次启动被未知键拒绝"，
+   * 也就是**装插件直接把程序搞崩**，正是这次改造要消灭的那类问题。
+   */
+  'plugins.config',
+]);
 
 /**
  * 深度合并 + 未知键检测。

@@ -30,26 +30,31 @@ function exists(rel) {
 
 /* --------------------------------------------------- 页面文件齐备 */
 
-test('九个页面视图文件都存在', () => {
-  const pages = ['overview', 'sessions', 'model', 'persona', 'tools', 'plugins', 'security', 'dsh', 'usage', 'logs'];
+test('页面视图文件都存在', () => {
+  // DSH 接入已并入通用插件页，不再有独立的 dsh.mjs
+  const pages = ['overview', 'sessions', 'model', 'persona', 'tools', 'plugins', 'security', 'usage', 'logs'];
   for (const p of pages) {
     assert.ok(exists(`ui/src/views/${p}.mjs`), `缺 ${p}.mjs`);
   }
+  assert.ok(!exists('ui/src/views/dsh.mjs'), 'DSH 已成为普通插件，不该再有专用页面');
 });
 
-test('app.mjs 注册了十一个页面且都 import 了渲染函数', () => {
+test('app.mjs 注册的页面里包含插件页，且不再有 DSH 专用页', () => {
   const src = read('ui/src/app.mjs');
   for (const f of ['usage', 'tools', 'plugins']) {
     assert.match(src, new RegExp(`import \\{ render\\w+ \\} from './views/${f}\\.mjs'`), `没 import ${f}`);
   }
-  // 数一下 PAGES 里的 id 个数
+  // 数一下 PAGES 里的 id 个数（DSH 页移除后是 10 个）
   const pagesBlock = src.slice(src.indexOf('const PAGES'), src.indexOf('];', src.indexOf('const PAGES')));
   const ids = [...pagesBlock.matchAll(/id: '(\w+)'/g)].map((m) => m[1]);
-  assert.equal(ids.length, 11, `页面数应为 11，实际 ${ids.length}`);
+  assert.equal(ids.length, 10, `页面数应为 10，实际 ${ids.length}`);
   assert.ok(ids.includes('tools') && ids.includes('plugins') && ids.includes('usage'));
   // 思考链路属于「概览」组，且排在会话总览之后
   assert.ok(ids.includes('thinking'), '缺思考链路页');
   assert.ok(ids.indexOf('thinking') > ids.indexOf('sessions'), '思考链路应在会话总览之后');
+  // DSH 不能作为独立页面存在
+  assert.ok(!ids.includes('dsh'), 'DSH 已并入插件页，不该再有独立页面');
+  assert.ok(!/renderDsh/.test(src), '不该再 import renderDsh');
 });
 
 /* --------------------------------------------------- 主题 */
@@ -216,20 +221,41 @@ test('能力三态区分 true / false / 未探测', () => {
 
 /* --------------------------------------------------- 插件页 */
 
-test('插件页把「已加载」和「已启用」分开显示', () => {
+test('插件页能区分运行状态，不是只显示启用/停用两态', () => {
   const src = read('ui/src/views/plugins.mjs');
-  assert.match(src, /已加载/, '缺已加载');
-  assert.match(src, /已启用/, '缺已启用');
-  assert.match(src, /已跳过/, '缺已跳过');
-  // 启用但没加载是明确的异常态，不能显示成"已禁用"
-  assert.match(src, /启用但未加载/);
+  // 运行状态来自 statusText（后端 STATUS_TEXT），不能只靠 enabled 布尔
+  assert.match(src, /statusText/, '要显示后端给的运行状态文案');
+  assert.match(src, /needs-config|needsConfig/, '待配置是独立状态');
+  assert.match(src, /crashed/, '崩溃是独立状态');
+  assert.match(src, /incompatible/, '接口不兼容是独立状态');
+  assert.match(src, /invalid/, '清单非法是独立状态');
+});
+
+test('插件页把声明驱动的东西全部渲染出来：配置表单 / 工具清单 / 诊断', () => {
+  const src = read('ui/src/views/plugins.mjs');
+  // 配置表单由 item.config 声明生成
+  assert.match(src, /item\.config/, '配置要来自声明');
+  for (const t of ['text', 'textarea', 'password', 'number', 'boolean', 'enum']) {
+    assert.ok(src.includes(`'${t}'`), `缺 ${t} 控件`);
+  }
+  // 工具清单
+  assert.match(src, /fullName/, '工具清单要显示完整的工具名');
+  assert.match(src, /risk/, '要显示风险等级');
+  assert.match(src, /needs/, '要显示可见范围');
+  // 诊断
+  assert.match(src, /测试连接/);
+  assert.match(src, /重载/);
+  assert.match(src, /重新扫描/);
 });
 
 test('禁用插件不改文件，只改配置', () => {
   const src = read('ui/src/views/plugins.mjs');
   assert.ok(!/rmSync|unlink|removeSync/.test(src), '禁用不该删文件');
   const app = read('ui/src/app.mjs');
-  assert.match(app, /setting\('plugins\.enabled'/, '要通过配置启停');
+  // 骨架改造后，启停走 action('plugin.enable'/'plugin.disable')，
+  // 持久化由管理器的 enable/disable 负责写 plugins.enabled。
+  assert.match(app, /plugin\.enable/, '要通过插件动作启用');
+  assert.match(app, /plugin\.disable/, '要通过插件动作停用');
 });
 
 /* ------------------------------------------- 输入不被重绘冲掉（踩过的坑） */
@@ -448,16 +474,38 @@ test('★ 后端要支持写 allowDangerous 与 enabled', () => {
   assert.match(src, /key === 'plugins\.enabled'/, '要有 enabled 分支');
   // 必须是布尔，不能收 "yes" 这种
   assert.match(src, /typeof value !== 'boolean'/, '要校验类型');
-  // 改完要重新加载，否则要等重启
-  assert.match(src, /async function reloadPlugins/, '要能重载插件');
-  assert.match(src, /await reloadPlugins\(\)/, '改设置后要调用');
+  // 骨架改造后改的是"逐个比对差异再启停"，不再是全量 reloadPlugins()
+  assert.match(src, /await plugins\.enable\(/, '要能启用插件');
+  assert.match(src, /await plugins\.disable\(/, '要能停用插件');
+  // 但全量重载入口仍然要有（rescan / 升级后重新加载用）
+  assert.match(src, /async function reloadPlugins/, '要保留整体重载入口');
 });
 
-test('★ 插件名不能带路径穿越', () => {
+test('★ 插件 id 不能带路径穿越', () => {
+  /*
+   * 插件 id 会被拼进磁盘路径（`plugins/<id>/`），所以必须挡掉分隔符与 `..`。
+   *
+   * 骨架改造后校验集中到 `isPluginId()` 一个纯函数里 —— 比在
+   * setting 分支里内联正则更好：`plugin.enable` / `plugin.disable` /
+   * `plugin.saveConfig` 等动作都走同一个判断，不会出现
+   * "某个入口忘了挡"的漏网之鱼。所以断言要落在那个函数上。
+   */
+  const src = read('src/index.mjs');
+  const i = src.indexOf('function isPluginId');
+  assert.ok(i > 0, '应当有 isPluginId 这个统一校验入口');
+  const block = src.slice(i, i + 400);
+  // 必须挡住路径分隔符与上跳
+  assert.match(block, /\[a-z\]/, '要限制字符集');
+  assert.match(block, /\^|\$/, '要锚定整串');
+  assert.match(src, /isPluginId\(/, '至少一个调用点');
+  // 具体行为由 test/plugins-core.test.mjs 的清单校验用例覆盖
+});
+
+test('★ plugins.enabled 拒绝路径穿越（不能只靠 UI）', () => {
   const src = read('src/index.mjs');
   const i = src.indexOf("key === 'plugins.enabled'");
-  const block = src.slice(i, i + 1200);
-  assert.match(block, /\[\\\\\/\]/, '要挡住路径分隔符');
+  const block = src.slice(i, i + 1600);
+  assert.match(block, /isPluginId\(/, '要走统一校验，而不是自己写一份正则');
   assert.match(block, /不合法/, '要给出错误');
 });
 
@@ -480,9 +528,28 @@ test('★ 确认框跨重绘要保留，不能闪一下就消失', () => {
   assert.match(src, /const ui = \{/, '要有模块级状态');
   assert.match(src, /dangerAsk/, '要有确认框开关');
   // 重绘后必须按状态恢复
-  assert.match(src, /setAsk\(ui\.dangerAsk === true\)/, '重绘后要恢复确认框');
-  // 不能又把状态重置掉
-  assert.ok(!/ui\.dangerAsk = false;\s*\n\s*\}\s*;?\s*\n/.test(src.split('setAsk(ui.dangerAsk')[1] ?? ''), '重绘后不能强行关掉');
+  assert.match(src, /renderConfirm\(ui\.dangerAsk === true\)/, '重绘后要恢复确认框');
+});
+
+test('★ 表单草稿也要活在模块作用域，且按插件 id 分开', () => {
+  // 同一类坑的第二种形态：配置输入框里的草稿如果是局部变量，
+  // 用户填一半遇到轮询重绘就全丢了。
+  //
+  // 而且键必须带插件 id：两个插件都有 token 字段时，
+  // 只按字段名存会让它们互相串味。
+  const src = read('ui/src/views/plugins.mjs');
+  assert.match(src, /draft: Object\.create\(null\)/, '草稿要在模块作用域');
+  assert.match(src, /const draftKey = `\$\{item\.id\}\.\$\{key\}`/, '草稿键要带插件 id');
+});
+
+test('★ 密钥字段留空表示保持原值，不能当清空提交', () => {
+  // 真踩到的坑：留空提交会把已保存的令牌抹掉，用户下次启动就连不上了。
+  const src = read('ui/src/views/plugins.mjs');
+  const i = src.indexOf('function collectForm');
+  const block = src.slice(i, i + 1400);
+  assert.match(block, /spec\.secret === true/, '要单独处理密钥');
+  assert.match(block, /String\(raw\) !== ''/, '留空不提交');
+  assert.match(block, /secrets\[key\]/, '密钥走 secrets 通道');
 });
 
 /* ------------------------------------------- 白名单编辑卡片 */

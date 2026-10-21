@@ -1,14 +1,18 @@
 /**
  * 前端启动 —— 原生 JS，无框架
  *
- * 九个页面，按「看 / 配 / 查」分成三组（见 PAGES 的 group 字段）：
+ * 页面按「看 / 配 / 查」分成三组（见 PAGES 的 group 字段）：
  *
- *   概览  数据总览 / 会话总览
- *   配置  模型设置 / 人格设置 / 工具记忆 / 插件设置 / 系统安全 / DSH 接入
+ *   概览  数据总览 / 会话总览 / 思考链路
+ *   配置  模型设置 / 人物设置 / 工具记忆 / 插件 / 系统安全
  *   记录  词元消耗 / 运行日志
  *
- * 分组不只是好看：9 个页面平铺在侧栏里，用户要一行行读完才知道
+ * 分组不只是好看：页面平铺在侧栏里，用户要一行行读完才知道
  * "我要改的东西在哪"。分组后「改配置」有固定的位置。
+ *
+ * 注意：**没有「DSH 接入」这一页**。DSH 已经是普通插件，
+ * 它的配置、启停、诊断全部在「插件」页里，由插件清单驱动。
+ * 这样再加一个插件不需要再往侧栏里塞一个入口。
  *
  * 每 2 秒拉一次快照（单一入口），不做每页面各自轮询。
  */
@@ -25,7 +29,6 @@ import { renderSecurity } from './views/security.mjs';
 import { renderLogs } from './views/logs.mjs';
 import { renderConfirmBar } from './views/confirm.mjs';
 import { renderModelSettings } from './views/model.mjs';
-import { renderDsh } from './views/dsh.mjs';
 import { renderUsage } from './views/usage.mjs';
 import { renderTools } from './views/tools.mjs';
 import { renderPlugins } from './views/plugins.mjs';
@@ -51,13 +54,51 @@ const PAGES = [
   { id: 'model', group: '配置', label: '模型设置', sub: '提供商、密钥、模型列表与能力探测', render: (s, ctx) => renderModelSettings(s, ctx.model) },
   { id: 'persona', group: '配置', label: '人物设置', sub: '人格 = 它是谁；角色 = 它在什么场景扮演什么', render: (s, ctx) => el('div', {}, [renderPersona(s, { persona: ctx.persona, role: ctx.role, tab: ctx.tab, onTab: ctx.onTab }), el('div', { class: 'spacer-12' }), renderBehaviorLayer()]) },
   { id: 'tools', group: '配置', label: '工具记忆', sub: 'L3 情境知识 / L4 任务与工具 / L5 输出契约', render: (s, ctx) => renderTools(s, ctx.tools) },
-  { id: 'plugins', group: '配置', label: '插件设置', sub: '已安装与已启用的插件', render: (s, ctx) => renderPlugins(s, ctx.plugins) },
+  { id: 'plugins', group: '配置', label: '插件设置', sub: '启用停用、配置、工具与诊断', render: (s, ctx) => renderPlugins(s, ctx.plugins) },
   { id: 'security', group: '配置', label: '系统安全', sub: '白名单、管理员与控制台凭证', render: (s, ctx) => renderSecurity(s, ctx.security) },
-  { id: 'dsh', group: '配置', label: 'DSH 接入', sub: '双向通道：审批推送到 QQ，QQ 下指令给 DSH', render: (s, ctx) => renderDsh(s, ctx.model) },
 
   { id: 'usage', group: '记录', label: '词元消耗', sub: '输入 / 输出、缓存命中与时间范围', render: (s, ctx) => renderUsage(s, ctx.usage) },
   { id: 'logs', group: '记录', label: '运行日志', sub: '工具调用历史与每次唤醒的消耗', render: (s, ctx) => renderLogs(s, ctx.logs) },
 ];
+
+/** 插件自带的专用页面（当前为空；将来由插件清单的 ui 字段驱动） */
+const pluginPages = [];
+
+/**
+ * 注册一个插件专用页面。
+ *
+ * 本次骨架**不真正加载**插件页面：先把这个边界留出来，证明"加页面"
+ * 不需要改导航代码。将来扫描插件清单的 ui 字段后调用它即可。
+ *
+ * 注意生效时机：侧栏是在模块加载时遍历 PAGES 建好的，所以这个函数
+ * 只对**导航重建之后**生效 —— 现在它连导航项都不会出现。别指望热加。
+ *
+ * @param {{ id: string, label: string, group?: string, sub?: string, render: (snap: any, ctx: any) => any }} def
+ * @returns {boolean} 是否注册成功（id 重复或参数非法返回 false）
+ */
+export function registerPluginPage(def) {
+  if (!def || typeof def.id !== 'string' || typeof def.render !== 'function') return false;
+  if (PAGES.some((p) => p.id === def.id)) return false;
+  const page = { group: '插件', sub: '', ...def };
+  pluginPages.push(page);
+  PAGES.push(page);
+  return true;
+}
+
+/**
+ * 插件动作的统一出口。
+ *
+ * 所有 `plugin.*` 都是写操作，成功后必须重新拉一次快照 ——
+ * 否则界面还显示旧状态，用户会以为没生效并重复点。
+ *
+ * @param {string} name
+ * @param {Record<string, any>} params
+ */
+async function callPlugin(name, params) {
+  const r = await action(name, params);
+  await pull();
+  return r;
+}
 
 /** 本地编辑态（不进 store，因为它不参与跨页渲染） */
 const local = {
@@ -1198,19 +1239,27 @@ function render() {
       persona: s.snapshot?.personaCards ?? { cards: [] },
     },
     plugins: {
-      state: s.snapshot?.plugins ?? { loaded: [], skipped: [], enabled: [] },
-      onToggle: async (name, on) => {
-        const cur = s.snapshot?.plugins?.enabled ?? [];
-        const next = on ? [...new Set([...cur, name])] : cur.filter((x) => x !== name);
-        const r = await setting('plugins.enabled', next);
-        await pull();
-        return r;
-      },
+      /*
+       * 插件页要的东西全部来自快照，页面本身不认识任何具体插件。
+       *
+       * 这是骨架改造的关键：加一个插件、加一个配置项、加一个工具，
+       * 这个文件一个字都不用改。
+       */
+      items: s.snapshot?.plugins?.items ?? [],
+      stats: s.snapshot?.plugins?.stats ?? { total: 0, ready: 0, error: 0, disabled: 0 },
+      dirs: s.snapshot?.plugins?.dirs ?? {},
+      allowDangerous: s.snapshot?.plugins?.allowDangerous === true,
+      onToggle: (id, on) => callPlugin(on ? 'plugin.enable' : 'plugin.disable', { id }),
+      onSaveConfig: (id, config, secrets) =>
+        callPlugin('plugin.saveConfig', { id, config, secrets }),
+      onTest: (id) => callPlugin('plugin.test', { id }),
+      onReload: (id) => callPlugin('plugin.reload', { id }),
+      onRescan: () => callPlugin('plugin.rescan', {}),
       /**
        * 危险权限开关。
        *
-       * 和 onToggle 走同一条 setting 通道，只是键不同 —— 后端会重新加载
-       * 插件面，所以点完立刻生效，不用重启。
+       * 它改的是 `plugins.allowDangerous`，属于配置而不是插件动作，
+       * 所以仍走 setting 通道；后端会在下次插件加载时生效。
        */
       onDangerous: (on) =>
         withPaintLock(async () => {
@@ -1218,6 +1267,7 @@ function render() {
           await pull();
           return r;
         }),
+      rerender: () => render(),
     },
     security: {
       onSaveSetting: async (k, v) => {

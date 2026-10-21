@@ -105,7 +105,15 @@ const local = {
     collapsed: false,
     days: 1,
     before: null,
-    filter: 'all',
+    /**
+     * 左栏选中的会话。
+     *
+     * 空串 = 「全部会话」。不用 null：它要原样塞进快照查询里，
+     * 而空串在 JSON 里比 null 更不容易被 midway 的判空逻辑吞掉。
+     */
+    convKey: '',
+    /** 正在等你点「确认删除」的日期（null = 没有待确认的） */
+    pendingDelete: null,
     /** @type {Set<string>} */
     expanded: new Set(),
     /** @type {Set<string>} */
@@ -198,6 +206,44 @@ function setThinkCollapsed(collapsed) {
 function refreshThinkOnly() {
   paintThinkPanel(getState());
   syncThinkToggle();
+}
+
+/**
+ * 删除某一天的思考记录。
+ *
+ * ## 为什么删完必须 pull(true)
+ *
+ * 快照指纹只看内容。删掉一天之后，如果那一天正好不在当前页
+ * （比如翻到了第 2 页），新快照的内容和旧的一模一样 → 指纹相同 →
+ * 跳过重绘 → 用户觉得"点了没反应"。force 就是让这一帧无论如何都落下去。
+ *
+ * ## 为什么失败要说清楚
+ *
+ * 删除失败最常见的原因是文件被占用（另一个进程正开着它）。
+ * 只说"删除失败"用户只能反复点；带上后端 message 才知道去关什么。
+ *
+ * @param {string} date `YYYY-MM-DD`
+ */
+async function deleteThinkDay(date) {
+  if (typeof date !== 'string' || !date) return;
+  try {
+    const res = await action('thinking.clear', { date });
+    if (res?.ok) {
+      toast(res.removed > 0 ? `已删除 ${date} 的 ${res.removed} 条记录` : `${date} 已经没有记录了`);
+      // 删掉的这天若正好被折叠过，把残留状态清掉，免得下次同一天再出现时是折着的
+      if (local.think.closedDays instanceof Set) local.think.closedDays.delete(date);
+      void pull(true);
+      return;
+    }
+    toast(res?.message ? `删除失败：${res.message}` : '删除失败，后端没有说明原因');
+  } catch (error) {
+    toast(`删除失败：${String(error?.message ?? error)}`);
+  }
+  /*
+   * 失败时也要重绘：确认条已经退出（pendingDelete 在调用前就清空了），
+   * 不重绘的话那个"确认删除 / 取消"还挂在屏幕上，看着像删成功了。
+   */
+  refreshThinkOnly();
 }
 
 /**
@@ -305,29 +351,63 @@ function paintThinkPanel(state) {
    * 面板里的正文是可聚焦的（tabindex=0），重建会把焦点节点一起丢掉。
    * 不恢复的话，键盘用户按一次回车展开、焦点就掉回 body，
    * 再按 Tab 要重新从侧栏走一遍 —— 用起来非常难受。
+   *
+   * 左栏的会话按钮同理：点一下左栏、两秒后焦点丢了，
+   * 之后就再也用不了方向键在会话之间移动。
    */
   const active = document.activeElement;
   const focusKey =
     active instanceof HTMLElement && thinkPanel.contains(active)
-      ? (active.dataset?.thinkKey ?? (active.dataset?.thinkDay ? `day:${active.dataset.thinkDay}` : ''))
+      ? focusSelectorOf(active)
       : '';
 
   clear(thinkPanel);
   thinkPanel.classList.toggle('is-collapsed', local.think.collapsed === true);
 
   const node = renderThinkingPanel(state.snapshot, {
-    currentConv: currentConvOf(state),
+    // 左栏选中哪个会话，由 local 决定；右栏只按它过滤
     ui: local.think,
     onCollapse: (v) => setThinkCollapsed(v),
-    onFilter: (f) => {
-      local.think.filter = f;
+    /*
+     * 切换会话：只改筛选，不重新拉快照。
+     *
+     * 快照里已经是"全部会话"的完整数据，前端过滤即可 —— 没有网络往返，
+     * 切换是瞬时的。只有翻页（before）必须走后端，因为分页是后端算的。
+     *
+     * 这里要清掉 before：翻到第 2 页的游标是**上一个会话**的，
+     * 换会话后它必然对不上。清掉之后就回到最新一页，符合直觉。
+     */
+    onSelectConv: (convKey) => {
+      const next = typeof convKey === 'string' ? convKey : '';
+      if (local.think.convKey === next) return;
+      local.think.convKey = next;
       local.think.before = null;
-      // force：筛选条件变了但结果可能一模一样，指纹相同会跳过重绘 → 点了没反应
+      local.think.pendingDelete = null;
+      /*
+       * force 重绘：切换会话后 days 可能**内容完全相同**
+       * （比如两个会话在同一个页面里都有记录），
+       * 指纹一样就会跳过重绘，表现为"点了左栏没反应"。
+       */
       void pull(true);
     },
     onDays: (days) => { local.think.days = days; local.think.before = null; void pull(true); },
     onOlder: (before) => { local.think.before = before; void pull(true); },
     onLatest: () => { local.think.before = null; void pull(true); },
+    /*
+     * 删除某一天：两段式。
+     *
+     * onAskDelete(date) 只是把这一天标成"待确认"，不碰后端；
+     * onDeleteDay(date) 才真删。中间的状态放在 local 里，
+     * 所以 2 秒一次的轮询重绘不会把确认态冲掉。
+     */
+    onAskDelete: (date) => {
+      local.think.pendingDelete = typeof date === 'string' && date ? date : null;
+      refreshThinkOnly();
+    },
+    onDeleteDay: (date) => {
+      local.think.pendingDelete = null;
+      void deleteThinkDay(date);
+    },
     onToggleStep: (key) => {
       if (!(local.think.expanded instanceof Set)) local.think.expanded = new Set();
       if (local.think.expanded.has(key)) local.think.expanded.delete(key);
@@ -378,7 +458,7 @@ function paintThinkPanel(state) {
   }
 
   if (focusKey) {
-    const again = next?.querySelector(`[data-think-key="${cssEscape(focusKey)}"]`);
+    const again = next?.querySelector(focusKey);
     again?.focus?.();
   }
 
@@ -386,6 +466,34 @@ function paintThinkPanel(state) {
   // 误用上一次的位置，表现成"点展开后滚到别处去"
   capturedThinkScroll = null;
   capturedShell = null;
+}
+
+/**
+ * 把一个"重建后要找回来的元素"翻译成 CSS 选择器。
+ *
+ * 左栏会话、步骤正文、日期折叠头三处都可聚焦，重建后都要能把焦点还回去。
+ * 以前只认 `data-think-key` 和 `data-think-day`，加上左栏之后分支变多，
+ * 索性集中到这里 —— 少一处手写选择器，就少一次漏转义。
+ *
+ * 注意 `#` 和 `:` 必须转义：步骤 key 形如 `<at>#<convKey>#<n>`，
+ * 不转义会被选择器当成 id / 伪类解析，轻则匹配不到，重则抛错。
+ *
+ * @param {HTMLElement} node
+ * @returns {string} 空串表示"这个元素不需要找回焦点"
+ */
+function focusSelectorOf(node) {
+  const dataset = node.dataset ?? {};
+  if (typeof dataset.thinkKey === 'string' && dataset.thinkKey) {
+    return `[data-think-key="${cssEscape(dataset.thinkKey)}"]`;
+  }
+  if (typeof dataset.thinkDay === 'string' && dataset.thinkDay) {
+    return `[data-think-day="${cssEscape(dataset.thinkDay)}"]`;
+  }
+  if (typeof dataset.thinkConv === 'string') {
+    // 空串是「全部会话」那一项，也要能找回焦点
+    return `[data-think-conv="${cssEscape(dataset.thinkConv)}"]`;
+  }
+  return '';
 }
 
 /**
@@ -576,9 +684,35 @@ async function pull(force = true) {
   polling = true;
   try {
     const snap = await snapshot(snapshotQuery({
-      convKey: local.think.filter === 'current' ? currentConvOf(getState()) || null : null,
+      /*
+       * 选中的会话要传给后端，不能只在前端过滤。
+       *
+       * 原因：`view()` 的 `limit` 截的是"最近 N 条"，默认 50。如果只在前端筛，
+       * 用户点开一个**只有旧记录**的会话（它的记录排在这 50 条之外）时，
+       * 右栏会显示"暂无思考记录"，而左栏明明写着"5 回合 12 步" —— 自相矛盾。
+       * 传下去之后，这一页就是按该会话重新算的，翻页、hasMore 也都对得上。
+       *
+       * 左栏不受影响：`conversations` 是后端按**全部留存数据**算的，
+       * 不随 convKey 收窄（那才叫目录）。
+       *
+       * 游标安全性：切换会话时前端已经把 before 清空（见 onSelectConv），
+       * 所以不会拿上一个会话的游标来用；即使真串了，view() 也只是
+       * 忽略游标、退回第一页并置 cursorIgnored，不会再让整份快照失败。
+       */
+      convKey: local.think.convKey || null,
       days: local.think.days, before: local.think.before,
     }));
+    /*
+     * 后端说游标被丢了（损坏 / 口径不一致）→ 把前端游标也复位。
+     *
+     * 不复位的话界面会一直带着那个坏游标去请求，每次都被忽略、
+     * 却仍然显示"更早记录"可用，用户点了没反应。
+     */
+    if (snap?.thinking?.cursorIgnored && local.think.before) {
+      local.think.before = null;
+      pullAgain = true;
+      pullAgainForce = true;
+    }
     // Full journal aggregation is cached separately; do not rescan it every two seconds.
     if (!snap.booting && (!local.usageData || Date.now() - local.usageLoadedAt > 30000)) await loadUsage();
     if (snap.usage && local.usageData) snap.usage.range = local.usageData;

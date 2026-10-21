@@ -896,6 +896,80 @@ function toolPolicy() {
 
 /** stdio JSON-RPC：请求带 id，响应按 id 关联；后端可主动 push 事件 */
 const rpc = {
+  /**
+   * 形状合法的空思考视图。
+   *
+   * 「启动中」「算不出来」「没有记录」三种情况都走它：前端只按形状取值，
+   * 少一个字段就得在每个渲染点写判空 —— 那才是最容易漏的地方。
+   *
+   * @returns {object}
+   */
+  emptyThinkingView() {
+    return {
+      days: [],
+      total: 0,
+      entryCount: 0,
+      stepCount: 0,
+      hasMore: false,
+      nextBefore: null,
+      nextBeforeDate: null,
+      cursorIgnored: false,
+      conversations: [],
+      dayKeys: [],
+      lastError: null,
+      retentionDays: thinkingStore?.maxDays ?? 30,
+    };
+  },
+
+  /**
+   * `YYYY-MM-DD` 形状 + 真实存在的日期。
+   *
+   * 只用正则不够：`2026-13-45` 也能过正则，但它会被当成文件名写下去，
+   * 而用户以为删的是"某一天"。所以再让 Date 校验一遍回读是否一致。
+   *
+   * @param {string} date
+   * @returns {boolean}
+   */
+  isDayKey(date) {
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+    const [y, m, d] = date.split('-').map(Number);
+    const probe = new Date(y, m - 1, d);
+    return probe.getFullYear() === y && probe.getMonth() === m - 1 && probe.getDate() === d;
+  },
+
+  /**
+   * 取思考视图，**永不抛错**。
+   *
+   * 它是纯展示数据：磁盘满、字段脏、游标坏了都只该让这一块空着，
+   * 不该把整份快照（连接状态、消息、待确认项）一起拖垮。
+   * 这也是修「新思考链路拉取失败」的第二道保险（第一道在
+   * thinking.mjs 的 view() 里：游标坏了不再抛错）。
+   *
+   * 出错时记一行 warn —— 否则"面板一直是空的"会非常难查，因为它不报错。
+   *
+   * @param {any} query 界面传来的 thinking 参数
+   * @returns {object}
+   */
+  thinkingView(query) {
+    try {
+      return thinkingStore.view({
+        convKey: query?.convKey ? String(query.convKey) : null,
+        days: 1,
+        limit: 50,
+        ...(query && typeof query === 'object' ? query : {}),
+      });
+    } catch (err) {
+      /*
+       * 这里不能假设 log 一定有 warn：测试里的 dispatcher 注入的 log
+       * 只有 info。降级路径本身绝不能再抛第二次错。
+       */
+      const note = String(/** @type {any} */ (err)?.message ?? err);
+      if (typeof log?.warn === 'function') log.warn('思考视图计算失败（不影响其他数据）', { message: note });
+      else if (typeof log?.info === 'function') log.info('思考视图计算失败（不影响其他数据）', { message: note });
+      return { ...rpc.emptyThinkingView(), lastError: '思考视图计算失败，本次未显示历史' };
+    }
+  },
+
   /** @param {string} method @param {object} params @returns {Promise<any>} */
   async handle(method, params) {
     switch (method) {
@@ -916,7 +990,7 @@ const rpc = {
             lastError,
             booting: true,
             // 形状与正常快照一致：界面不必为"启动中"再写一条分支
-            thinking: { days: [], total: 0 },
+            thinking: rpc.emptyThinkingView(),
           };
         }
         return {
@@ -944,7 +1018,9 @@ const rpc = {
            *
            * 形状被前端锁定，改之前先对齐：
            *   { days: [{ date, entries: [{ at, convKey, steps: [
-           *              { n, reasoning, tools, answerPreview } ] }] }], total }
+           *              { n, reasoning, tools, answerPreview } ] }] }], total,
+           *     conversations: [{ convKey, entries, steps, lastAt, firstAt }],
+           *     dayKeys: string[], cursorIgnored: boolean }
            *
            * 默认给"全部会话"——后端不知道界面当前在看哪个会话，
            * 而多给不会出错、少给会让面板空着。界面若要只看当前会话，
@@ -952,13 +1028,13 @@ const rpc = {
            *
            * 每次快照都现算一份拷贝：界面拿到的是快照时刻的视图，
            * 不会因为后续 record() 而在手里悄悄变。
+           *
+           * **整段包 try/catch**：思考链路是纯展示数据，它算不出来绝不能
+           * 让整份快照失败 —— 那样用户会连消息列表、连接状态一起看不到，
+           * 症状是「界面拉取失败」，而真正的问题只在一个可选面板上。
+           * 失败时给一个形状合法的空视图，界面照常渲染。
            */
-          thinking: thinkingStore.view({
-            convKey: params?.convKey ? String(params.convKey) : null,
-            days: 1,
-            limit: 50,
-            ...(params?.thinking ?? {}),
-          }),
+          thinking: rpc.thinkingView(params?.thinking),
           config: publicConfig(),
           lastError,
           brain: {
@@ -997,7 +1073,7 @@ const rpc = {
         const name = params?.name;
         const arg = params?.params ?? {};
         if (name === 'usage.query') return { ok: true, range: await usageLedger.range(arg) };
-        if (name === 'thinking.query') return { ok: true, ...thinkingStore.view(arg) };
+        if (name === 'thinking.query') return { ok: true, ...rpc.thinkingView(arg) };
         if (name === 'persona.setDefault') return personaStore.setDefault(arg.id);
         if (name === 'role.setDefault') return roleStore.setDefault(arg.id);
 
@@ -1048,9 +1124,18 @@ const rpc = {
          *
          * 没有做 `thinking.clearAll`：那是一条不可撤销的批量删除，
          * 而它的价值（省一次点击）远小于误触的代价。
+         *
+         * 但「删某一天」必须有 —— 思考记录里可能混进不想留的内容
+         * （发错群、试模型时的胡话），而用户只能按天删。
+         * 拒绝空日期 / 非法日期：`clearDay()` 的默认值是"今天"，
+         * 界面传个空字符串过来就会静默删掉今天的记录，太像一个陷阱。
          */
         if (name === 'thinking.clear') {
-          const r = await thinkingStore.clearDay(arg?.date);
+          const date = typeof arg?.date === 'string' ? arg.date.trim() : '';
+          if (!rpc.isDayKey(date)) {
+            return { ok: false, code: 'E4010', message: '要删除哪一天？日期必须是 YYYY-MM-DD' };
+          }
+          const r = await thinkingStore.clearDay(date);
           log.info('思考记录已清空', { date: r.date, removed: r.removed });
           return { ok: true, date: r.date, removed: r.removed };
         }

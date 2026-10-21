@@ -53,6 +53,22 @@ function storeAt(opts) {
   });
 }
 
+/** 空视图的完整形状。集中一处，加字段时只改这里，不必追着每个断言跑。 */
+const EMPTY_VIEW = {
+  days: [],
+  total: 0,
+  entryCount: 0,
+  stepCount: 0,
+  hasMore: false,
+  nextBefore: null,
+  nextBeforeDate: null,
+  cursorIgnored: false,
+  conversations: [],
+  dayKeys: [],
+  lastError: null,
+  retentionDays: 30,
+};
+
 /** @param {string} dir */
 async function files(dir) {
   try {
@@ -171,7 +187,7 @@ test('降级：没有 reasoning 时不记录、不建空文件', async () => {
 
   await store.flush();
   assert.deepEqual(await files(dir), [], '不该留下任何文件');
-  assert.deepEqual(store.view({ days: 1, limit: 50 }), { days: [], total: 0, entryCount: 0, stepCount: 0, hasMore: false, nextBefore: null, nextBeforeDate: null, lastError: null, retentionDays: 30 });
+  assert.deepEqual(store.view({ days: 1, limit: 50 }), EMPTY_VIEW);
 });
 
 /* ---------------------------------------------------------------- 按日分文件 */
@@ -281,6 +297,164 @@ test('视图：返回的是拷贝，改它不会污染内存', async () => {
   assert.equal(again.days[0].entries[0].steps[0].reasoning, '原始');
   assert.deepEqual(again.days[0].entries[0].steps[0].tools, []);
 });
+
+/* ---------------------------------------------------------------- 落盘不丢数据 */
+
+test('★ 写盘期间新增的记录不会被静默丢掉（历史未保存的根因）', async () => {
+  /*
+   * 旧实现的 #doFlush 是「序列化 → await 写盘 → 无条件 dirty.delete(date)」。
+   * 写盘是真异步 IO，期间完全可能有 record() 落到同一天，于是那条
+   * **没被序列化进去**的记录被一起当成"已保存"，此后只在内存里活到退出。
+   *
+   * 这里用"边记边 flush"把这个窗口撑开：修复前实测 200 条只落盘 30 多条。
+   */
+  const dir = await tmpDir();
+  const now = new Date(2026, 9, 19, 12, 0, 0).getTime();
+  const store = storeAt({ dir, now });
+
+  for (let i = 0; i < 120; i += 1) {
+    store.record({ convKey: 'group:1', at: now + i, steps: [{ n: 1, reasoning: `r${i}` }] });
+    // 每记几条就踢一次 flush，让"写盘进行中"与"继续记录"重叠
+    if (i % 3 === 0) void store.flush();
+    await new Promise((r) => setImmediate(r));
+  }
+  await store.flush();
+  // 防抖计时器排的那次也收一下，确保所有 dirty 都落地
+  await store.flush();
+
+  const mem = store.view({ days: 1, limit: 9999 }).total;
+  assert.equal(mem, 120, '内存里应有 120 条');
+
+  const day = await readJson(dir, '2026-10-19.json');
+  assert.equal(day.entries.length, 120, `落盘必须一条不少，实际 ${day.entries.length}`);
+  const texts = day.entries.map((e) => e.steps[0].reasoning);
+  assert.equal(new Set(texts).size, 120, '不能有重复或丢号');
+});
+
+test('★ 写盘失败时保留 dirty，恢复后能补写上去', async () => {
+  const dir = await tmpDir();
+  const at = new Date(2026, 9, 19, 12, 0, 0).getTime();
+  const store = storeAt({ dir, now: at });
+  store.record({ convKey: 'group:1', at, steps: [{ n: 1, reasoning: '要保住的' }] });
+
+  // 把目标文件位置占成一个目录：写入必然失败
+  await fs.mkdir(store.dir, { recursive: true });
+  await fs.mkdir(path.join(dir, '2026-10-19.json'), { recursive: true });
+
+  const first = await store.flush();
+  assert.equal(first.written, 0, '第一次写不进去');
+  assert.ok(store.lastError, '错误要留痕，不能静默');
+
+  // 清掉障碍，再 flush 一次应当补上
+  await fs.rmdir(path.join(dir, '2026-10-19.json'));
+  await store.flush();
+  /*
+   * 不清 dirty 的意义就在这里：写失败的那一天必须留在队列里，
+   * 否则这一条记录只活在内存里，重启即消失。
+   * 防抖计时器可能已经抢先补写过一次，所以这里只看**最终结果**，
+   * 不假设是哪一次调用写成功的。
+   */
+  const day = await readJson(dir, '2026-10-19.json');
+  assert.equal(day.entries.length, 1);
+  assert.equal(day.entries[0].steps[0].reasoning, '要保住的');
+});
+
+test('★ 记录后自动落盘：不显式 flush 也能在防抖窗口后写进磁盘', async () => {
+  const dir = await tmpDir();
+  const at = new Date(2026, 9, 19, 12, 0, 0).getTime();
+  const store = storeAt({ dir, now: at });
+  store.record({ convKey: 'group:1', at, steps: [{ n: 1, reasoning: '自动落盘' }] });
+
+  // 等过防抖窗口（FLUSH_DEBOUNCE_MS=400），不主动调用 flush
+  await new Promise((r) => setTimeout(r, 900));
+  const day = await readJson(dir, '2026-10-19.json');
+  assert.equal(day.entries[0].steps[0].reasoning, '自动落盘');
+});
+
+/* ---------------------------------------------------------------- 分页游标容错 */
+
+test('★ 游标坏了只退回第一页，不许抛错（它曾让整份快照失败）', () => {
+  const dir = 'C:/tmp/unused';
+  const store = storeAt({ dir, now: Date.now() });
+  store.record({ convKey: 'group:1', at: Date.now(), steps: [{ n: 1, reasoning: 'x' }] });
+
+  // 三种坏游标：非 base64、解出来不是 JSON、JSON 里字段非法
+  for (const bad of ['!!!not base64!!!', Buffer.from('not json').toString('base64url'), Buffer.from('{"end":"x"}').toString('base64url')]) {
+    const v = store.view({ days: 1, limit: 10, before: bad });
+    assert.equal(v.cursorIgnored, true, `坏游标 ${bad.slice(0, 12)} 应被忽略`);
+    assert.equal(v.days.length, 1, '要退回第一页，而不是空视图');
+  }
+});
+
+test('★ 游标与当前筛选不匹配时也退回第一页（切「当前会话」必然发生）', () => {
+  const dir = 'C:/tmp/unused';
+  const now = Date.now();
+  const store = storeAt({ dir, now });
+  store.record({ convKey: 'group:1', at: now, steps: [{ n: 1, reasoning: 'a' }] });
+  store.record({ convKey: 'group:1', at: now + 1, steps: [{ n: 1, reasoning: 'b' }] });
+  store.record({ convKey: 'group:1', at: now + 2, steps: [{ n: 1, reasoning: 'c' }] });
+
+  // 「全部会话」翻页拿到的游标里 convKey 是 null
+  const page1 = store.view({ days: 1, limit: 2 });
+  assert.equal(page1.hasMore, true);
+  assert.ok(page1.nextBefore);
+
+  // 用户切到「当前会话」，游标还是旧的 → 不能抛
+  const page2 = store.view({ convKey: 'group:1', days: 1, limit: 2, before: page1.nextBefore });
+  assert.equal(page2.cursorIgnored, true);
+  assert.equal(page2.days.flatMap((d) => d.entries).length, 2, '退回第一页');
+});
+
+/* ---------------------------------------------------------------- 会话索引 */
+
+test('会话索引：不受分页影响，按最近记录倒序，带条数与步数', () => {
+  const dir = 'C:/tmp/unused';
+  const now = new Date(2026, 9, 19, 12, 0, 0).getTime();
+  const store = storeAt({ dir, now });
+
+  // 甲：1 条 2 步（较旧）；乙：2 条 1 步（较新）
+  store.record({ convKey: 'group:1', at: now - 5000, steps: [{ n: 1, reasoning: 'a1' }, { n: 2, reasoning: 'a2' }] });
+  store.record({ convKey: 'private:2', at: now - 1000, steps: [{ n: 1, reasoning: 'b1' }] });
+  store.record({ convKey: 'private:2', at: now, steps: [{ n: 1, reasoning: 'b2' }] });
+
+  // 故意只取 1 条：索引仍应是完整的两个会话（它是"目录"，不能被分页裁掉）
+  const v = store.view({ days: 1, limit: 1 });
+  assert.equal(v.entryCount, 1, '这一页只有 1 条');
+  assert.equal(v.conversations.length, 2, '目录里两个会话都在');
+
+  assert.deepEqual(v.conversations.map((c) => c.convKey), ['private:2', 'group:1'], '最近有记录的在前');
+  const g = v.conversations.find((c) => c.convKey === 'group:1');
+  assert.equal(g.entries, 1);
+  assert.equal(g.steps, 2, '步数要单独给：一条记录可能含多步');
+});
+
+test('会话索引：dayKeys 列出所有有数据的日期（升序）', () => {
+  const dir = 'C:/tmp/unused';
+  const base = new Date(2026, 9, 17, 12, 0, 0).getTime();
+  const store = storeAt({ dir, now: base + 2 * 86400000 });
+  for (let d = 0; d < 3; d += 1) {
+    store.record({ convKey: 'group:1', at: base + d * 86400000, steps: [{ n: 1, reasoning: `d${d}` }] });
+  }
+  assert.deepEqual(store.view({ days: 1 }).dayKeys, ['2026-10-17', '2026-10-18', '2026-10-19']);
+});
+
+test('删某一天：只影响那一天，且从会话索引里一起消失', async () => {
+  const dir = await tmpDir();
+  const base = new Date(2026, 9, 18, 12, 0, 0).getTime();
+  const store = storeAt({ dir, now: base + 86400000 });
+
+  store.record({ convKey: 'group:1', at: base, steps: [{ n: 1, reasoning: '前一天' }] });
+  store.record({ convKey: 'group:1', at: base + 86400000, steps: [{ n: 1, reasoning: '当天' }] });
+  await store.flush();
+
+  const r = await store.clearDay('2026-10-18');
+  assert.equal(r.removed, 1);
+  const v = store.view({ days: 7 });
+  assert.deepEqual(v.days.map((d) => d.date), ['2026-10-19']);
+  assert.deepEqual(v.dayKeys, ['2026-10-19']);
+  assert.equal(v.conversations.find((c) => c.convKey === 'group:1').entries, 1);
+});
+
 
 /* ---------------------------------------------------------------- 条数上限 */
 
@@ -407,7 +581,7 @@ test('原子写入：目录里已有的 .tmp 垃圾不会被当成数据读', as
   const store = storeAt({ dir, now });
   const r = await store.load();
   assert.equal(r.loaded, 0);
-  assert.deepEqual(store.view({ days: 1, limit: 10 }), { days: [], total: 0, entryCount: 0, stepCount: 0, hasMore: false, nextBefore: null, nextBeforeDate: null, lastError: null, retentionDays: 30 });
+  assert.deepEqual(store.view({ days: 1, limit: 10 }), EMPTY_VIEW);
 });
 
 /* ---------------------------------------------------------------- 8MB 上限 */

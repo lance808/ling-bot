@@ -26,3 +26,38 @@ test('DSH validation rejects before persistence; runtime stop/start follows pers
  const r=await rpc.handle('setting',{key:'dsh.config',value});assert.equal(r.applied,true);assert.deepEqual(order,['persist','stop','start']);assert.equal(context.config.dsh.token,'fictional-token');
  mod.startBridge=async()=>({ok:false});const failed=await rpc.handle('setting',{key:'dsh.config',value});assert.equal(failed.ok,true);assert.equal(failed.applied,false);assert.equal(failed.restartRequired,true);
 });
+
+/* -------------------------------------------------- 思考链路：删除与容错 */
+
+test('thinking.clear 必须给出明确日期，绝不默认为"今天"',async()=>{
+ // clearDay() 的默认值是今天：界面传个空值过来就会静默删掉今天的记录。
+ // 所以这一层必须自己把关，不让空/畸形日期流到 store。
+ const cleared=[];const {rpc}=await dispatcher({thinkingStore:{view:()=>({days:[],total:0}),clearDay:async d=>{cleared.push(d);return {date:d,removed:2};}}});
+ for (const bad of [undefined,{}, {date:''}, {date:'   '}, {date:'2026-13-45'}, {date:'今天'}]) {
+   const r=await rpc.handle('action',{name:'thinking.clear',params:bad});
+   assert.equal(r.ok,false,`${JSON.stringify(bad)} 不该被接受`);
+   assert.match(r.message,/YYYY-MM-DD/);
+ }
+ assert.deepEqual(cleared,[],'拒绝时一次都不该落到 store');
+ const ok=await rpc.handle('action',{name:'thinking.clear',params:{date:' 2026-10-19 '}});
+ assert.equal(ok.ok,true);assert.equal(ok.removed,2);
+ assert.deepEqual(cleared,['2026-10-19'],'日期要 trim 之后再交给 store');
+});
+
+test('思考视图算不出来时降级成空视图，不许让整个 RPC 抛错',async()=>{
+ // 这条守的是"新思考链路拉取失败"：view() 一旦抛错，
+ // 以前整个 snapshot 就 reject，用户连消息列表都看不到。
+ const {rpc}=await dispatcher({thinkingStore:{view:()=>{throw new Error('磁盘炸了');}}});
+ const v=rpc.thinkingView({days:1});
+ // vm 里返回的数组是另一个 realm 的，deepEqual 会因为原型不同而失败；
+ // 走一趟 JSON 才能在宿主 realm 里比较结构。
+ const plain=JSON.parse(JSON.stringify(v));
+ assert.deepEqual(plain.days,[]);
+ assert.equal(plain.total,0);
+ assert.match(plain.lastError,/计算失败/);
+ // 形状必须和正常视图一致，否则界面每个渲染点都要写判空
+ assert.deepEqual(plain.conversations,[]);
+ assert.deepEqual(plain.dayKeys,[]);
+ assert.equal(plain.hasMore,false);
+ assert.equal(typeof plain.retentionDays,'number');
+});

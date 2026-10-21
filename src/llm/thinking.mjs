@@ -103,6 +103,25 @@ export class ThinkingStore {
   /** 待落盘的日期 */
   /** @type {Set<string>} */
   #dirty = new Set();
+  /**
+   * 每个日期的修改版本号。
+   *
+   * ## 为什么必须有它（这里曾经真丢过数据）
+   *
+   * `#doFlush` 的形状是「先序列化 → await 写盘 → 清 dirty 标记」。写盘是
+   * 真正的异步 IO，期间完全可能有一次 `record()` 落到同一天上。旧写法
+   * 写完后无条件 `dirty.delete(date)`，于是那条**没被序列化进去**的新记录
+   * 被一起当成"已保存"——它此后只在内存里，直到进程退出都不会再碰磁盘。
+   *
+   * 实测能丢得很难看：并发 200 次记录只落盘 32 条，用户看到的是
+   * "思考链路里刚才明明有，重启就没了"。
+   *
+   * 所以记录写入带版本号：只有"写盘期间没有被改过"的日期才清 dirty，
+   * 被改过的留着，下一轮 flush 再写一次。
+   *
+   * @type {Map<string, number>}
+   */
+  #rev = new Map();
   /** @type {NodeJS.Timeout | null} */
   #timer = null;
   /** @type {Promise<any> | null} */
@@ -162,6 +181,7 @@ export class ThinkingStore {
 
     this.#days.clear();
     this.#dirty.clear();
+    this.#rev.clear();
     this.lastError = null;
     const cutoff = daysAgoKey(this.#now(), this.#maxDays - 1);
 
@@ -238,7 +258,7 @@ export class ThinkingStore {
     /** @type {{at: number, convKey: string, steps: object[]}} */
     const rec = { at, convKey, steps };
     day.entries.push(rec);
-    this.#dirty.add(date);
+    this.#markDirty(date);
     this.#scheduleFlush();
     return rec;
   }
@@ -248,10 +268,24 @@ export class ThinkingStore {
    *
    * 语义（前端依赖，改之前先对齐）：
    *   · `days` 按日期升序（旧 → 新），每天内部按 `at` 升序；
-   *   · `days: N` 取**最近 N 个有数据的日期**（不是"最近 N 个自然日"），
+   *   · `days` 取**最近 N 个有数据的日期**（不是"最近 N 个自然日"），
    *     这样刚过零点时不会看到一个空面板；
    *   · `limit` 截的是"最近的 N 条"，先截再按时间升序返回；
-   *   · `total` 是过滤后**所有留存天数**的条目总数，不受 days / limit 影响。
+   *   · `total` 是过滤后**所有留存天数**的条目总数，不受 days / limit 影响；
+   *   · `conversations` 是**不受分页/筛选影响**的全量会话索引，
+   *     供界面左栏列出"哪些群、哪些私聊有记录"。
+   *
+   * ## 游标坏了不许抛错（这里曾经让整条快照失败）
+   *
+   * 旧实现在游标解码失败或 convKey 不一致时直接 throw。而 `view()` 是在
+   * `rpc.handle('snapshot')` 里同步调的 —— 一次抛错等于**一份完整快照都拿不到**，
+   * 界面上表现成"新思考链路拉取失败"，连消息列表和连接状态一起冻住。
+   *
+   * 触发条件还很日常：用户先在「全部会话」翻了一页拿到游标，再切到
+   * 「当前会话」，旧游标带着 `convKey: null` 过来，必然不匹配。
+   *
+   * 所以游标只当作**提示**：认不出来就退回最新一页，并置 `cursorIgnored`
+   * 让界面把页码跳回第一页，而不是让整个界面白屏。
    *
    * 返回的是拷贝：调用方（界面快照）随便改都不会污染内存里的记录。
    *
@@ -266,9 +300,25 @@ export class ThinkingStore {
     let total = 0;
     /** @type {Array<{date: string, entries: object[]}>} */
     const perDay = [];
+    /*
+     * 会话索引：一次遍历顺手攒出来。
+     *
+     * 它必须基于**全部留存数据**，而不是这一页的内容 —— 左栏是"目录"，
+     * 目录不能因为翻到第 3 页就少几个会话。
+     */
+    /** @type {Map<string, {entries: number, steps: number, lastAt: number, firstAt: number}>} */
+    const convIndex = new Map();
     for (const date of [...this.#days.keys()].sort()) {
       const day = this.#days.get(date);
       if (!day) continue;
+      for (const entry of day.entries) {
+        const slot = convIndex.get(entry.convKey) ?? { entries: 0, steps: 0, lastAt: 0, firstAt: Infinity };
+        slot.entries += 1;
+        slot.steps += entry.steps.length;
+        slot.lastAt = Math.max(slot.lastAt, entry.at);
+        slot.firstAt = Math.min(slot.firstAt, entry.at);
+        convIndex.set(entry.convKey, slot);
+      }
       const entries = day.entries
         .filter((e) => !convKey || e.convKey === convKey)
         .slice()
@@ -276,13 +326,24 @@ export class ThinkingStore {
       total += entries.length;
       if (entries.length > 0) perDay.push({ date, entries });
     }
+
     const available = perDay.filter(d => !query.beforeDate || d.date < String(query.beforeDate));
+
+    /*
+     * 解游标：任何异常都退化成"第一页"，不往上抛。
+     * 前端会读 cursorIgnored 把页码复位，用户看到的只是"回到了最新一页"。
+     */
     let pageEnd = null;
+    let cursorIgnored = false;
     if (query.before) {
-      const cursor = JSON.parse(Buffer.from(String(query.before), 'base64url').toString());
-      if (cursor.convKey !== convKey || !Number.isSafeInteger(cursor.end) || cursor.end < 0) throw new Error('思考分页游标不匹配');
-      pageEnd = cursor.end;
+      const cursor = decodeCursor(query.before);
+      if (cursor && cursor.convKey === convKey) {
+        pageEnd = cursor.end;
+      } else {
+        cursorIgnored = true;
+      }
     }
+
     const picked = available;
     /** @type {Array<{date: string, entry: any}>} */
     const flat = [];
@@ -309,6 +370,19 @@ export class ThinkingStore {
       hasMore: start > 0,
       nextBefore: start > 0 ? Buffer.from(JSON.stringify({ convKey, end: start })).toString('base64url') : null,
       nextBeforeDate: start > 0 ? keep[0]?.date ?? null : null,
+      /** 游标被丢弃（损坏或与当前筛选不匹配）→ 界面应把页码复位 */
+      cursorIgnored,
+      /*
+       * 全量会话索引，按"最近有记录"倒序。
+       *
+       * 带上 entries / steps 两个计数：左栏要显示"几条思考"，
+       * 而一条记录可能含多步，直接给两个数比让前端自己加更省事。
+       */
+      conversations: [...convIndex.entries()]
+        .map(([key, v]) => ({ convKey: key, entries: v.entries, steps: v.steps, lastAt: v.lastAt, firstAt: v.firstAt }))
+        .sort((a, b) => b.lastAt - a.lastAt),
+      /** 所有有数据的日期（升序），供"删除某一天"确认与范围提示 */
+      dayKeys: [...this.#days.keys()].sort(),
       lastError: this.lastError ? '思考仓库读取或写入失败，历史可能不完整' : null,
       retentionDays: this.#maxDays,
     };
@@ -327,6 +401,8 @@ export class ThinkingStore {
 
     this.#days.delete(target);
     this.#dirty.delete(target);
+    // 版本号也要跟着作废：否则下次同一天再记录时，脏标记会和旧版本号对不上
+    this.#rev.set(target, this.#revOf(target) + 1);
     try {
       await fs.unlink(this.#file(target));
     } catch (err) {
@@ -375,6 +451,24 @@ export class ThinkingStore {
     return path.join(this.#dir, `${date}.json`);
   }
 
+  /**
+   * 标记某天待落盘，并把它的版本号 +1。
+   *
+   * 所有"内存里的这一天变了"的路径都必须走这里（record / clearDay 回滚），
+   * 否则版本号对不上，落盘会误判成"没变化"而跳过。
+   *
+   * @param {string} date
+   */
+  #markDirty(date) {
+    this.#dirty.add(date);
+    this.#rev.set(date, (this.#rev.get(date) ?? 0) + 1);
+  }
+
+  /** @param {string} date */
+  #revOf(date) {
+    return this.#rev.get(date) ?? 0;
+  }
+
   /** 排一次防抖落盘；已经排了就不重复排 */
   #scheduleFlush() {
     if (this.#timer) return;
@@ -403,8 +497,13 @@ export class ThinkingStore {
     result.removed += await this.#pruneExpired();
 
     // 2) 序列化待写内容，算清楚"写完会占多大"
+    //
+    //    **版本号必须和文本一起记下来**：写盘是异步的，等它回来时
+    //    这一天可能已经被追加过新记录，那时就不能清 dirty（见 #rev 的注释）。
     /** @type {Map<string, string>} */
     const payloads = new Map();
+    /** @type {Map<string, number>} 序列化时的版本号（date → rev） */
+    const written = new Map();
     for (const date of dates) {
       const day = this.#days.get(date);
       if (!day) {
@@ -412,6 +511,7 @@ export class ThinkingStore {
         continue;
       }
       payloads.set(date, serializeDay(day));
+      written.set(date, this.#revOf(date));
     }
     if (payloads.size === 0) return result;
 
@@ -422,7 +522,20 @@ export class ThinkingStore {
     for (const [date, text] of payloads) {
       try {
         await writeTextAtomic(this.#file(date), text);
-        this.#dirty.delete(date);
+        /*
+         * 只有"写盘期间这一天没再被改过"才清 dirty。
+         *
+         * 这里曾经是无条件 delete，于是写盘期间新 record 进来的那条
+         * 从未落盘（序列化时它还不存在，写完却被标成已保存）。
+         * 数据只在内存里活到进程退出 —— 表现为"历史未保存"。
+         */
+        if (this.#revOf(date) === written.get(date)) {
+          this.#dirty.delete(date);
+        } else {
+          // 还有没写进去的新内容：留着 dirty，让下一轮 flush 再写
+          result.rewritten = (result.rewritten ?? 0) + 1;
+          this.#scheduleFlush();
+        }
         result.written += 1;
       } catch (err) {
         // 保留 dirty 标记：下次 flush 会再试一次
@@ -643,6 +756,36 @@ function cloneEntry(entry) {
       answerPreview: s.answerPreview,
     })),
   };
+}
+
+/**
+ * 解一个分页游标。
+ *
+ * 游标是 `{convKey, end}` 的 base64url。**任何不合法的输入都返回 null**，
+ * 绝不抛错 —— 它来自界面，而界面状态可能是上一轮筛选留下的、
+ * 也可能被中途重启打断。解不开只应该"退回第一页"，不该让整份快照失败。
+ *
+ * @param {any} raw
+ * @returns {{convKey: string | null, end: number} | null}
+ */
+function decodeCursor(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  let text;
+  try {
+    text = Buffer.from(raw, 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+  let cursor;
+  try {
+    cursor = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!cursor || typeof cursor !== 'object') return null;
+  const convKey = typeof cursor.convKey === 'string' && cursor.convKey ? cursor.convKey : null;
+  if (!Number.isSafeInteger(cursor.end) || cursor.end < 0) return null;
+  return { convKey, end: cursor.end };
 }
 
 /**

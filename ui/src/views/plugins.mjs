@@ -550,10 +550,63 @@ function configField(item, spec) {
            * 什么都不会显示 —— 用户点了「生成」看到框里还是空的。
            */
           input.value = token;
+          // 生成完立刻把明文露出来，否则 password 框里全是圆点，
+          // 用户没法确认生成成功，更没法抄到 DSH 侧去填。
+          input.type = 'text';
+          showBtn.textContent = '隐藏';
           markDirty();
         },
       });
-      control = el('div', { class: 'row' }, [input, gen]);
+
+      /*
+       * 「显示 / 复制」是**同一个令牌唯一的取用路径**。
+       *
+       * 为什么必须有：令牌存在保险箱里，后端 `toView()` 对 secret 字段
+       * 一律返回空值（只给 hasSecret 标记），保存后输入框就被清空。
+       * 于是用户点「生成」→ 保存 → 想去 DSH 侧填同一份 → **明文已经没了**，
+       * 只能重新生成一个（这会让 DSH 侧那份立刻失效）。
+       * 这不是"复制粘贴不好用"，是根本没地方拿到值。
+       */
+      const showBtn = el('button', {
+        type: 'button',
+        class: 'btn btn-sm',
+        text: '显示',
+        onclick: () => {
+          // 值可能来自草稿（刚生成/刚输入），也可能来自已保存的快照
+          const v = draftKey in ui.draft ? ui.draft[draftKey] : '';
+          if (!v) {
+            setFieldToast(
+              '没有可复制的值：已保存的令牌出于安全不会回显。重新生成一个，或直接把 DSH 侧那份粘贴到这里。',
+              false,
+            );
+            return;
+          }
+          if (input.type === 'password') {
+            input.type = 'text';
+            showBtn.textContent = '隐藏';
+          } else {
+            input.type = 'password';
+            showBtn.textContent = '显示';
+          }
+        },
+      });
+
+      const copyBtn = el('button', {
+        type: 'button',
+        class: 'btn btn-sm',
+        text: '复制',
+        onclick: async () => {
+          const v = draftKey in ui.draft ? String(ui.draft[draftKey] ?? '') : '';
+          if (!v) {
+            setFieldToast('没有可复制的值，先点「生成」或粘贴一份。', false);
+            return;
+          }
+          const ok = await copyText(v);
+          setFieldToast(ok ? '令牌已复制，去 DSH 侧粘贴。' : '复制失败，请点「显示」后手动选中。', ok);
+        },
+      });
+
+      control = el('div', { class: 'row' }, [input, gen, showBtn, copyBtn]);
     }
   }
 
@@ -916,6 +969,61 @@ function localStamp(at) {
   const d = new Date(ms);
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * 复制一段文本到剪贴板。
+ *
+ * 为什么要两条路径：`navigator.clipboard` 需要**安全上下文**（https 或
+ * localhost）。这个界面是 http://127.0.0.1，属于安全上下文，正常可用；
+ * 但在某些 WebView 里权限被拒（返回 rejected promise 或 undefined）。
+ * 那时候退回到 `execCommand('copy')` —— 虽然已废弃，但它是唯一还能用的兜底，
+ * 总比让用户对着一个圆点框干瞪眼好。
+ *
+ * @param {string} text
+ * @returns {Promise<boolean>}
+ */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* 落到下面的兜底 */
+  }
+
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    // 必须真的在文档里且可聚焦，否则 execCommand 不生效。
+    // 用 class 挪到视口外：CSP 的 style-src 'self' 会拦掉 inline style。
+    ta.setAttribute('readonly', '');
+    ta.className = 'clipboard-shim';
+    document.body.append(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 字段级的即时反馈。
+ *
+ * 复用页面级 toast 而不是自建一个浮层：插件页每次操作后都会整页重绘，
+ * 任何挂在字段上的临时提示都会被下一次重绘抹掉 —— 那才是"点了没反应"的根源。
+ *
+ * @param {string} message
+ * @param {boolean} ok
+ */
+function setFieldToast(message, ok) {
+  ui.toast = { ok, message };
+  ui.toastAt = Date.now();
+  lastCtx?.rerender?.();
 }
 
 /**

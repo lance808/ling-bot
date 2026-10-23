@@ -26,11 +26,14 @@ import { renderOverview } from './views/overview.mjs';
 import { renderSessions } from './views/sessions.mjs';
 import { renderPersona, renderBehaviorLayer } from './views/persona.mjs';
 import { renderSecurity } from './views/security.mjs';
+import { renderWake } from './views/wake.mjs';
+import { renderSilence } from './views/silence.mjs';
 import { renderLogs } from './views/logs.mjs';
 import { renderConfirmBar } from './views/confirm.mjs';
 import { renderModelSettings } from './views/model.mjs';
 import { renderUsage } from './views/usage.mjs';
-import { renderTools } from './views/tools.mjs';
+import { renderMemory } from './views/memory.mjs';
+import { renderToolCalls } from './views/tool-calls.mjs';
 import { renderPlugins } from './views/plugins.mjs';
 import { renderThinkingPanel } from './views/thinking.mjs';
 
@@ -53,9 +56,12 @@ const PAGES = [
 
   { id: 'model', group: '配置', label: '模型设置', sub: '提供商、密钥、模型列表与能力探测', render: (s, ctx) => renderModelSettings(s, ctx.model) },
   { id: 'persona', group: '配置', label: '人物设置', sub: '人格 = 它是谁；角色 = 它在什么场景扮演什么', render: (s, ctx) => el('div', {}, [renderPersona(s, { persona: ctx.persona, role: ctx.role, tab: ctx.tab, onTab: ctx.onTab }), el('div', { class: 'spacer-12' }), renderBehaviorLayer()]) },
-  { id: 'tools', group: '配置', label: '工具记忆', sub: 'L3 情境知识 / L4 任务与工具 / L5 输出契约', render: (s, ctx) => renderTools(s, ctx.tools) },
+  { id: 'memory', group: '配置', label: '记忆', sub: '情境知识、日记与淡忘、人格卡', render: (s, ctx) => renderMemory(s, { rerender: ctx.sessions?.rerender }) },
+  { id: 'tool-calls', group: '配置', label: '工具调用', sub: '它现在能做什么：注册的工具、可用来源与确认要求', render: (s, ctx) => renderToolCalls(s, ctx.tools) },
   { id: 'plugins', group: '配置', label: '插件设置', sub: '启用停用、配置、工具与诊断', render: (s, ctx) => renderPlugins(s, ctx.plugins) },
   { id: 'security', group: '配置', label: '系统安全', sub: '白名单、管理员与控制台凭证', render: (s, ctx) => renderSecurity(s, ctx.security) },
+  { id: 'wake', group: '配置', label: '唤醒设置', sub: '什么消息值得起一个回合，以及频率硬限', render: (s, ctx) => renderWake(s, { rerender: ctx.sessions?.rerender }) },
+  { id: 'silence', group: '配置', label: '静音', sub: '让它闭嘴：全局 / 按会话 / 时段 / 聊天指令', render: (s, ctx) => renderSilence(s, { rerender: ctx.sessions?.rerender }) },
 
   { id: 'usage', group: '记录', label: '词元消耗', sub: '输入 / 输出、缓存命中与时间范围', render: (s, ctx) => renderUsage(s, ctx.usage) },
   { id: 'logs', group: '记录', label: '运行日志', sub: '工具调用历史与每次唤醒的消耗', render: (s, ctx) => renderLogs(s, ctx.logs) },
@@ -134,10 +140,14 @@ const local = {
    * 任何存在 DOM 上的状态（class / dataset / 展开的正文）都会在两秒后
    * 被打回原样 —— 表现成"刚展开，它自己折回去了"。
    *
-   *   collapsed   整块面板是否收起（只剩一条竖边）
+   *   collapsed   整块面板是否收起
    *   filter      'all' | 'current'：看全部会话还是只看当前会话
-   *   expanded    展开全文的步骤 key 集合（key 形如 "<at>#<convKey>#<n>"）
+   *   folded      被折叠成一行摘要的步骤 key 集合（key 形如 "<at>#<convKey>#<n>"）
+   *              默认是空的 = 全部展开：思考内容要能直接看见，
+   *              包括那些"想了但没回答"的步骤。
    *   closedDays  被折起来的日期分组（默认全展开，所以记"关掉的"更省）
+   *   order       'asc' | 'desc'：对话流正序（旧在上）/ 倒序（新在上）
+   *   pendingScroll 切换排序后要落到哪里（'top' | 'bottom'），只消费一次
    *
    * 滚动位置**不在这里**：它必须每一帧从真实 DOM 上现取，
    * 存成模块状态反而会拿到上一次的值（见 paintThinkPanel）。
@@ -146,6 +156,8 @@ const local = {
     collapsed: false,
     days: 1,
     before: null,
+    order: 'asc',
+    pendingScroll: null,
     /**
      * 左栏选中的会话。
      *
@@ -156,7 +168,7 @@ const local = {
     /** 正在等你点「确认删除」的日期（null = 没有待确认的） */
     pendingDelete: null,
     /** @type {Set<string>} */
-    expanded: new Set(),
+    folded: new Set(),
     /** @type {Set<string>} */
     closedDays: new Set(),
   },
@@ -228,7 +240,7 @@ syncThemeButtons();
  */
 function setThinkCollapsed(collapsed) {
   local.think.collapsed = collapsed === true;
-  // 收起时把展开的正文留在 expanded 里：用户再展开时还能接着看
+  // 收起整块面板时不动 folded：用户再展开时，逐句的折叠状态还在
   refreshThinkOnly();
 }
 
@@ -432,6 +444,20 @@ function paintThinkPanel(state) {
       void pull(true);
     },
     onDays: (days) => { local.think.days = days; local.think.before = null; void pull(true); },
+    /*
+     * 正序/倒序：纯前端排序，不重新拉快照。
+     *
+     * 切换后落点要跟着换，否则用户切到「倒序」还停在原来的滚动位置，
+     * 看到的是中间那一段 —— 而想要的"最新"其实在顶部。
+     * pendingScroll 交给 paintThinkPanel 消费一次，避免影响下一次普通重绘。
+     */
+    onOrder: (order) => {
+      const next = order === 'desc' ? 'desc' : 'asc';
+      if (local.think.order === next) return;
+      local.think.order = next;
+      local.think.pendingScroll = next === 'desc' ? 'top' : 'bottom';
+      refreshThinkOnly();
+    },
     onOlder: (before) => { local.think.before = before; void pull(true); },
     onLatest: () => { local.think.before = null; void pull(true); },
     /*
@@ -450,9 +476,9 @@ function paintThinkPanel(state) {
       void deleteThinkDay(date);
     },
     onToggleStep: (key) => {
-      if (!(local.think.expanded instanceof Set)) local.think.expanded = new Set();
-      if (local.think.expanded.has(key)) local.think.expanded.delete(key);
-      else local.think.expanded.add(key);
+      if (!(local.think.folded instanceof Set)) local.think.folded = new Set();
+      if (local.think.folded.has(key)) local.think.folded.delete(key);
+      else local.think.folded.add(key);
       refreshThinkOnly();
     },
     onToggleDay: (date) => {
@@ -480,16 +506,28 @@ function paintThinkPanel(state) {
   const next = thinkPanel.querySelector('.think-scroll');
   if (next) {
     /*
-     * 首帧（没有采集值）要**停在顶部**，不要贴底。
+     * 排序切换是一次性指令，优先级最高：消费后立刻清掉。
      *
-     * 侧栏时代贴底是对的 —— 面板一直在、新内容从底部追加，用户想看最新的。
-     * 但改成页面之后，每次进入这一页都是全新重建：没有采集值时三个数都是 0，
-     * `0 <= 0 + 24` 恒成立，会被判成"贴底"然后滚到底 —— 打开页面直接落在
-     * 中间，连"今天"的日期头都看不见。
-     *
-     * 所以只有**确实采到过位置**时才恢复；没采到就停在顶部，让人从头看。
+     * 切到倒序时最新一条在顶部，落在顶部才有意义；切回正序时
+     * 最新一条在底部，落到末尾才符合"接着往下读"的预期。
      */
-    if (!capturedForRestore) {
+    const pending = local.think.pendingScroll;
+    local.think.pendingScroll = null;
+    if (pending === 'top') {
+      next.scrollTop = 0;
+    } else if (pending === 'bottom') {
+      next.scrollTop = next.scrollHeight;
+    } else if (!capturedForRestore) {
+      /*
+       * 首帧（没有采集值）要**停在顶部**，不要贴底。
+       *
+       * 侧栏时代贴底是对的 —— 面板一直在、新内容从底部追加，用户想看最新的。
+       * 但改成页面之后，每次进入这一页都是全新重建：没有采集值时三个数都是 0，
+       * `0 <= 0 + 24` 恒成立，会被判成"贴底"然后滚到底 —— 打开页面直接落在
+       * 中间，连"今天"的日期头都看不见。
+       *
+       * 所以只有**确实采到过位置**时才恢复；没采到就停在顶部，让人从头看。
+       */
       next.scrollTop = 0;
     } else if (wasAtBottom) {
       next.scrollTop = next.scrollHeight;
@@ -1218,6 +1256,14 @@ function render() {
        * 界面只负责把用户选的路径交上去。
        */
       onSendMedia: (k, kind, filePath) => action('send-media', { convKey: k, kind, path: filePath }),
+      /**
+       * 分页翻页后要主动重绘。
+       *
+       * 翻历史是异步动作（`session.page`），结果不会自动进快照 ——
+       * 不重绘的话用户点了「加载更早」看不到任何变化，会以为按钮坏了。
+       * 这和 2 秒轮询无关：轮询刷新的是快照，而翻页结果是页面级缓存。
+       */
+      rerender: () => render(),
     },
     /**
      * 人物页：人格与角色各一套卡。

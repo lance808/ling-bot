@@ -29,6 +29,38 @@
     "minIntervalMs": 1800000,
     "activeWindowMs": 1800000
   },
+  "wake": {
+    "defaultMode": "active",
+    "atMention": true,
+    "nameMention": true,
+    "question": true,
+    "poke": true,
+    "speakerIds": [],
+    "keywords": [],
+    "batchWindowMs": 8000,
+    "minSleepMs": 60000,
+    "maxSleepMs": 0,
+    "maxWakePerMinute": 6,
+    "maxWakePerHour": 60,
+    "noActionLimit": 3,
+    "preSleepWaitMs": 300000,
+    "recommendedProbability": 0.05
+  },
+  "diary": {
+    "initialWeight": 100,
+    "decayPerDay": 1,
+    "hiddenBelowWeight": 0,
+    "contextMinWeight": 60
+  },
+  "silence": {
+    "all": false,
+    "convKeys": [],
+    "windows": [],
+    "allowCommand": true,
+    "adminIds": [],
+    "defaultMuteMs": 1800000,
+    "maxMuteMs": 86400000
+  },
   "tools": {
     "roots": [],
     "allowR3": false

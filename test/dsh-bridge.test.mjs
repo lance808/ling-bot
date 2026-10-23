@@ -140,6 +140,27 @@ function makeBridge() {
   return { bridge: b, asked };
 }
 
+/** 造一个连 onNotify 也记下来的桥（撤销通知用） */
+function makeBridgeWithNotify() {
+  /** @type {any[]} */
+  const asked = [];
+  /** @type {any[]} */
+  const notified = [];
+  const b = new DshBridge({
+    token: 'test-token',
+    onAsk: async (r) => {
+      asked.push(r);
+    },
+    onNotify: (info) => {
+      notified.push(info);
+    },
+  });
+  return { bridge: b, asked, notified };
+}
+
+/** 让出一个事件循环轮次：推送是异步发的 */
+const tick = () => new Promise((r) => setTimeout(r, 20));
+
 test('★ 免打扰期内审批直接放行，不推 QQ', async () => {
   const { bridge, asked } = makeBridge();
   bridge.quiet(60_000);
@@ -205,6 +226,189 @@ test('★ 没配令牌时拒绝一切（不是放行一切）', () => {
   assert.equal(b.checkToken(''), false);
   assert.equal(b.checkToken('anything'), false);
 });
+
+/* ---------------------------------------------------------------- 桥：两段式 */
+
+test('★ askStart 立刻回编号，不等结论', async () => {
+  const { bridge, asked } = makeBridge();
+  const start = bridge.askStart({ toolName: 'fs_write', reason: '要写 README' });
+
+  assert.match(String(start.id), /^\d+$/);
+  assert.equal(start.outcome, undefined, '正常登记不该带结论');
+
+  await tick();
+  assert.equal(asked.length, 1, '登记之后必须推出去，否则用户永远不知道要回答');
+  assert.equal(asked[0].id, start.id);
+  assert.equal(asked[0].kind, 'approval');
+  assert.equal(asked[0].toolName, 'fs_write');
+
+  const waiting = bridge.awaitResult(start.id);
+  bridge.answer(start.id, 'allowed-once');
+  assert.deepEqual(await waiting, {
+    status: 'answered',
+    kind: 'approval',
+    outcome: 'allowed-once',
+  });
+});
+
+test('★ 免打扰时 askStart 不给编号，直接放行', async () => {
+  const { bridge, asked } = makeBridge();
+  bridge.quiet(60_000);
+
+  const start = bridge.askStart({ toolName: 'fs_write' });
+  assert.equal(start.id, null, '没有待回复就没有编号可给');
+  assert.equal(start.outcome, 'allowed-once');
+
+  await tick();
+  assert.equal(asked.length, 0, '免打扰期间不该打扰用户');
+  // 没有编号自然也没有结论可等
+  assert.equal((await bridge.awaitResult(start.id)).status, 'unknown');
+});
+
+test('提问走两段式：答案按当次选项表翻译', async () => {
+  const { bridge, asked } = makeBridge();
+  const questions = [
+    {
+      id: 'q1',
+      header: '改哪里',
+      question: '要改哪个文件？',
+      options: [{ label: 'README.md' }, { label: 'src/index.mjs' }],
+    },
+  ];
+
+  const start = bridge.askQuestionStart({ questions });
+  assert.match(String(start.id), /^\d+$/);
+  await tick();
+  assert.equal(asked[0].kind, 'question');
+
+  const waiting = bridge.awaitResult(start.id);
+  // 用户回 2 = 第二项；交给 DSH 的必须是**选项文案**而不是编号
+  assert.equal(bridge.reply(start.id, '2').ok, true);
+
+  const r = await waiting;
+  assert.equal(r.status, 'answered');
+  assert.equal(r.kind, 'question');
+  assert.deepEqual(r.answer, {
+    answers: [{ id: 'q1', selected: ['src/index.mjs'] }],
+  });
+});
+
+test('没有可选项的提问不产生待回复（没法回数字）', () => {
+  const { bridge } = makeBridge();
+  const start = bridge.askQuestionStart({ questions: [{ id: 'q1', question: '说说看' }] });
+  assert.equal(start.id, null);
+  assert.equal(bridge.listPending().length, 0);
+});
+
+test('★ withdraw 让等待方拿到 withdrawn，并通知 QQ 侧', async () => {
+  const { bridge, notified } = makeBridgeWithNotify();
+  const start = bridge.askStart({ toolName: 'fs_write' });
+  const waiting = bridge.awaitResult(start.id);
+
+  assert.deepEqual(bridge.withdraw(start.id, 'desktop'), { ok: true, removed: true });
+
+  const r = await waiting;
+  assert.equal(r.status, 'withdrawn', '撤销不能表现成超时或拒绝');
+  assert.equal(r.reason, 'desktop');
+
+  await tick();
+  assert.equal(notified.length, 1, '撤销后要告诉 QQ 侧别回了');
+  assert.equal(notified[0].id, start.id);
+  assert.equal(notified[0].reason, 'desktop');
+
+  assert.deepEqual(bridge.listPending(), [], '作废的请求不能还挂在队列里');
+});
+
+test('★ withdraw 之后再用编号回复必须报错', () => {
+  const { bridge } = makeBridgeWithNotify();
+  const start = bridge.askStart({ toolName: 'fs_write' });
+  bridge.withdraw(start.id, 'desktop');
+
+  const r = bridge.reply(start.id, '1');
+  assert.equal(r.ok, false);
+  assert.match(r.error, new RegExp(String(start.id)));
+  // 直接指定结论的老入口也一样：不能对已撤销的请求翻案
+  assert.equal(bridge.answer(start.id, 'allowed-once').ok, false);
+});
+
+test('withdraw 不存在的编号明确报错，也不发通知', async () => {
+  const { bridge, notified } = makeBridgeWithNotify();
+  const r = bridge.withdraw('42', 'desktop');
+  assert.equal(r.ok, false);
+  assert.equal(r.removed, false);
+  assert.match(r.error, /42/);
+  await tick();
+  assert.equal(notified.length, 0);
+});
+
+test('没有 onNotify 时 withdraw 也不炸（回调是可选的）', async () => {
+  const { bridge } = makeBridge();
+  const start = bridge.askStart({ toolName: 'shell' });
+  assert.equal(bridge.withdraw(start.id, 'desktop').ok, true);
+  await tick();
+  assert.deepEqual(bridge.listPending(), []);
+});
+
+test('★ 同一条只能 await 一次（结论不能被取两次）', async () => {
+  const { bridge } = makeBridge();
+  const start = bridge.askStart({ toolName: 'shell' });
+  const waiting = bridge.awaitResult(start.id);
+  bridge.answer(start.id, 'rejected');
+  assert.equal((await waiting).status, 'answered');
+  assert.equal((await bridge.awaitResult(start.id)).status, 'unknown');
+});
+
+test('await 未知编号回 unknown，不抛错', async () => {
+  const { bridge } = makeBridge();
+  assert.equal((await bridge.awaitResult('99')).status, 'unknown');
+  assert.equal((await bridge.awaitResult(undefined)).status, 'unknown');
+});
+
+test('ask()/askQuestion() 仍是登记 + 等待的包装', async () => {
+  const { bridge, asked } = makeBridge();
+
+  const p = bridge.ask({ toolName: 'shell' });
+  await tick();
+  assert.equal(asked.length, 1);
+  bridge.reply(asked[0].id, '2'); // 审批的第 2 项 = 拒绝
+  assert.equal(await p, 'rejected');
+
+  const q = bridge.askQuestion({
+    questions: [{ id: 'q1', question: '选一个', options: [{ label: 'A' }, { label: 'B' }] }],
+  });
+  await tick();
+  const qid = bridge.listPending()[0].id;
+  bridge.reply(qid, '1');
+  assert.deepEqual(await q, { answers: [{ id: 'q1', selected: ['A'] }] });
+});
+
+test('★ 撤销之后 ask() 返回 unavailable（QQ 这边没有结论）', async () => {
+  const { bridge } = makeBridge();
+  const p = bridge.ask({ toolName: 'shell' });
+  await tick();
+  const id = bridge.listPending()[0].id;
+  bridge.withdraw(id, 'desktop');
+  assert.equal(await p, 'unavailable');
+});
+
+test('★ 超时回 timeout，ask() 转成 unavailable（不能猜成同意或拒绝）', async () => {
+  // 只给 30ms：测的是"没人回答"这条路径，不是真等两分钟
+  const b = new DshBridge({ token: 't', onAsk: async () => {}, timeoutMs: 30 });
+
+  const start = b.askStart({ toolName: 'shell' });
+  assert.deepEqual(await b.awaitResult(start.id), { status: 'timeout' });
+
+  assert.equal(await b.ask({ toolName: 'shell' }), 'unavailable');
+});
+
+test('shutdown 让还在等的请求拿到 cancelled（进程退出不把 DSH 卡住）', async () => {
+  const { bridge } = makeBridge();
+  const start = bridge.askStart({ toolName: 'shell' });
+  const waiting = bridge.awaitResult(start.id);
+  bridge.shutdown();
+  assert.equal((await waiting).status, 'cancelled');
+});
+
 
 /* ---------------------------------------------------------------- 桥：指令 */
 

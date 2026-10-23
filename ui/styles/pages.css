@@ -742,11 +742,37 @@ select.text-input {
   box-shadow: var(--shadow-1);
 }
 
+/*
+ * 标题行：会话名 + 类型徽章。
+ *
+ * 时间分组之后群聊和私聊混在同一段里，没有徽章用户就得靠群号猜
+ * 这条是群还是私聊。
+ */
+.think-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .think-pick-title {
+  flex: 1;
+  min-width: 0;
   font-size: 12.5px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.think-pick-kind {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg-faint);
+  font-size: 10px;
+  line-height: 1.5;
   white-space: nowrap;
 }
 
@@ -764,6 +790,15 @@ select.text-input {
   font-size: 12px;
   line-height: 1.6;
   color: var(--fg-faint);
+}
+
+/* 筛选条里的竖分隔：把「记录日」和「正序/倒序」两组按钮分开 */
+.think-tools-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: var(--border);
 }
 
 /* ---------------------------------------------------------- 右栏：内容 */
@@ -865,10 +900,10 @@ select.text-input {
   max-height: calc(100vh - 190px);
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 9px 12px 18px;
+  padding: 12px 16px 22px;
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 18px;
 }
 
 /* 细滚动条：整条 10px 宽在这么窄的面板里会吃掉 1/3 的正文宽度 */
@@ -899,23 +934,26 @@ select.text-input {
  * 不能把它们做成一个按钮里嵌一个按钮 —— HTML 不允许，浏览器会
  * 把内层那个直接丢掉，表现出来就是"删除按钮根本不出现"。所以容器
  * 是 div，两个真正的 button 各占一段。
+ *
+ * 视觉上它是聊天软件里的「日期分隔条」：两侧横线中间夹着日期。
  */
 .think-day-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   width: 100%;
-  padding: 2px 2px 6px;
+  padding: 6px 2px 8px;
   color: var(--fg-faint);
-  font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
 }
 
 .think-day-toggle {
   display: flex;
   align-items: center;
-  gap: 5px;
+  justify-content: center;
+  gap: 7px;
   flex: 1;
   min-width: 0;
   padding: 0;
@@ -926,8 +964,17 @@ select.text-input {
   font-size: inherit;
   font-weight: inherit;
   letter-spacing: inherit;
-  text-align: left;
+  text-align: center;
   cursor: pointer;
+}
+
+/* 两侧横线把日期夹在中间 */
+.think-day-toggle::before,
+.think-day-toggle::after {
+  content: '';
+  flex: 1;
+  min-width: 14px;
+  border-top: 1px solid var(--border);
 }
 
 .think-day-head:hover .think-day-toggle {
@@ -1012,8 +1059,8 @@ select.text-input {
 }
 
 .think-day-label {
-  flex: 1;
-  min-width: 0;
+  flex: none;
+  font-size: 12px;
 }
 
 .think-day-count {
@@ -1025,23 +1072,61 @@ select.text-input {
 .think-day-body {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
 }
 
-/* ---------------------------------------------------------- 回合条目 */
+/* ---------------------------------------------------------- 对话流 */
 
-.think-entry {
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-elev-2);
+/*
+ * 一条回合 = 一条助手消息：左侧头像 + 右侧气泡。
+ *
+ * 全部消息都来自助手（思考链路不记录用户消息），所以统一靠左；
+ * 不需要左右分栏，也就没有"用户气泡"那套配色。
+ */
+.think-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
 }
 
-.think-entry-head {
+.think-avatar {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  margin-top: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+
+.think-msg-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.think-msg-meta {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin-bottom: 6px;
+  min-width: 0;
+  padding-left: 2px;
+}
+
+.think-msg-who {
+  flex: none;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--fg-dim);
 }
 
 .think-time {
@@ -1056,39 +1141,124 @@ select.text-input {
   flex: 1;
   min-width: 0;
   font-size: 11px;
-  color: var(--fg-dim);
+  color: var(--fg-faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* ---------------------------------------------------------- 单步思考 */
+/*
+ * 气泡：左上角收小，指向头像。
+ *
+ * 宽度不设 max-width —— 右栏本来就不宽，再限一次会让长思考
+ * 在窄屏上变成一条细长条。
+ */
+.think-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 3px 12px 12px 12px;
+  background: var(--bg-elev-2);
+}
 
-.think-step + .think-step {
-  margin-top: 8px;
-  padding-top: 8px;
+/* ---------------------------------------------------------- 单句思考 */
+
+/*
+ * 一句思考 = 气泡里的一条可折叠消息。
+ *
+ * 默认只显示一行摘要（第几步 + 前 64 字 + 工具标签），点开才展开全文。
+ * 私聊里一长串思考可以逐句折叠/展开，群聊里也能快速扫过。
+ */
+.think-thought + .think-thought {
+  margin-top: 2px;
+  padding-top: 2px;
   border-top: 1px dashed var(--border);
 }
 
-.think-step-head {
+.think-thought-head {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-bottom: 4px;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 3px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
 }
 
-.think-step-n {
+.think-thought-head:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.think-thought-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.think-thought-icon {
   flex: none;
-  padding: 1px 7px;
-  border-radius: 999px;
-  background: var(--accent-soft);
   color: var(--accent);
-  font-size: 10.5px;
-  font-weight: 600;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.think-thought-label {
+  flex: none;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--fg-dim);
   white-space: nowrap;
 }
 
+/* 折叠态的摘要：单行省略，把宽度让给工具标签 */
+.think-thought-preview {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.think-thought-arrow {
+  flex: none;
+  width: 12px;
+  color: var(--fg-faint);
+  font-size: 11px;
+  text-align: center;
+}
+
+.think-thought-body {
+  padding: 3px 8px 8px 23px;
+}
+
+/* 展开态的工具标签放在正文上方，和推理内容一起读 */
+.think-thought-tools {
+  margin-bottom: 6px;
+}
+
+/* 展开后的正文：正常流式排版，保留模型给的换行 */
+.think-reason {
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 工具标签：小圆角、等宽字体，像聊天里的 inline code */
 .think-tools {
   display: flex;
   flex-wrap: wrap;
@@ -1107,50 +1277,41 @@ select.text-input {
   white-space: nowrap;
 }
 
-/* 点正文展开全文。用 role=button + tabindex，键盘也能操作 */
-.think-reason-wrap {
-  border-radius: 5px;
-  cursor: pointer;
-}
-
-.think-reason-wrap:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+.think-tool-more {
+  border-style: dashed;
 }
 
 /*
- * 默认三行截断。
+ * 回答预览：气泡底部的一条引用。
  *
- * -webkit-line-clamp 需要配合 display:-webkit-box 才生效。
- * 客户端固定是 Chromium，不需要考虑前缀之外的情况。
+ * 思考看的是"为什么"，回答看的是"最后说了什么"，所以用一条分隔线
+ * 把两者分开，而不是再套一个气泡。
  */
-.think-reason {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  overflow: hidden;
-  font-size: 12px;
-  line-height: 1.62;
-  color: var(--fg-dim);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  transition: color 0.12s ease;
-}
-
-.think-reason-wrap:hover .think-reason {
-  color: var(--fg);
-}
-
-/* 展开后要恢复正常流式布局，否则 pre-wrap 的换行会被 -webkit-box 吃掉 */
-.think-reason.is-open {
-  display: block;
-  -webkit-line-clamp: unset;
-  overflow: visible;
-}
-
 .think-answer {
-  margin-top: 5px;
-  font-size: 11px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  min-width: 0;
+}
+
+.think-answer-label {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.think-answer-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
   color: var(--fg-faint);
   white-space: nowrap;
   overflow: hidden;
@@ -1280,14 +1441,13 @@ button:focus-visible, [role='button']:focus-visible { outline: 2px solid var(--a
 .think-shell { height: 100%; box-shadow: var(--shadow-1); }
 .think-head { padding: 16px; background: linear-gradient(110deg, var(--bg-elev), var(--bg-elev-2)); }
 .think-title { font-size: 15px; }
-.think-count, .think-time, .think-conv, .think-answer, .think-empty-hint { font-size: 12px; }
-.think-time, .think-answer { color: var(--fg-dim); }
+.think-count, .think-time, .think-conv, .think-empty-hint { font-size: 12px; }
+.think-time, .think-conv { color: var(--fg-dim); }
 .think-fold { width: auto; min-width: 32px; height: 32px; padding: 0 8px; background: var(--bg-inset); border-color: var(--border); color: var(--fg-dim); }
-.think-scroll { max-height: none; flex: 1; padding: 14px 16px 18px; gap: 12px; }
-.think-entry { padding: 12px 14px; }
+.think-scroll { max-height: none; flex: 1; padding: 14px 18px 24px; gap: 18px; }
+.think-msg { gap: 12px; }
 .think-reason { font-size: 13px; line-height: 1.75; }
 .think-tool { font-size: 11px; color: var(--fg-dim); white-space: normal; overflow-wrap: anywhere; }
-.think-step-n { font-size: 12px; }
 .think-empty { padding: 28px 20px; }
 .think-empty-title { font-size: 14px; }
 .think-empty-hint { max-width: 580px; margin: 8px auto 0; text-align: center; }
@@ -1803,3 +1963,120 @@ td { overflow-wrap: anywhere; }
  * 兜底会让写错的代码看起来是好的，下次再有人这么写就没人发现了。
  * 真需要行间距，请用占位 div 或 `.spacer-12`。
  */
+
+/* -------------------------------------------------- 日记权重条（F18） */
+
+/*
+ * 权重条表达的是"还记得多清楚"，不是评分。
+ *
+ * 所以只有三档颜色（记得 / 在淡 / 快忘），没有连续渐变 ——
+ * 连续色阶会让人以为这是可以刷分的数值，而它其实只会往下走。
+ */
+.bar-track {
+  position: relative;
+  height: 8px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 240ms ease;
+}
+
+/*
+ * 权重条宽度：10 档。
+ *
+ * 用 class 而不是 inline style，因为 CSP 是 `style-src self`，
+ * inline style 会被拦截（打包后条子是空的）。项目不变量也禁止 inline style。
+ *
+ * 只有 10 档是有意的：权重表达"还记得多清楚"，不是精确评分，
+ * 每差 1 分没有视觉意义 —— 反而会让人以为这是可以刷分的数值。
+ */
+.w-0 { width: 0%; }
+.w-10 { width: 10%; }
+.w-20 { width: 20%; }
+.w-30 { width: 30%; }
+.w-40 { width: 40%; }
+.w-50 { width: 50%; }
+.w-60 { width: 60%; }
+.w-70 { width: 70%; }
+.w-80 { width: 80%; }
+.w-90 { width: 90%; }
+.w-100 { width: 100%; }
+
+.bar-ok {
+  background: var(--ok);
+}
+
+.bar-warn {
+  background: var(--warn);
+}
+
+.bar-err {
+  background: var(--err);
+}
+
+/* -------------------------------------------------- 未读徽标（F5） */
+
+/*
+ * 未读用强调色。不用红色：红色在这套配色里代表"出错"，
+ * 而"有 3 条未读"是正常状态，不是故障。
+ */
+.pill-accent {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* 徽标不需要前置圆点：它本身就是数字，再加个点会看着像开关 */
+.pill-accent::before {
+  display: none;
+}
+
+/* 标签里的删除按钮：必须比 btn-sm 更小，否则会把整个标签撑高 */
+.btn-xs {
+  padding: 1px 5px;
+  font-size: 11px;
+  min-height: 18px;
+  line-height: 1.2;
+}
+
+/* -------------------------------------------------- 未读消息（F5） */
+
+/*
+ * 未读消息用左侧色条标记，而不是换背景色。
+ *
+ * 换背景会让整列消息在那条上下"断一下"，滚动时像加载失败；
+ * 色条只在左边加一笔，视觉连续性不受影响。
+ */
+.msg-unread {
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-inset));
+}
+
+.msg-unread .meta {
+  color: var(--fg-dim);
+}
+
+/*
+ * 复制用的临时 textarea。
+ *
+ * execCommand('copy') 要求元素在文档里且可选中，所以不能只 createElement
+ * 不挂载；但它又不能被用户看见 —— 用 fixed 挪到视口外，而不是 display:none
+ * （display:none 的元素选不中，复制会失败）。
+ *
+ * 为什么写在 CSS 而不是 inline style：index.html 的 CSP 是 style-src 'self'，
+ * inline style 会被直接拦掉（ui-shell 测试专门守着这条）。
+ */
+.clipboard-shim {
+  position: fixed;
+  top: -1000px;
+  left: -1000px;
+  opacity: 0;
+  pointer-events: none;
+}

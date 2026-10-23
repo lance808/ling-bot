@@ -85,14 +85,31 @@ export async function runTurn(opts) {
       break;
     }
 
-    const res = await llm.chat({
-      messages: conversation,
-      tools: tools.length > 0 ? toOpenAiTools(tools) : undefined,
-      signal,
-      onDelta,
-      onReasoningDelta,
-      proactive: opts.proactive,
-    });
+    /*
+     * 模型调用失败（上游 500 / 超时）时，把**失败前已经产生的思考**
+     * 挂到错误对象上再抛。用户排查"它怎么答成这样"时，最需要看的
+     * 恰恰是失败前那几步推理；丢掉它们，页面上就只剩一条孤零零的报错。
+     *
+     * 这里只包住单次调用，不包整个循环：错误要原样往上抛，
+     * 上层的重试/降级逻辑（以及 turn-end 通知）不能被打断。
+     */
+    let res;
+    try {
+      res = await llm.chat({
+        messages: conversation,
+        tools: tools.length > 0 ? toOpenAiTools(tools) : undefined,
+        signal,
+        onDelta,
+        onReasoningDelta,
+        proactive: opts.proactive,
+      });
+    } catch (err) {
+      if (err && typeof err === 'object') {
+        /** @type {any} */ (err).thinkingTrace = thinkingTrace;
+        /** @type {any} */ (err).toolTrace = toolTrace;
+      }
+      throw err;
+    }
 
     rounds += 1;
     /*

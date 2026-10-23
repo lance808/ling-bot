@@ -22,12 +22,28 @@ export function registerAllActions() {
  * @typedef {object} RegistrySnapshot
  * @property {object[]} actions
  * @property {object[]} tools
- * @property {string[]} pages
- * @property {string[]} timers
  */
 
 /**
- * 生成注册表快照（给界面「安全」页与诊断用）。
+ * 生成注册表快照（给界面「工具调用」页与诊断用）。
+ *
+ * ## 为什么删掉了 `pages` 和 `timers`
+ *
+ * 这两个字段从来没有被真正使用过：
+ *
+ *   · `pages` 是硬编码的 `['overview','sessions','persona','security','logs']`，
+ *     是**旧版页面列表**，和实际侧栏（13 页，由 `ui/src/app.mjs` 的 PAGES 决定）
+ *     完全不符。界面也没读它 —— 谁读谁就会得到一份过时且错误的清单。
+ *   · `timers` 恒为 `[]`，全仓没有任何代码往里加东西。
+ *
+ * 它们看起来像"插件可以注册页面/定时器"的机制，但那套机制从没实现。
+ * 留着比删掉更危险：后来的人会以为这里有扩展点，往一个死数组里写数据，
+ * 然后困惑于"为什么没生效"。
+ *
+ * 真正的事实来源是：
+ *   页面 → `ui/src/app.mjs` 的 PAGES（前端自己知道有哪些页）
+ *   工具 → `src/tools/registry.mjs` 的 listTools()
+ *   动作 → `src/onebot/actions/`
  *
  * @returns {RegistrySnapshot}
  */
@@ -35,8 +51,6 @@ export function snapshotRegistry() {
   return {
     actions: listActions(),
     tools: listTools(),
-    pages: ['overview', 'sessions', 'persona', 'security', 'logs'],
-    timers: [],
   };
 }
 

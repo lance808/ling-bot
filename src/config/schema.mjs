@@ -78,6 +78,140 @@ export const DEFAULT_CONFIG = Object.freeze({
     minIntervalMs: 1_800_000,
     activeWindowMs: 1_800_000,
   },
+  /**
+   * 唤醒设置 —— 「什么消息值得起一个回合」。
+   *
+   * ## ⚠️ 与参考项目 qq-bridge 的语义不同
+   *
+   * 那边是「AI 自主潜水」：AI 决定何时睡，桥接按条件把它叫醒。
+   * Ling-bot 是消息驱动的：收到消息 → 判定够不够格起一个回合。
+   *
+   * 所以这里的字段映射是：
+   *   minSleepMs   → 两次**主动发言**之间的最小间隔
+   *   maxWakePer*  → 每会话每分/每小时最多起几个回合
+   *   atMention 等 → detectTrigger 的各个开关
+   *
+   * ## 每个开关都是硬开关
+   *
+   * 关掉就是不触发，不存在"关掉走默认值"。用户关掉「提问唤醒」
+   * 是因为不想被每句问话叫醒，关掉还触发的话这个开关就是假的。
+   */
+  wake: {
+    /** active = 正常参与；diving = 只在被明确叫到时参与 */
+    defaultMode: 'active',
+    /** 被 @ 或引用机器人时触发 */
+    atMention: true,
+    /** 文本里出现机器人名字时触发 */
+    nameMention: true,
+    /** 被直接提问时触发（问号 / 句尾疑问助词，判定刻意保守） */
+    question: true,
+    /** 有人拍一拍机器人时触发 */
+    poke: true,
+    /** 指定群友 QQ 号：这些人发言就触发（想等某个人时用） */
+    speakerIds: [],
+    /**
+     * 触发关键词。
+     *
+     * 新位置。老配置里的 `llm.keywords` 会在启动时迁过来，
+     * 但那个字段**不删**（mergeStrict 对未知键 fail-fast，删了就是起不来）。
+     */
+    keywords: [],
+    /**
+     * 多条消息合并成一个回合的窗口（毫秒）。
+     *
+     * 治「回复混乱」的第二道保险：群里连着发三条短句时，
+     * 不该触发三个回合。**合并逻辑只在一处实现**（index.mjs 的回合调度），
+     * 这里只是那个窗口的长度。
+     */
+    batchWindowMs: 8000,
+    /** 两次主动发言的最小间隔（毫秒），0 = 不限 */
+    minSleepMs: 60000,
+    /** 最大潜水时长（毫秒），0 = 不限 */
+    maxSleepMs: 0,
+    /** 每会话每分钟最多起几个回合，0 = 不限 */
+    maxWakePerMinute: 6,
+    /** 每会话每小时最多起几个回合，0 = 不限 */
+    maxWakePerHour: 60,
+    /** 连续多少次回合没有产出就自动降频 */
+    noActionLimit: 3,
+    /** 沉睡前观察窗口（毫秒），0 = 不限制。仅供提示，不做强制 */
+    preSleepWaitMs: 300000,
+    /** 推荐概率（仅参考，AI 可以不遵守；硬限制在 proactive.probability） */
+    recommendedProbability: 0.05,
+  },
+  /**
+   * 日记与淡忘。
+   *
+   * 权重是**派生计算**：落盘只存 weightBase/weightBaseDate，
+   * 读取时按日期差现算。所以这里不需要"每天跑一次衰减"的定时器。
+   */
+  diary: {
+    /** 新日记的初始权重 */
+    initialWeight: 100,
+    /** 每个自然日衰减多少 */
+    decayPerDay: 1,
+    /** 低于这个权重就从默认列表隐藏（0 = 不隐藏） */
+    hiddenBelowWeight: 0,
+    /** 低于这个权重就不进上下文（即"已经淡忘了"） */
+    contextMinWeight: 60,
+  },
+  /**
+   * 静音（「闭嘴」）。
+   *
+   * ## 为什么独立于 wake，而不是往里塞一个开关
+   *
+   * `wake` 是**语义判断**：这条消息像不像在叫它、值不值得参与。
+   * 静音是**绝对压制**：现在根本不许说话，优先于一切语义判断。
+   *
+   * 混在一起的后果很具体：用户设了静音，但某条消息"特别像在叫它"，
+   * 于是它还是开口了 —— 那静音就是假的。
+   *
+   * ## 严格静音
+   *
+   * 静音期间 @ 和私聊也**不**回。半截静音（@ 还能叫醒）会让人不敢用它：
+   * 群里别人狂 @ 时噪音照旧，而用户以为自己已经让它安静了。
+   */
+  silence: {
+    /** 全局静音：开启后所有会话都不回复，直到手动关闭 */
+    all: false,
+    /** 按会话静音：这些 convKey 不回复（`group:123` / `private:456`） */
+    convKeys: [],
+    /**
+     * 时段静默：`[{ start: '23:00', end: '08:00' }]`，本地时区。
+     *
+     * start > end 表示**跨午夜**（23:00–08:00 是最常见的写法）。
+     * start == end 视为不生效，而不是全天 —— 手写出这种多半是笔误，
+     * 理解成"全天静音"会让机器人整天不说话且用户不知道为什么。
+     */
+    windows: [],
+    /**
+     * 是否允许管理员在聊天里用「闭嘴 / 说话」指令。
+     *
+     * 关掉之后只能从桌面端控制。注意：**解除指令永远不受静音影响** ——
+     * 否则用户一开口让它闭嘴就再也没法用 QQ 叫它回来，只能去改配置。
+     */
+    allowCommand: true,
+    /**
+     * 允许用静音指令的 QQ 号。**留空 = 谁都不能用指令**。
+     *
+     * ## 为什么不复用 `dsh.admins`
+     *
+     * DSH 已经改成**独立插件**了。插件自己的配置属于插件，核心功能
+     * 不该反向依赖它 —— 那样会出两个问题：
+     *
+     *   1. 不装 DSH 插件的用户配不了静音指令（字段藏在别处，找不到）
+     *   2. 卸载插件后静音权限凭空消失，而用户不知道为什么
+     *
+     * 更根本的是授权范围不同：`dsh.admins` 管的是"能否操作本机 DSH"，
+     * 而静音只是让它闭嘴。有人愿意把静音权限给更多信任的人，
+     * 但不愿给本机操作权 —— 两个名单就该是两件事。
+     */
+    adminIds: [],
+    /** 指令默认时长（毫秒）：只说「闭嘴」不带时长时用它。默认 30 分钟 */
+    defaultMuteMs: 1800000,
+    /** 单次指令的最长时长（毫秒）：再长请用全局开关。默认 24 小时 */
+    maxMuteMs: 86400000,
+  },
   persona: {
     /** 机器人被叫的名字（用于「叫名字」触发） */
     name: 'Ling',
@@ -250,5 +384,71 @@ export function validateConfig(userConfig = {}) {
   } catch {
     throw Object.assign(new Error(`配置项 onebot.wsUrl 不是合法 URL：${wsUrl}`), { code: 'E40XX' });
   }
+
+  /*
+   * 静音配置的形状校验。
+   *
+   * `mergeStrict` 对数组是整体接受的（元素的键不参与未知键检测），
+   * 所以 `silence.windows` 里的元素必须在这里单独验 ——
+   * 否则写错一个 `{start,end}` 会在运行时段静默悄悄失效，
+   * 而用户以为设好了（这是最难排查的一类问题）。
+   */
+  const silence = /** @type {any} */ (config).silence;
+  const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+  if (!Array.isArray(silence.convKeys)) {
+    throw Object.assign(new Error('配置项 silence.convKeys 必须是数组'), { code: 'E40XX' });
+  }
+  for (const k of silence.convKeys) {
+    if (typeof k !== 'string' || !/^(group|private):\d+$/.test(k)) {
+      throw Object.assign(
+        new Error(`配置项 silence.convKeys 里的 "${k}" 不是合法会话键（应为 group:123 或 private:456）`),
+        { code: 'E40XX' },
+      );
+    }
+  }
+
+  if (!Array.isArray(silence.adminIds)) {
+    throw Object.assign(new Error('配置项 silence.adminIds 必须是数组'), { code: 'E40XX' });
+  }
+  for (const id of silence.adminIds) {
+    if (!/^\d+$/.test(String(id))) {
+      throw Object.assign(
+        new Error(`配置项 silence.adminIds 里的 "${id}" 不是合法 QQ 号（应为纯数字）`),
+        { code: 'E40XX' },
+      );
+    }
+  }
+
+  if (!Array.isArray(silence.windows)) {
+    throw Object.assign(new Error('配置项 silence.windows 必须是数组'), { code: 'E40XX' });
+  }
+  for (const [i, w] of silence.windows.entries()) {
+    if (!w || typeof w !== 'object') {
+      throw Object.assign(new Error(`配置项 silence.windows[${i}] 必须是对象`), { code: 'E40XX' });
+    }
+    for (const field of ['start', 'end']) {
+      if (!TIME_RE.test(String(w[field] ?? ''))) {
+        throw Object.assign(
+          new Error(`配置项 silence.windows[${i}].${field} 必须是 HH:MM（24 小时制，例如 23:00）`),
+          { code: 'E40XX' },
+        );
+      }
+    }
+  }
+
+  for (const field of ['defaultMuteMs', 'maxMuteMs']) {
+    const v = silence[field];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+      throw Object.assign(new Error(`配置项 silence.${field} 必须是非负数字`), { code: 'E40XX' });
+    }
+  }
+  if (silence.maxMuteMs > 0 && silence.defaultMuteMs > silence.maxMuteMs) {
+    throw Object.assign(
+      new Error('配置项 silence.defaultMuteMs 不能大于 maxMuteMs（否则默认时长会被上限截短）'),
+      { code: 'E40XX' },
+    );
+  }
+
   return config;
 }

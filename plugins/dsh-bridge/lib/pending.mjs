@@ -60,7 +60,13 @@ export class PendingQueue {
   }
 
   /**
-   * 登记一条待回复，并返回一个在"被回答/超时"时结算的 Promise。
+   * 登记一条待回复，返回编号和结算 Promise。
+   *
+   * ## 为什么要把编号交出去
+   *
+   * 光有 Promise 时，调用方只能"等结果"，没法**主动结束**它：
+   * DSH 桌面端先回答了，QQ 这条就该撤销，但调用方不知道要撤销哪一条。
+   * 把编号一起返回，撤销就有据可依（见 withdraw）。
    *
    * @param {object} spec
    * @param {'approval'|'question'} spec.kind
@@ -69,11 +75,11 @@ export class PendingQueue {
    * @param {boolean} [spec.multiSelect]
    * @param {string} [spec.preview]
    * @param {(entry: PendingEntry) => void} [spec.onPush] 推送回调（失败不影响等待）
-   * @returns {Promise<{status: 'answered', value: any} | {status: 'timeout'} | {status: 'cancelled'}>}
+   * @returns {{id: string, promise: Promise<{status: 'answered', value: any} | {status: 'timeout'} | {status: 'withdrawn', reason: string} | {status: 'cancelled'}>}}
    */
-  wait(spec) {
+  enqueue(spec) {
     const id = this.allocId();
-    return new Promise((resolve) => {
+    const promise = new Promise((resolve) => {
       /** @type {PendingEntry} */
       const entry = {
         id,
@@ -108,6 +114,41 @@ export class PendingQueue {
         /* 忽略：推送是尽力而为 */
       }
     });
+
+    return { id, promise };
+  }
+
+  /**
+   * 登记一条待回复，只取结算 Promise。
+   *
+   * 保留这个入口是因为大多数调用方只关心"等到什么"；
+   * 需要撤销的调用方用 enqueue 拿编号。
+   *
+   * @param {object} spec 同 enqueue
+   * @returns {Promise<{status: 'answered', value: any} | {status: 'timeout'} | {status: 'withdrawn', reason: string} | {status: 'cancelled'}>}
+   */
+  wait(spec) {
+    return this.enqueue(spec).promise;
+  }
+
+  /**
+   * 撤销一条在册的待回复（另一端已经处理了）。
+   *
+   * 结算成 `withdrawn` 而不是 `cancelled`：两者对调用方的含义不同——
+   * `cancelled` 是"这次请求被撤了，当作没发生"，
+   * `withdrawn` 是"别人已经答过了，你这边别再等"。
+   *
+   * @param {string} id
+   * @param {string} [reason] 撤销来源（协议里目前只有 'desktop'）
+   * @returns {{ok: boolean, error?: string}}
+   */
+  withdraw(id, reason) {
+    const e = this.entries.get(String(id));
+    if (!e) return { ok: false, error: `没有编号为 ${id} 的待回复（可能已回答或超时）` };
+    // reason 缺省按 desktop：目前只有 DSH 桌面端会主动撤销。
+    // 不硬编码空串，是为了让调用方能从结论里看出"谁撤的"。
+    e.resolve({ status: 'withdrawn', reason: String(reason ?? '').trim() || 'desktop' });
+    return { ok: true };
   }
 
   /** 取一条在册记录（不存在返回 undefined） */

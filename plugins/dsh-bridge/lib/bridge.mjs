@@ -14,8 +14,10 @@
  *
  * ## 两个方向
  *
- * **DSH → QQ**：插件在 `approval/request` 里 POST `/dsh/ask`，
- *   桥把请求转成一条带编号的 QQ 消息，等管理员回复，再把结论作为 HTTP 响应返回。
+ * **DSH → QQ**：插件在 `approval/request` 里 POST `/dsh/ask` 登记，
+ *   桥把请求转成一条带编号的 QQ 消息并**立刻返回编号**；
+ *   插件再用 `/dsh/await` 拿结论、用 `/dsh/withdraw` 撤销。
+ *   两段式是为了让 DSH 拿到编号——桌面端先回答时，它得知道要撤销哪一条。
  *
  * **QQ → DSH**：Ling-bot 收到管理员指令，POST `/qq/command`，
  *   桥缓存下来，插件下次轮询（或桥主动回调）时取走。
@@ -86,18 +88,43 @@ export class DshBridge {
   #onAsk;
   /** 把指令交给 DSH 的回调 */
   #onCommand;
+  /**
+   * 撤销时通知 QQ 侧的回调（可选）。
+   *
+   * 桥不认识 QQ，也不该认识：它只负责告诉"某人"这条已经作废了，
+   * 由宿主决定发什么文案。
+   */
+  #onNotify;
+  /**
+   * 已登记、还没被 await 的请求（编号 → 登记信息）。
+   *
+   * 为什么要单独留一份：`awaitResult` 拿到编号后要能找回
+   * 当初的 req/spec —— 提问的答案得按**那一次**的题目翻译，
+   * 不能拿"当前在册的选项表"去猜。
+   *
+   * @type {Map<string, {kind: 'approval'|'question', req: any, spec: any, promise: Promise<any>, createdAt: number}>}
+   */
+  #asks = new Map();
 
   /**
    * @param {object} o
    * @param {string} o.token
    * @param {(req: any) => Promise<void>} o.onAsk   推送一条审批到 QQ
    * @param {(cmd: any) => Promise<void>} o.onCommand 把 QQ 指令交给 DSH
+   * @param {(info: {id: string, reason: string}) => void} [o.onNotify] 撤销时通知 QQ 侧
+   * @param {number} [o.timeoutMs] 单条等待上限（默认 APPROVAL_TIMEOUT_MS）。
+   *   留这个口子是为了让"超时"这个协议状态能被测试覆盖——
+   *   生产路径不传，行为与写死常量完全一致。
    */
-  constructor({ token, onAsk, onCommand }) {
+  constructor({ token, onAsk, onCommand, onNotify, timeoutMs }) {
     this.#token = String(token ?? '');
     this.#onAsk = onAsk;
     this.#onCommand = onCommand;
-    this.#queue = new PendingQueue({ timeoutMs: APPROVAL_TIMEOUT_MS });
+    this.#onNotify = typeof onNotify === 'function' ? onNotify : null;
+    const wait = Number(timeoutMs);
+    this.#queue = new PendingQueue({
+      timeoutMs: Number.isFinite(wait) && wait > 0 ? wait : APPROVAL_TIMEOUT_MS,
+    });
   }
 
   /** 令牌是否已配置。没配就等于没启用。 */
@@ -163,28 +190,27 @@ export class DshBridge {
   /* ---------------------------------------------------------------- 审批 */
 
   /**
-   * 处理一次审批请求（插件调用）。
+   * 登记一次审批请求，立刻返回编号（两段式的第一段）。
+   *
+   * ## 为什么必须拆开
+   *
+   * 原来 `/dsh/ask` 是一个长轮询：DSH 发出去就一直挂着。
+   * 可桌面端审批面板也会同时弹出，它先回答时，DSH 需要**撤销** QQ 这条——
+   * 而长轮询的响应要等结果才回来，编号根本拿不到。
+   * 所以先给编号，让它有能力撤销。
    *
    * @param {object} req
-   * @returns {Promise<string>} ApprovalOutcome 词表里的值
+   * @returns {{id: string | null, outcome?: string}}
    */
-  /**
-   * 处理一次审批请求（插件调用）。
-   *
-   * 选项表由 approvalChoices() 给出，随推送一起送到 QQ。
-   * 回复时按表把数字翻译回 ApprovalOutcome。
-   *
-   * @param {object} req
-   * @returns {Promise<string>} ApprovalOutcome 词表里的值
-   */
-  async ask(req) {
+  askStart(req) {
     // 免打扰期内直接放行。这是用户显式选择的，且有时长上限。
+    // 不产生待回复，所以也没有编号可给——调用方按 outcome 处理即可。
     if (Date.now() < this.#quietUntil) {
-      return 'allowed-once';
+      return { id: null, outcome: 'allowed-once' };
     }
 
     const spec = approvalChoices(req?.toolName);
-    const r = await this.#queue.wait({
+    const { id, promise } = this.#queue.enqueue({
       kind: 'approval',
       title: spec.title,
       choices: spec.choices,
@@ -206,32 +232,28 @@ export class DshBridge {
       },
     });
 
-    if (r.status === 'timeout') {
-      // 超时 = 没人回答。不能当成拒绝（用户可能只是没看手机），
-      // 也不能当成同意。返回 unavailable 让插件按策略处理。
-      return 'unavailable';
-    }
-    if (r.status === 'cancelled') return 'cancelled';
-    return String(r.value);
+    this.#remember(id, { kind: 'approval', req, spec, promise });
+    return { id };
   }
 
   /**
-   * 处理一次提问请求（插件调用）。
+   * 登记一次提问，立刻返回编号（两段式的第一段）。
    *
-   * 与审批最大的不同：选项来自 DSH 的实时数据，数量不固定，
-   * 回传的形状也不同（要按 question id 组装）。
+   * 选项来自 DSH 的实时数据，数量不固定，所以选项表必须和这个编号
+   * 一起存进 #asks：等到答案时按**当次**的表翻译，不能按当前在册的猜。
    *
    * @param {{questions: Array<object>}} req
-   * @returns {Promise<{answers: Array<{id: string, selected: string[], custom?: string}>} | null>}
+   * @returns {{id: string | null, answer?: null}}
    */
-  async askQuestion(req) {
+  askQuestionStart(req) {
     const spec = questionChoices(req);
     if (spec.choices.length === 0) {
-      // 没有任何选项：只能自由输入。也给它一个编号位，避免"没法回"。
-      return null;
+      // 没有任何选项：只能自由输入，也就没东西可编号、没法让用户回数字。
+      // 与 askQuestion 返回 null 的语义保持一致。
+      return { id: null, answer: null };
     }
 
-    const r = await this.#queue.wait({
+    const { id, promise } = this.#queue.enqueue({
       kind: 'question',
       title: '需要你决定',
       choices: spec.choices,
@@ -252,11 +274,128 @@ export class DshBridge {
       },
     });
 
-    if (r.status !== 'answered') return null;
+    this.#remember(id, { kind: 'question', req, spec, promise });
+    return { id };
+  }
 
-    // 把选中的编号翻译回**题目里的选项文案**再交给 DSH：
-    // DSH 的答案格式要的是 selected 里的值，而我们给用户看的是编号。
-    return this.#toAnswer(req, spec, r.value);
+  /**
+   * 等一条已登记请求的结论（两段式的第二段）。
+   *
+   * 编号只认登记过的；同一条只发一次结论——拿到就删，
+   * 免得"重复等待"把同一份结论用两次。
+   *
+   * @param {string} id
+   * @returns {Promise<
+   *   {status: 'answered', kind: 'approval', outcome: string} |
+   *   {status: 'answered', kind: 'question', answer: any} |
+   *   {status: 'timeout'} |
+   *   {status: 'withdrawn', reason: string} |
+   *   {status: 'cancelled'} |
+   *   {status: 'unknown'}
+   * >}
+   */
+  async awaitResult(id) {
+    const key = String(id ?? '');
+    const rec = this.#asks.get(key);
+    if (!rec) return { status: 'unknown' };
+    this.#asks.delete(key);
+
+    const r = await rec.promise;
+
+    if (r.status === 'timeout') return { status: 'timeout' };
+    if (r.status === 'cancelled') return { status: 'cancelled' };
+    if (r.status === 'withdrawn') return { status: 'withdrawn', reason: String(r.reason ?? '') };
+    if (rec.kind === 'approval') {
+      return { status: 'answered', kind: 'approval', outcome: String(r.value) };
+    }
+
+    // 提问：把选中的编号翻译回**题目里的选项文案**。
+    // 用登记时存下的 req/spec，不用眼下队列里的样子。
+    const picked = r.value;
+    const answer =
+      picked && Array.isArray(picked.keys) ? this.#toAnswer(rec.req, rec.spec, picked) : null;
+    return { status: 'answered', kind: 'question', answer };
+  }
+
+  /**
+   * 撤销一条还没回答的待回复（两段式的第三段）。
+   *
+   * 用途：DSH 桌面端先回答了，QQ 这条就不该再等下去。
+   * 不撤的话它会一直挂到超时，用户还会看到一条"在等你回答"的消息。
+   *
+   * @param {string} id
+   * @param {string} [reason] 撤销来源（协议里目前只有 'desktop'）
+   * @returns {{ok: boolean, removed: boolean, error?: string}}
+   */
+  withdraw(id, reason) {
+    const r = this.#queue.withdraw(String(id), reason);
+    if (!r.ok) return { ok: false, removed: false, error: r.error };
+
+    // 队列已经把它结算成 withdrawn；这里只通知 QQ 侧"别回了"。
+    // 不 await 也不抛：撤销本身已经生效，通知失败不能让 DSH 以为没撤成。
+    const key = String(id);
+    const why = String(reason ?? '').trim() || 'desktop';
+    Promise.resolve()
+      .then(() => this.#onNotify?.({ id: key, reason: why }))
+      .catch(() => {});
+
+    return { ok: true, removed: true };
+  }
+
+  /**
+   * 记住一条已登记请求，供 awaitResult 找回 req/spec。
+   *
+   * 留上限：DSH 只登记不 await 时（它自己先超时放弃了）记录会一直留着，
+   * 长时间运行下会慢慢变多。超了就淘汰最旧的，反正那种条目的结论
+   * 早就没人要了。
+   */
+  #remember(id, rec) {
+    this.#asks.set(id, { ...rec, createdAt: Date.now() });
+    if (this.#asks.size <= 100) return;
+    const oldest = [...this.#asks.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
+    if (oldest) this.#asks.delete(oldest[0]);
+  }
+
+  /**
+   * 处理一次审批请求（插件调用）。
+   *
+   * 这是"登记 + 等待"的便捷包装，给不需要撤销的调用方用。
+   * 逻辑上等价于 askStart 后立刻 awaitResult，两条路径共用同一份实现。
+   *
+   * @param {object} req
+   * @returns {Promise<string>} ApprovalOutcome 词表里的值
+   */
+  async ask(req) {
+    const start = this.askStart(req);
+    if (start.id === null) return String(start.outcome ?? 'allowed-once');
+
+    const r = await this.awaitResult(start.id);
+    if (r.status === 'answered') return String(r.outcome);
+    if (r.status === 'cancelled') return 'cancelled';
+
+    // 超时 = 没人回答。不能当成拒绝（用户可能只是没看手机），
+    // 也不能当成同意。返回 unavailable 让插件按策略处理。
+    // withdrawn（桌面端先处理了）同理：QQ 这边没有结论可给。
+    return 'unavailable';
+  }
+
+  /**
+   * 处理一次提问请求（插件调用）。
+   *
+   * 与审批最大的不同：选项来自 DSH 的实时数据，数量不固定，
+   * 回传的形状也不同（要按 question id 组装）。
+   *
+   * @param {{questions: Array<object>}} req
+   * @returns {Promise<{answers: Array<{id: string, selected: string[], custom?: string}>} | null>}
+   */
+  async askQuestion(req) {
+    const start = this.askQuestionStart(req);
+    if (start.id === null) return null;
+
+    const r = await this.awaitResult(start.id);
+    // null = 没人回答/超时/被撤销。调用方据此走自己的策略，
+    // 绝不能把 null 当成"用户同意了"。
+    return r.status === 'answered' ? r.answer : null;
   }
 
   /**
@@ -449,7 +588,7 @@ export class DshBridge {
 /**
  * 起一个最小 HTTP 服务。
  *
- * 只认这四条路由，且全部要求 `Authorization: Bearer <token>`。
+ * 只认下面列出的这些路由，且全部要求 `Authorization: Bearer <token>`。
  * 不实现 CORS、不实现静态文件、不实现 OPTIONS —— 少一个入口就少一条被利用的路径。
  *
  * @param {DshBridge} bridge
@@ -533,14 +672,40 @@ export function serve(bridge, port = DEFAULT_PORT, host = '127.0.0.1') {
           hits: bridge.hitStats(),
         });
 
-      /* 插件问审批：这是唯一会**长时间挂起**的请求 */
+      /* 插件登记审批/提问：两段式的第一段，**立刻**回编号 --------------- */
       case '/dsh/ask': {
-        const outcome = await bridge.ask(body);
-        return json(res, 200, { ok: true, outcome });
+        // kind 省略按 approval（与协议一致）。提问走同一条路由，
+        // 因为调用方只想表达"我要登记一件事"，不必记两个地址。
+        const r =
+          String(body?.kind ?? '') === 'question'
+            ? bridge.askQuestionStart(body)
+            : bridge.askStart(body);
+        // 免打扰时 id 为 null，并带 outcome（审批直接放行）；
+        // 没有可选项的提问 id 也是 null，但带 answer: null。
+        return json(res, 200, { ok: true, ...r });
       }
 
-      /* 插件问问题（与审批同一条通路，但答案形状不同） */
+      /* 插件等结论：两段式的第二段。会**长时间挂起**的只有这一条 ------ */
+      case '/dsh/await': {
+        // 永远 200 + ok:true：结论在 status 里，不在 HTTP 码里。
+        // 未知编号回 status:'unknown'，而不是 404 —— 调用方只需看 status，
+        // 少一个要判断的分支就少一处判错的机会。
+        const r = await bridge.awaitResult(body?.id);
+        return json(res, 200, { ok: true, ...r });
+      }
+
+      /* 插件撤销：桌面端已经处理了，QQ 这条作废 ----------------------- */
+      case '/dsh/withdraw': {
+        const r = bridge.withdraw(String(body?.id ?? ''), body?.reason);
+        // 撤销失败多半是"已经答过/超时"，调用方只需要知道没撤成，
+        // 不该因此以为审批失败了——所以走 400 但结论仍可由调用方忽略。
+        return json(res, r.ok ? 200 : 400, r);
+      }
+
+      /* 兼容别名：老调用方的长轮询入口，等价"提问的登记 + 等待" ------- */
       case '/dsh/ask-question': {
+        // 保留旧行为（一直等到有结论，回 {ok, answer}）：
+        // 老调用方没有编号也撤销不了，改成只回编号等于让它永远等不到答案。
         const answer = await bridge.askQuestion(body);
         // null = 没人回答/超时/没有选项。调用方据此走自己的策略，
         // 绝不能把 null 当成"用户同意了"。

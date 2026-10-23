@@ -124,6 +124,24 @@ export async function installBuiltinPlugins(opts) {
     const from = path.join(FACTORY_DIR, name);
     const to = path.join(opts.pluginsDir, name);
 
+    /*
+     * 出厂源与目标**可能是同一个目录**。
+     *
+     * 2026-10-22 起插件目录默认是 `<程序目录>/plugins`，而内置插件的
+     * 出厂源也在 `<程序目录>/plugins` —— 两者重合。
+     *
+     * 这时必须直接跳过：`fs.cp(from, to)` 在 `from === to` 时
+     * 会往自己身上拷，轻则报 EINVAL，重则把插件目录拷成嵌套的
+     * `dsh-bridge/dsh-bridge/...`。而这一步是启动流程里的，
+     * 出错会让"插件全挂"看起来像是升级失败。
+     *
+     * 判定用 resolve 后的真实路径比较，避免 `D:\a\..\a` 这种写法漏判。
+     */
+    if (path.resolve(from) === path.resolve(to)) {
+      out.skipped.push(name);
+      continue;
+    }
+
     try {
       const exists = await fs
         .access(path.join(from, 'plugin.json'))
@@ -210,3 +228,81 @@ export async function installBuiltinPlugins(opts) {
 }
 
 export { FACTORY_DIR };
+
+/**
+ * 旧插件目录 → 新插件目录的一次性补齐。
+ *
+ * ## 为什么需要它
+ *
+ * 插件目录从 `%APPDATA%\ling-bot\plugins` 改到了程序目录下。
+ * 不迁移的话，用户在旧位置装的插件会**静默消失**：配置里还写着启用，
+ * 加载器报 0 个插件，界面上一切正常。这种"什么都没发生"的故障
+ * 比报错难查得多。
+ *
+ * ## 三条规则
+ *
+ * 1. **只补缺，不覆盖。** 新目录里已有同名插件 = 用户已在新位置改过，
+ *    旧副本不能反向冲掉它。
+ * 2. **不删旧目录。** 删是不可逆的，而留着最多是占点空间。
+ *    用户可能还有别的程序在读它，或者想手动比对。
+ * 3. **失败不致命。** 迁移不上只是"插件没跟过来"，记一条日志即可，
+ *    不该让主程序起不来。
+ *
+ * @param {{root: string, pluginsDir: string}} paths
+ * @param {{info: Function, warn: Function}} log
+ * @returns {Promise<{migrated: string[], skipped: string[]}>}
+ */
+export async function migrateLegacyPlugins(paths, log) {
+  /** @type {{migrated: string[], skipped: string[]}} */
+  const out = { migrated: [], skipped: [] };
+
+  const legacyDir = path.join(paths.root, 'plugins');
+  const targetDir = paths.pluginsDir;
+
+  // 同一个目录就不用迁（新默认就是程序目录，数据根也可能正好是程序目录）
+  if (path.resolve(legacyDir) === path.resolve(targetDir)) return out;
+
+  let names;
+  try {
+    const entries = await fs.readdir(legacyDir, { withFileTypes: true });
+    names = entries.filter((e) => e.isDirectory() && !e.name.startsWith('.')).map((e) => e.name);
+  } catch {
+    // 没有旧目录 = 全新安装，正常
+    return out;
+  }
+
+  for (const name of names) {
+    const from = path.join(legacyDir, name);
+    const to = path.join(targetDir, name);
+    try {
+      // 新位置已经有这个插件：用户已在新位置维护，跳过
+      const exists = await fs
+        .access(path.join(to, 'plugin.json'))
+        .then(() => true)
+        .catch(() => false);
+      if (exists) {
+        out.skipped.push(name);
+        continue;
+      }
+
+      await fs.mkdir(targetDir, { recursive: true });
+      await fs.cp(from, to, { recursive: true, force: false, errorOnExist: false });
+      out.migrated.push(name);
+      log.info(`插件 ${name} 已从旧目录迁移到 ${to}`, { from });
+    } catch (err) {
+      const message = String(/** @type {any} */ (err)?.message ?? err);
+      log.warn(`插件 ${name} 迁移失败（不影响主程序）`, { from, message });
+    }
+  }
+
+  if (out.migrated.length > 0) {
+    log.info('旧插件目录迁移完成', {
+      migrated: out.migrated,
+      legacyDir,
+      // 明确告诉用户旧目录还在，可以自己删
+      note: '旧目录仍保留，确认新目录可用后可手动删除',
+    });
+  }
+
+  return out;
+}

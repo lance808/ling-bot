@@ -141,12 +141,102 @@ async function checkNoInlineStyle() {
   const offenders = [];
   for (const file of files) {
     const text = await fs.readFile(file, 'utf8');
-    if (/\{\s*style:\s*['"`]/.test(text)) offenders.push(rel(file));
+    /*
+     * 三种写法都要抓：
+     *
+     *   1. 对象字面量里的 `style:` —— 注意**不能**要求前面紧挨着 `{`。
+     *      属性常有多个且可跨行（`{ class: ..., style: ... }`），
+     *      原来那个正则要求 `{\s*style:`，只要前面多一个属性就漏检。
+     *      这个漏洞让一处权重条的 inline style 逃过了检查。
+     *   2. `setAttribute('style', ...)` —— 绕过对象字面量的写法
+     *   3. `.style.xxx =` —— 直接改样式属性
+     */
+    const hasInline =
+      /(?<![\w$.])style\s*:/.test(text) ||
+      /setAttribute\(\s*['"`]style['"`]/.test(text) ||
+      /\.style\.[\w-]+\s*=/.test(text);
+    if (hasInline) offenders.push(rel(file));
   }
   if (offenders.length) {
     failures.push(`界面里出现 inline style（CSP 会拦截）：${offenders.join(', ')}`);
   } else {
     passes.push('界面不使用 inline style（符合 CSP style-src self）');
+  }
+}
+
+/**
+ * I23：`.spacer-*` 只能当占位块，不能当容器。
+ *
+ * ## 为什么这条值得进不变量检查
+ *
+ * `.spacer-8` / `.spacer-10` / `.spacer-12` / `.spacer-16` 都是
+ * `height: Npx` 的**纯占位块**，语义是"在这里留 N 像素空白"。
+ *
+ * 但它的类名读起来像"带 8px 间距的容器"，于是很容易被写成
+ * `el('div', { class: 'spacer-8' }, [ ...子元素... ])`：
+ * 盒子只有 8px 高，子内容却按自己的高度渲染 —— 溢出到盒子外面，
+ * 压住后面的兄弟元素。
+ *
+ * 真实后果：静音页的管理员列表压住了下面的输入框，
+ * "移出"按钮和输入框叠在一起。这类问题不会报错、不会崩，
+ * 只会让界面看起来"坏了"，而且极难从代码里看出来 ——
+ * 因为 div 嵌套本身完全合法。
+ *
+ * 正确写法：容器不带 spacer，间距作为**第一个子元素**单独放。
+ *
+ *   el('div', {}, [el('div', { class: 'spacer-8' }), ...子元素])
+ */
+async function checkSpacerIsNotContainer() {
+  const files = await walk(path.join(repoRoot, 'ui'), (f) => f.endsWith('.mjs'));
+  const offenders = [];
+  for (const file of files) {
+    const lines = (await fs.readFile(file, 'utf8')).split('\n');
+    lines.forEach((line, i) => {
+      // spacer 类后面紧跟一个子元素数组 → 它被当成了容器
+      if (/class:\s*['"`]spacer-\d+['"`]\s*\}\s*,\s*\[/.test(line)) {
+        offenders.push(`${rel(file)}:${i + 1}`);
+      }
+    });
+  }
+  if (offenders.length) {
+    failures.push(
+      `.spacer-* 被当成容器用（它是固定高度的占位块，子内容会溢出压住后面的元素）：${offenders.join(', ')}`,
+    );
+  } else {
+    passes.push('.spacer-* 只作占位块使用（未当容器）');
+  }
+}
+
+/**
+ * I24：`.row` 上不能再叠 `.spacer-*`。
+ *
+ * 这是同一个坑的另一种写法。`.row` 是 flex 行，叠上 `height: 8px`
+ * 会把整行压成 8 像素高，行内元素溢出到下一块内容上。
+ *
+ * 两处规则分开写，是因为它们的成因不同：
+ *   · I23 是"内容放不进盒子"
+ *   · I24 是"盒子本身被压扁"
+ * 分开报错能让人一眼看出该改哪边。
+ */
+async function checkRowHasNoSpacer() {
+  const files = await walk(path.join(repoRoot, 'ui'), (f) => f.endsWith('.mjs'));
+  const offenders = [];
+  for (const file of files) {
+    const lines = (await fs.readFile(file, 'utf8')).split('\n');
+    lines.forEach((line, i) => {
+      // class 字符串里同时出现 row 与 spacer
+      for (const m of line.matchAll(/class:\s*['"`]([^'"`]*)['"`]/g)) {
+        const cls = m[1];
+        if (/\brow\b/.test(cls) && /\bspacer-\d+\b/.test(cls)) {
+          offenders.push(`${rel(file)}:${i + 1} → "${cls}"`);
+        }
+      }
+    });
+  }
+  if (offenders.length) {
+    failures.push(`.row 上叠了 .spacer-*（会把整行压扁，内容溢出）：${offenders.join(', ')}`);
+  } else {
+    passes.push('.row 上没有叠加 .spacer-*（行高未被压扁）');
   }
 }
 
@@ -500,6 +590,8 @@ async function main() {
   await checkGateIsPure();
   await checkNoInnerHtml();
   await checkNoInlineStyle();
+  await checkSpacerIsNotContainer();
+  await checkRowHasNoSpacer();
   await checkBridgeSurface();
   await checkShellGates();
   await checkQuitPath();

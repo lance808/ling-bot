@@ -32,23 +32,112 @@ function exists(rel) {
 
 test('页面视图文件都存在', () => {
   // DSH 接入已并入通用插件页，不再有独立的 dsh.mjs
-  const pages = ['overview', 'sessions', 'model', 'persona', 'tools', 'plugins', 'security', 'usage', 'logs'];
+  const pages = [
+    'overview', 'sessions', 'model', 'persona', 'plugins', 'security', 'usage', 'logs',
+    // F19 唤醒设置 / F20 静音
+    'wake', 'silence',
+    // F21：工具记忆改名为「记忆」并并入日记；工具列表拆到「工具调用」
+    'memory', 'tool-calls',
+  ];
   for (const p of pages) {
     assert.ok(exists(`ui/src/views/${p}.mjs`), `缺 ${p}.mjs`);
   }
   assert.ok(!exists('ui/src/views/dsh.mjs'), 'DSH 已成为普通插件，不该再有专用页面');
+
+  /*
+   * 旧的「工具记忆」页已经拆成 memory + tool-calls，diary 也并进了 memory。
+   * 这两个文件必须真的消失 —— 留着就是第二份实现，
+   * 而"哪个才对"用户无从判断。
+   */
+  assert.ok(!exists('ui/src/views/tools.mjs'), 'tools.mjs 已拆分为 memory.mjs 与 tool-calls.mjs，不该保留');
+  assert.ok(exists('ui/src/views/diary.mjs'), 'diary.mjs 仍作为可嵌入区块存在（不再是独立页面）');
+});
+
+test('★ 界面不使用 inline style（CSP style-src self 会拦截）', () => {
+  /*
+   * ## 为什么这条必须放进测试
+   *
+   * inline style 在开发机上**可能看不出问题** —— WebView 未启用 CSP 时
+   * 它照样生效。打包后才是"条子空了 / 颜色丢了"。
+   *
+   * 而且它的漏检方式很隐蔽：`scripts/check.mjs` 原来的正则要求
+   * `{` 紧跟 `style:`，只要对象里有第二个属性（`{ class, style }`）
+   * 或者属性跨行，就**完全扫不到**。日记页的权重条就这么漏过去了。
+   *
+   * 所以这里用不依赖"前面是不是 `{`"的写法，把三种形态都覆盖：
+   *   1. 对象属性 `style:`
+   *   2. `setAttribute('style', ...)`
+   *   3. `.style.xxx =`
+   */
+  const viewsDir = path.join(repoRoot, 'ui', 'src', 'views');
+  const files = readdirSync(viewsDir).filter((f) => f.endsWith('.mjs'));
+  assert.ok(files.length > 0, '没扫到任何视图文件，路径可能不对');
+
+  const offenders = [];
+  for (const f of files) {
+    const text = read(`ui/src/views/${f}`);
+    const hasInline =
+      /(?<![\w$.])style\s*:/.test(text) ||
+      /setAttribute\(\s*['"`]style['"`]/.test(text) ||
+      /\.style\.[\w-]+\s*=/.test(text);
+    if (hasInline) offenders.push(f);
+  }
+  assert.deepEqual(offenders, [], `这些视图用了 inline style（CSP 会拦截，改走 class）：${offenders.join(', ')}`);
+});
+
+test('★ 日记权重条用固定档位 class，不用 inline 宽度', () => {
+  /*
+   * 权重条必须表达"还剩多少"，而唯一"自然"的写法是 `style: width:xx%` ——
+   * 那正好被 CSP 拦。所以改用 10 档 class。
+   *
+   * 这里钉住两件事：
+   *   1. 视图里确实用 `w-NN` 这种 class
+   *   2. 样式表里确实定义了这些 class（定义了才算数）
+   */
+  const view = read('ui/src/views/diary.mjs');
+  assert.match(view, /w-\$\{|w-\d+/, '日记视图应使用 w-NN 档位 class');
+
+  const css = read('ui/styles/pages.css');
+  for (const pct of [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]) {
+    assert.match(
+      css,
+      new RegExp(`\\.w-${pct}\\s*\\{[^}]*width:\\s*${pct}%`),
+      `样式表缺 .w-${pct} 的宽度定义（条子会没有长度）`,
+    );
+  }
 });
 
 test('app.mjs 注册的页面里包含插件页，且不再有 DSH 专用页', () => {
   const src = read('ui/src/app.mjs');
-  for (const f of ['usage', 'tools', 'plugins']) {
+  for (const f of ['usage', 'plugins', 'memory', 'tool-calls']) {
     assert.match(src, new RegExp(`import \\{ render\\w+ \\} from './views/${f}\\.mjs'`), `没 import ${f}`);
   }
-  // 数一下 PAGES 里的 id 个数（DSH 页移除后是 10 个）
+  /*
+   * 数一下 PAGES 里的 id 个数。
+   *
+   * 注意 id 允许连字符（`tool-calls`），所以这里是 `[\w-]+` 而不是 `\w+` ——
+   * 用 `\w+` 会让 `id: 'tool-calls'` 整个匹配不上，页面数凭空少一个，
+   * 而报错信息只说"页面数不对"，看不出是正则的问题。
+   *
+   * 变化史：DSH 页移除后 10 个 → F19 唤醒 / F20 静音 加到 12
+   * → F21 把「日记」并进「记忆」、工具列表拆出「工具调用」，
+   * 日记页不再是独立入口，净增 1（记忆 + 工具调用 − 日记）= 13。
+   */
   const pagesBlock = src.slice(src.indexOf('const PAGES'), src.indexOf('];', src.indexOf('const PAGES')));
-  const ids = [...pagesBlock.matchAll(/id: '(\w+)'/g)].map((m) => m[1]);
-  assert.equal(ids.length, 10, `页面数应为 10，实际 ${ids.length}`);
-  assert.ok(ids.includes('tools') && ids.includes('plugins') && ids.includes('usage'));
+  const ids = [...pagesBlock.matchAll(/id: '([\w-]+)'/g)].map((m) => m[1]);
+  assert.equal(ids.length, 13, `页面数应为 13，实际 ${ids.length}：${ids.join(', ')}`);
+
+  assert.ok(ids.includes('plugins') && ids.includes('usage'));
+  // F21：工具记忆已改名为「记忆」，工具列表拆到「工具调用」
+  assert.ok(ids.includes('memory'), '缺《记忆》页（F21）');
+  assert.ok(ids.includes('tool-calls'), '缺《工具调用》页（F21）');
+  assert.ok(!ids.includes('tools'), '「工具调用」的 id 应是 tool-calls，不是旧的 tools');
+  // 日记已并入《记忆》，不再是独立页面
+  assert.ok(!ids.includes('diary'), '日记已并入《记忆》页，不该再占一个侧栏入口');
+
+  // F19 唤醒设置页 / F20 静音页
+  assert.ok(ids.includes('wake'), '缺唤醒设置页（F19）');
+  assert.ok(ids.includes('silence'), '缺静音页（F20）');
   // 思考链路属于「概览」组，且排在会话总览之后
   assert.ok(ids.includes('thinking'), '缺思考链路页');
   assert.ok(ids.indexOf('thinking') > ids.indexOf('sessions'), '思考链路应在会话总览之后');
@@ -246,6 +335,37 @@ test('插件页把声明驱动的东西全部渲染出来：配置表单 / 工�
   assert.match(src, /测试连接/);
   assert.match(src, /重载/);
   assert.match(src, /重新扫描/);
+});
+
+test('★ 生成的令牌必须能取出明文（否则没法填到 DSH 侧）', () => {
+  const src = read('ui/src/views/plugins.mjs');
+
+  /*
+   * 背景：令牌存在保险箱里，后端 toView() 对 secret 字段一律返回空值
+   * （只给 hasSecret 标记），保存后输入框就被清空。
+   * 如果界面上没有"显示"和"复制"，用户点完「生成」→ 保存 → 明文就永久消失了，
+   * 只能重新生成一个（那会让 DSH 侧那份立刻失效）。
+   *
+   * 这不是体验问题，是**功能不可用**：没法把同一个令牌填到两边。
+   */
+  assert.match(src, /function copyText/, '要有复制能力');
+  assert.match(src, /navigator\.clipboard/, '优先走标准剪贴板 API');
+  assert.match(src, /execCommand\('copy'\)/, '要有兜底路径');
+  assert.match(src, /text: '显示'/, '要有显示明文入口');
+  assert.match(src, /text: '复制'/, '要有复制按钮');
+  // 点「生成」后必须立刻露明文，不然 password 框里全是圆点
+  assert.match(src, /input\.type = 'text'/, '生成后要露出明文');
+});
+
+test('★ 复制用的 textarea 不能用 inline style（CSP style-src self）', () => {
+  const src = read('ui/src/views/plugins.mjs');
+  const i = src.indexOf('function copyText');
+  const block = src.slice(i, i + 900);
+  assert.ok(!/\.style\./.test(block), 'inline style 会被 CSP 拦掉，要用 class');
+  assert.match(block, /clipboard-shim/);
+
+  const css = read('ui/styles/pages.css');
+  assert.match(css, /\.clipboard-shim/, 'class 必须在样式表里定义');
 });
 
 test('禁用插件不改文件，只改配置', () => {

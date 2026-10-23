@@ -24,6 +24,22 @@ persona.json
 role.json
 thinking/
 
+# 插件目录（F21：已从 %APPDATA% 移到程序目录下，即仓库根的 plugins/）
+#
+# 这个目录**既是**出厂源（随包分发的 dsh-bridge / echo），
+# **又是**用户放自己插件的运行位置。两者混在一起，所以：
+#   · 默认忽略整个目录，避免用户的自定义插件被误提交
+#   · 再显式放行随包的那两个 —— 它们是仓库内容，必须入库
+#
+# 代价：新增一个随包插件时，必须在这里补一行放行，
+# 否则它不会进仓库，而症状是"我这能跑、别人 clone 下来没有"。
+plugins/*
+!plugins/dsh-bridge/
+!plugins/echo/
+# 插件运行期产生的临时目录（安装/升级时的暂存与备份），任何插件都不入库
+plugins/*/.staging-*/
+plugins/*/.backup/
+
 # 编辑器与本机杂项
 .DS_Store
 Thumbs.db

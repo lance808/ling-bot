@@ -505,6 +505,32 @@ body {
   font-size: 12px;
 }
 
+/*
+ * 复选框（唤醒页与静音页的开关行用）。
+ *
+ * 不写样式的话，浏览器默认的复选框在深色主题下是浅灰色方块，
+ * 和强调色完全不搭 —— 而且它在两个页面里都是"主要操作入口"，
+ * 看起来像个没做完的控件会让人不敢点。
+ *
+ * 用 accent-color 而不是重画整个控件：这是原生能力，
+ * 焦点环、键盘操作、无障碍语义都自动保留。自己用伪元素重画
+ * 会把这些一并丢掉，那时"用键盘能不能切换"就成了新问题。
+ */
+.checkbox,
+input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex: none;
+}
+
+input[type='checkbox']:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .btn-danger {
   color: var(--err);
   border-color: color-mix(in srgb, var(--err) 40%, var(--border));

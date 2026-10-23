@@ -172,6 +172,7 @@ renderTest('thinking history forwards the opaque cursor and distinguishes steps 
 
 /** 一份"两个群 + 一个私聊各有记录"的快照 */
 function thinkingSnap() {
+  const now = Date.now();
   return {
     thinking: {
       total: 3,
@@ -179,9 +180,10 @@ function thinkingSnap() {
       nextBefore: null,
       dayKeys: ['2026-10-19'],
       conversations: [
-        { convKey: 'private:200', entries: 1, steps: 1, lastAt: 3000 },
-        { convKey: 'group:100', entries: 1, steps: 2, lastAt: 2000 },
-        { convKey: 'group:101', entries: 1, steps: 1, lastAt: 1000 },
+        // 三个会话分别落在「今日 / 7 天内 / 30 天内」三个时间桶里
+        { convKey: 'private:200', entries: 1, steps: 1, lastAt: now - 60_000 },
+        { convKey: 'group:100', entries: 1, steps: 2, lastAt: now - 3 * 86_400_000 },
+        { convKey: 'group:101', entries: 1, steps: 1, lastAt: now - 10 * 86_400_000 },
       ],
       days: [
         {
@@ -206,7 +208,7 @@ function thinkingSnap() {
 
 const byClass = (root, cls) => nodes(root).filter((n) => String(n.className ?? '').split(/\s+/).includes(cls));
 
-renderTest('思考链路：左栏列出群聊与私聊，右栏按选中会话过滤', async () => {
+renderTest('思考链路：左栏按今日 / 7 天内 / 30 天内分组，右栏按选中会话过滤', async () => {
   const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
 
   // 选中群 100：右栏只应出现它的两步，别的会话内容必须消失
@@ -217,14 +219,18 @@ renderTest('思考链路：左栏列出群聊与私聊，右栏按选中会话�
   assert.doesNotMatch(body, /私聊里的想法/);
   assert.doesNotMatch(body, /群一零一的想法/);
 
-  // 左栏要分组：群聊 / 私聊各一个组头，且两个群 + 一个私聊都在
+  // 左栏按最近活跃时间分组：三个会话各落一个桶
   const side = text(byClass(root, 'think-col-left')[0]);
-  assert.match(side, /群聊 2/);
-  assert.match(side, /私聊 1/);
+  assert.match(side, /今日/);
+  assert.match(side, /7 天内/);
+  assert.match(side, /30 天内/);
   assert.match(side, /全部会话/);
   assert.match(side, /群 100/);
   assert.match(side, /群 101/);
   assert.match(side, /私聊 200/);
+  // 时间分组之后群聊/私聊混排，靠类型徽章区分
+  assert.match(side, /群聊/);
+  assert.match(side, /私聊/);
 });
 
 renderTest('思考链路：点左栏会话会带着 convKey 回调（空串=全部）', async () => {
@@ -388,4 +394,66 @@ renderTest('思考链路：lastSkip 字段脏掉也不能把面板弄崩', async
     const root = renderThinkingPanel(snap, { ui: { days: 7 } });
     assert.match(text(root), /昨天的想法/, `lastSkip=${JSON.stringify(bad)} 时历史仍要正常显示`);
   }
+});
+
+/* ------------------------------------------------ 对话式：气泡 / 折叠 / 排序 */
+
+renderTest('思考链路：右栏是对话流，一个回合一个气泡', async () => {
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+  const root = renderThinkingPanel(thinkingSnap(), { ui: { convKey: '' } });
+  assert.equal(byClass(root, 'think-msg').length, 3, '三个回合 = 三条消息');
+  assert.equal(byClass(root, 'think-bubble').length, 3, '每条消息一个气泡');
+  assert.equal(byClass(root, 'think-avatar').length, 3, '每条消息一个头像');
+  assert.match(text(root), /Ling/);
+});
+
+renderTest('思考链路：每句思考默认展开，点标题可以收成一行摘要', async () => {
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+
+  // 默认展开：没有回答的那几步也必须直接看得见思考正文
+  const opened = renderThinkingPanel(thinkingSnap(), { ui: { convKey: 'group:100' } });
+  const heads = byClass(opened, 'think-thought-head');
+  assert.equal(heads.length, 2);
+  assert.equal(heads[0]['aria-expanded'], 'true');
+  const bodies = byClass(opened, 'think-thought-body');
+  assert.equal(bodies.length, 2);
+  assert.notEqual(bodies[0].hidden, '', '默认态正文必须可见');
+  assert.match(text(opened), /群一百的第一步/);
+
+  // 用户主动收起：aria-expanded=false、正文 hidden、摘要顶上
+  const picked = [];
+  const foldKey = '2000#group:100#1';
+  const folded = renderThinkingPanel(thinkingSnap(), {
+    ui: { convKey: 'group:100', folded: new Set([foldKey]) },
+    onToggleStep: (key) => picked.push(key),
+  });
+  const foldedHeads = byClass(folded, 'think-thought-head');
+  assert.equal(foldedHeads[0]['aria-expanded'], 'false');
+  assert.equal(byClass(folded, 'think-thought-body')[0].hidden, '', '收起态正文必须 hidden');
+  await foldedHeads[0].listeners.click();
+  assert.deepEqual(picked, [foldKey]);
+});
+
+renderTest('思考链路：正序/倒序切换按回合翻转，步骤内部保持原顺序', async () => {
+  const { renderThinkingPanel } = await import('../ui/src/views/thinking.mjs');
+
+  const asc = renderThinkingPanel(thinkingSnap(), { ui: { convKey: '', order: 'asc' } });
+  const ascText = text(byClass(asc, 'think-col-main')[0]);
+  assert.ok(ascText.indexOf('群一零一的想法') < ascText.indexOf('私聊里的想法'), '正序：旧的在上面');
+
+  const desc = renderThinkingPanel(thinkingSnap(), { ui: { convKey: '', order: 'desc' } });
+  const descText = text(byClass(desc, 'think-col-main')[0]);
+  assert.ok(descText.indexOf('私聊里的想法') < descText.indexOf('群一零一的想法'), '倒序：新的在上面');
+  // 一步推理里的先后顺序是内容本身，不能跟着翻转
+  assert.ok(
+    descText.indexOf('群一百的第一步') < descText.indexOf('群一百的第二步'),
+    '步骤内部必须保持正序',
+  );
+
+  const picked = [];
+  const root = renderThinkingPanel(thinkingSnap(), { ui: { convKey: '' }, onOrder: (o) => picked.push(o) });
+  assert.equal(button(root, '正序')['aria-pressed'], 'true');
+  await button(root, '倒序').listeners.click();
+  await button(root, '正序').listeners.click();
+  assert.deepEqual(picked, ['desc', 'asc']);
 });

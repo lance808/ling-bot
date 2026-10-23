@@ -68,7 +68,20 @@ export function renderSecurity(snap, ctx = {}) {
   const allow = snap?.config?.allow ?? { groups: [], private: [] };
   const deny = snap?.config?.deny ?? { groups: [], private: [] };
   const allowAllWhenEmpty = snap?.config?.allowAllWhenEmpty === true;
-  const admins = snap?.config?.dsh?.admins ?? [];
+  /**
+   * 管理员列表现在住在插件配置里（`plugins.config['dsh-bridge'].admins`）。
+   *
+   * 这里以前读 `config.dsh.admins` —— 那是迁移前的旧位置，迁移后永远是空数组，
+   * 于是下面那条"管理员私聊也能收到审批推送"的提示**再也不会显示**，
+   * 用户会以为审批推送坏了。保留旧位置兜底：万一迁移还没跑到。
+   */
+  const adminRaw =
+    snap?.config?.plugins?.config?.['dsh-bridge']?.admins ?? snap?.config?.dsh?.admins ?? '';
+  const admins = Array.isArray(adminRaw)
+    ? adminRaw
+    : String(adminRaw ?? '')
+        .split(/[,，、\s]+/)
+        .filter(Boolean);
 
   const hostTools = tools.filter((t) => t.kind === 'host');
   const qqTools = tools.filter((t) => t.kind !== 'host');
@@ -322,45 +335,57 @@ export function renderSecurity(snap, ctx = {}) {
       emptyPrivate: '黑名单为空。要拦某个人就在下面加。',
     }),
 
+    /*
+     * 四层防线。
+     *
+     * 原来用「L1 准入 / L2 授权 / L3 约束 / L4 审计」编号。
+     * 改成语义名称：L 编号原来在记忆页也有一套（L3 情境 / L4 工具 / L5 契约），
+     * 两套编号撞在一起 —— 用户在两个页面看到两个不同的「L3」，
+     * 会以为是同一套体系里的同一个东西。记忆那套已经删了，
+     * 但编号本身没有信息量，不如直接说它管什么。
+     */
     card('四层防线', [
       el('div', { class: 'list' }, [
         kv(
-          'L1 准入',
+          '准入',
           `白名单 群 ${allow.groups.length} / 私聊 ${allow.private.length}，黑名单 ${deny.groups.length + deny.private.length}`,
         ),
-        kv('L2 授权', '只看回合来源（origin），不看对话内容'),
-        kv('L3 约束', '路径根 / 命令白名单 / 上限 / 跨会话隔离'),
-        kv('L4 审计', '出站文本 + 调用流水'),
+        kv('授权', '只看回合来源（origin），不看对话内容'),
+        kv('约束', '路径根 / 命令白名单 / 上限 / 跨会话隔离'),
+        kv('审计', '出站文本 + 调用流水'),
       ]),
     ]),
+
+    /*
+     * 这里原来有一张「工具面（F14）」列表，逐条列出宿主工具与 QQ 工具。
+     *
+     * 已经删掉：完整工具列表现在只在《工具调用》页维护一份。
+     * 同一批数据在两个页面各画一遍，加一个工具就得记得改两处 ——
+     * 漏改的那次不会报错，只会让两个页面说的不一样，
+     * 而用户没法判断该信哪个。
+     *
+     * 这一页保留的是**安全判定本身**（谁能调、按什么规则判），
+     * 那才是"系统安全"该讲的东西。
+     */
 
     card('工具面（F14）', [
       el('div', { class: 'muted', text: '未声明 origins 的工具谁都调不到；群聊来源永远看不到宿主机工具。' }),
       el('div', { class: 'spacer-10' }),
-      hostTools.length === 0 && qqTools.length === 0
-        ? el('div', { class: 'empty', text: '尚未登记任何工具' })
-        : el('div', {}, [
-            ...hostTools.map((t) =>
-              el('div', { class: 'tool-row' }, [
-                el('div', {}, [
-                  el('strong', { text: t.name }),
-                  el('div', { class: 'muted', text: t.description ?? '' }),
-                ]),
-                el('div', { class: 'taglist' }, [
-                  el('span', { class: 'tool-tag', text: t.risk }),
-                  el('span', { class: 'tool-tag', text: (t.origins ?? []).join(' / ') }),
-                ]),
-              ]),
-            ),
-            ...qqTools.map((t) =>
-              el('div', { class: 'tool-row' }, [
-                el('div', {}, [el('strong', { text: t.name })]),
-                el('div', { class: 'taglist' }, [el('span', { class: 'tool-tag', text: t.risk })]),
-              ]),
-            ),
-          ]),
+      el('div', { class: 'row wrap' }, [
+        pill(`宿主机工具 ${hostTools.length} 个`, hostTools.length > 0 ? 'warn' : 'dim'),
+        pill(`QQ 工具 ${qqTools.length} 个`, qqTools.length > 0 ? 'dim' : 'dim'),
+      ]),
+      el('div', { class: 'spacer-8' }),
+      el('div', {
+        class: 'field-hint',
+        text: '具体有哪些工具、各自对谁开放，见「工具调用」页。',
+      }),
     ]),
 
+    /*
+     * 来源表也保留 —— 但这是**判定规则**，不是工具清单。
+     * 工具清单会变（插件装卸），来源规则不会变（写在代码里）。
+     */
     card('回合来源与默认工具集', [
       el('div', { class: 'list' }, [
         kv('owner-private（管理员私聊）', pill('宿主机工具（按配置）', 'warn')),

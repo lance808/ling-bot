@@ -321,6 +321,30 @@ async function startBridge(ctx) {
         rt.log?.(`推送失败：${String(/** @type {any} */ (err)?.message ?? err)}`);
       }
     },
+    // DSH 桌面端先回答了：告诉管理员 QQ 这条不用再回了。
+    //
+    // 为什么必须发：不发的话那条推送还挂在聊天记录里，用户会以为还要回答，
+    // 回过来却只会得到"没有这条待回复"——看起来像丢了消息。
+    //
+    // 失败只记日志：撤销本身已经在桥里生效了，通知只是善后，
+    // 不能因为 QQ 没连上就让 DSH 以为撤销失败。
+    onNotify: async (info) => {
+      const id = String(info?.id ?? '?');
+      const text = `[#${id}] 已在 DSH 桌面端处理，QQ 这条不用再回了`;
+      const send = rt.sendText;
+      if (!send) {
+        rt.log?.('撤销通知跳过：没有可用的发送通道（ctx.sendText 缺失）');
+        return;
+      }
+      try {
+        const r = await send(rt.ownerConvKey, text);
+        if (r && r.ok === false) {
+          rt.log?.(`撤销通知被拒：${r.code} ${r.message}`);
+        }
+      } catch (err) {
+        rt.log?.(`撤销通知发送失败：${String(/** @type {any} */ (err)?.message ?? err)}`);
+      }
+    },
     // 用队列模式：DSH 侧轮询 /dsh/drain 取走，插件不主动连 DSH
     onCommand: null,
   });

@@ -154,3 +154,64 @@ test('提问类条目保留 multiSelect', () => {
   q.settle('1', { any: 'thing' });
   return p;
 });
+
+/* ---------------------------------------------------------------- 两段式 */
+
+test('enqueue 同时交出编号和 Promise', async () => {
+  const q = new PendingQueue({ timeoutMs: 1000 });
+  const { id, promise } = q.enqueue(spec());
+  assert.equal(id, '1');
+  assert.deepEqual(q.ids(), ['1']);
+  q.settle(id, 'allowed-once');
+  const r = await promise;
+  assert.equal(r.status, 'answered');
+  assert.equal(r.value, 'allowed-once');
+});
+
+test('wait 与 enqueue 是同一份实现（编号仍然从 1 起）', () => {
+  const q = new PendingQueue({ timeoutMs: 1000 });
+  const p = q.wait(spec());
+  assert.deepEqual(q.ids(), ['1']);
+  q.settle('1', 'rejected');
+  return p;
+});
+
+test('★ withdraw 以 withdrawn 结算，并把条目移出在册', async () => {
+  const q = new PendingQueue({ timeoutMs: 5000 });
+  const { id, promise } = q.enqueue(spec());
+  assert.deepEqual(q.withdraw(id, 'desktop'), { ok: true });
+  const r = await promise;
+  assert.equal(r.status, 'withdrawn', '撤销不能表现成超时或拒绝');
+  assert.equal(r.reason, 'desktop');
+  assert.deepEqual(q.ids(), [], '撤销后不能再占着编号');
+});
+
+test('withdraw 不写 reason 时按 desktop（目前只有桌面端会撤销）', async () => {
+  const q = new PendingQueue({ timeoutMs: 5000 });
+  const { promise } = q.enqueue(spec());
+  q.withdraw('1');
+  assert.equal((await promise).reason, 'desktop');
+});
+
+test('★ withdraw 不存在的编号要报错，不能静默成功', () => {
+  const q = new PendingQueue({ timeoutMs: 1000 });
+  const r = q.withdraw('7', 'desktop');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /7/);
+});
+
+test('★ withdraw 之后不能再被 settle（旧编号不能翻案）', async () => {
+  const q = new PendingQueue({ timeoutMs: 5000 });
+  const { promise } = q.enqueue(spec());
+  q.withdraw('1', 'desktop');
+  assert.equal(q.settle('1', 'allowed-once').ok, false);
+  assert.equal(q.withdraw('1', 'desktop').ok, false, '同一条不能撤两次');
+  assert.equal((await promise).status, 'withdrawn');
+});
+
+test('withdraw 之后条目立刻从列表消失', () => {
+  const q = new PendingQueue({ timeoutMs: 5000 });
+  q.enqueue(spec({ preview: 'fs_write' }));
+  q.withdraw('1', 'desktop');
+  assert.deepEqual(q.list(), []);
+});

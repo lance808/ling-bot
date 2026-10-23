@@ -805,6 +805,55 @@ test('runTurn：非推理模型时 thinkingTrace 是空数组', async () => {
   assert.equal(res.text, '答');
 });
 
+test('★ runTurn：中途失败时，失败前已产生的思考要挂在错误上带出去', async () => {
+  /*
+   * 真实场景：模型先想了一步、调了工具，第二次调用上游 500。
+   * 如果异常一路裸抛，那一步思考就永远消失了 —— 而用户排查
+   * "它怎么答成这样"时最需要看的恰恰是它。
+   */
+  let i = 0;
+  const runner = {
+    availableTools: () => [
+      { name: 'web_search', kind: 'host', risk: 'R0', origins: ['owner-private'], description: '搜', params: {} },
+    ],
+    run: async () => ({ ok: true, result: { content: '晴' } }),
+  };
+  const llm = {
+    async chat() {
+      i += 1;
+      if (i === 1) {
+        return {
+          text: '',
+          reasoning: '先查一下天气。',
+          toolCalls: [{ id: 'c1', name: 'web_search', arguments: '{"q":"天气"}' }],
+          usage: { totalTokens: 1 },
+          model: 'fake',
+          cancelled: false,
+        };
+      }
+      throw new Error('上游 500');
+    },
+  };
+
+  let caught = null;
+  try {
+    await runTurn({
+      llm,
+      runner,
+      toOpenAiTools: (t) => t.map((x) => ({ type: 'function', function: { name: x.name } })),
+      messages: [{ role: 'user', content: '今天天气？' }],
+    });
+  } catch (err) {
+    caught = /** @type {any} */ (err);
+  }
+
+  assert.ok(caught, '错误必须继续往上抛，不能被吞掉');
+  assert.equal(caught.message, '上游 500');
+  assert.equal(caught.thinkingTrace?.length, 1, '失败前的思考不能丢');
+  assert.equal(caught.thinkingTrace[0].reasoning, '先查一下天气。');
+  assert.deepEqual(caught.thinkingTrace[0].tools, ['web_search']);
+});
+
 /* ----------------------------------------------------- 「没有思考内容」也要能解释 */
 
 test('★ 没有 reasoning 时不留空记录，但要留下可解释的标记', () => {

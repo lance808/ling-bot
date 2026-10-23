@@ -20,6 +20,12 @@ import { readJson, writeJsonAtomic } from './config/atomic.mjs';
 import { Logger } from './config/logger.mjs';
 import { OneBotClient, CLIENT_STATE } from './onebot/client.mjs';
 import { normalizeEvent, escapeCq } from './onebot/events.mjs';
+import { isSelfMessage, MessageDedup, TurnQueue } from './session/inbound.mjs';
+import { SessionStore } from './session/store.mjs';
+import { DiaryStore, DiaryScheduler } from './diary/store.mjs';
+import { generateDiary, collectGroupsForDate } from './diary/generate.mjs';
+import { localDateKey } from './diary/decay.mjs';
+import { computeWeight, isHidden, shouldIncludeInContext } from './diary/decay.mjs';
 import { UpstreamHealth } from './onebot/health.mjs';
 import { passSendGate, checkWhitelist, RateLimiter } from './guard/send-gate.mjs';
 import { auditOutbound, maskSecret } from './guard/audit.mjs';
@@ -28,7 +34,7 @@ import { resolveToolSet, toOpenAiTools, RISK } from './guard/tool-gate.mjs';
 import { listTools, describeTools } from './tools/registry.mjs';
 import { registerReadonlyTools } from './tools/basic.mjs';
 import { createToolRunner } from './tools/executor.mjs';
-import { installBuiltinPlugins } from './tools/builtin-plugins.mjs';
+import { installBuiltinPlugins, migrateLegacyPlugins } from './tools/builtin-plugins.mjs';
 import { PluginManager } from './plugins/manager.mjs';
 import { migrateLegacyDsh } from './plugins/legacy.mjs';
 import { registerAllActions, snapshotRegistry, renderRegistryBanner } from './registry.mjs';
@@ -43,7 +49,8 @@ import { LlmClient, estimateTokens, THINKING_STYLES } from './llm/client.mjs';
 const THINKING_STYLE_KEYS = new Set(['auto', ...Object.keys(THINKING_STYLES)]);
 import { buildMessages, DEFAULT_PERSONA } from './llm/prompt.mjs';
 import { runTurn, truncationNotice } from './llm/agent-loop.mjs';
-import { detectTrigger, decideProactive, isStrongTrigger, TriggerLedger } from './llm/triggers.mjs';
+import { detectTrigger, detectPokeTrigger, decideProactive, isStrongTrigger, TriggerLedger, WakeLedger } from './llm/triggers.mjs';
+import { SilenceGate, parseSilenceCommand, SILENCE_REASON, MAX_MUTE_MS, matchWindow } from './llm/silence.mjs';
 import { UsageLedger } from './llm/usage.mjs';
 import { PersonaStore, RoleStore } from './llm/persona.mjs';
 import { ThinkingStore } from './llm/thinking.mjs';
@@ -87,18 +94,156 @@ let currentApiKey = '';
 let usageLedger;
 /** 触发状态簿（主动发言的 30 分钟间隔靠它） */
 const triggerLedger = new TriggerLedger();
+/**
+ * 唤醒频率账本。
+ *
+ * 和 triggerLedger 分工不同：那个管"它自己想说话的间隔"，
+ * 这个管"因为别人的消息起回合"的节奏 —— 两件不同的事。
+ * 一个活跃群每分钟几十条消息，每条都起回合就是刷屏 + 烧钱。
+ *
+ * 超限时**不触发**（而不是排队）：排队的语义是"稍后回复"，
+ * 而这里的问题是"不该回"。见 src/llm/triggers.mjs 的 WakeLedger 注释。
+ */
+const wakeLedger = new WakeLedger();
+
+/**
+ * 静音闸门（F20「闭嘴」）。
+ *
+ * 四种来源：全局 / 按会话 / 时段 / 指令临时。
+ * 只有"指令临时"有内存状态，其余三种从配置现算 —— 所以重启后
+ * 临时静音自然失效（用户重启往往就是想让它恢复）。
+ *
+ * 它**独立于** `wake` 并且排在它前面：wake 是"什么消息值得回应"的语义判断，
+ * 静音是"现在根本不许说话"的绝对压制。混在一起就会出现
+ * "消息特别像在叫它 → 还是回了"，那静音就是假的。
+ */
+const silenceGate = new SilenceGate();
+
+/**
+ * 这个发消息的人能不能用静音指令。
+ *
+ * 唯一来源是 `silence.adminIds`。
+ *
+ * ## 为什么不复用 `dsh.admins`
+ *
+ * DSH 已经是**独立插件**了。核心功能反向依赖插件配置会出两个问题：
+ *
+ *   1. 不装 DSH 插件的用户配不了静音指令 —— 字段藏在别处，根本找不到
+ *   2. 卸载插件后静音权限凭空消失，而用户不知道为什么
+ *
+ * 而且两者授权范围不同：`dsh.admins` 管的是"能否操作本机 DSH"，
+ * 静音只是让它闭嘴。愿意把静音权限给更多人、但不愿给本机操作权，
+ * 是很正常的要求。
+ *
+ * ## 为什么空名单 = 谁都不能
+ *
+ * 静音能让机器人彻底不说话。默认给所有人这个能力，
+ * 等于把"让它闭嘴"变成群友可以随手用的骚扰手段。
+ * fail-closed 在这里是对的。
+ *
+ * @param {object} evt
+ * @returns {boolean}
+ */
+function isAdmin(evt) {
+  const from = String(evt?.sender?.userId ?? '').trim();
+  if (!from) return false;
+  // 自己发的消息已经在上游被过滤掉，这里再挡一层：不能自己给自己下指令
+  if (selfId && from === String(selfId)) return false;
+
+  const list = Array.isArray(config.silence?.adminIds) ? config.silence.adminIds : [];
+  return list.some((id) => String(id).trim() === from);
+}
+
+/**
+ * 执行一条静音指令，并在会话里回一句确认。
+ *
+ * ## 为什么一定要回执
+ *
+ * 指令是"改变状态"的操作，没有回执用户就不知道有没有生效 ——
+ * 然后他会反复发，或者以为坏了。回执还要**说清什么时候恢复**，
+ * 否则用户只能盯着表等。
+ *
+ * @param {object} evt
+ * @param {{kind: 'mute', ms: number} | {kind: 'unmute'}} cmd
+ */
+async function handleSilenceCommand(evt, cmd) {
+  const convKey = evt.convKey;
+  try {
+    if (cmd.kind === 'unmute') {
+      const r = silenceGate.unmute(convKey);
+      log.info('静音指令：解除', { convKey, wasSilent: r.wasSilent });
+      await sendText(
+        convKey,
+        r.wasSilent
+          ? '好，我回来了。'
+          : '我本来就没在静音。如果还是没反应，可能是全局静音或静默时段开着，那个得在桌面端改。',
+      );
+      return;
+    }
+
+    /*
+     * 上限来自配置：`maxMuteMs` 兜住"闭嘴 999d"这种手滑。
+     * 0 表示不限 —— 但那时也不该让一条聊天指令把机器人永久静音，
+     * 所以仍然用 MAX_MUTE_MS 兜底。
+     */
+    const cap = Number(config.silence?.maxMuteMs) > 0 ? Number(config.silence.maxMuteMs) : MAX_MUTE_MS;
+    const ms = Math.min(cmd.ms, cap);
+    const { until } = silenceGate.mute(convKey, ms);
+
+    const mins = Math.max(1, Math.round(ms / 60_000));
+    const untilText = new Date(until).toLocaleTimeString('zh-CN', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    log.info('静音指令：闭嘴', { convKey, ms, until });
+
+    await sendText(convKey, `好，我安静 ${mins} 分钟，到 ${untilText} 自动恢复。想提前叫我说话就发「说话」。`);
+  } catch (err) {
+    log.warn('静音指令回执发送失败', {
+      convKey,
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
+}
 /** 每个会话的最近消息（拼上下文用，比全局 messages 更准） */
 /** @type {Map<string, Array<{role: string, nickname?: string, text: string}>>} */
 const recentByConv = new Map();
 /** 正在跑的回合：同一会话同时只允许 1 个（F7 并发约束） */
 /** @type {Map<string, AbortController>} */
 const inflight = new Map();
-/** 排队等待的强触发（不能用"忙"把人晾着） */
-/** @type {Map<string, object>} */
-const pendingTurns = new Map();
+/**
+ * 排队等待的强触发（不能用"忙"把人晾着）。
+ *
+ * ## 为什么从 Map 换成了 TurnQueue
+ *
+ * 原来是 `Map<string, job>` —— 一个会话只有一个槽位。回合还在跑的时候
+ * 连着来两条 @，第二条直接 `set` 把第一条**覆盖**掉：第一条永远不会被回复，
+ * 而日志里看起来"排过队"。这种静默丢弃没有任何错误可查，用户只看到
+ * "连问两句只回最后一句"。队列 + 上限才是正确形状。
+ */
+const pendingTurns = new TurnQueue({ limit: 5 });
+/**
+ * 已处理消息的去重表。
+ *
+ * 断线重连和上游补发会把同一条消息再推一次，没有它就会同一个问题跑两个回合。
+ */
+const dedup = new MessageDedup();
 /** 待人工确认的 R2/R3 工具调用 */
 /** @type {Map<string, {resolve: Function, timer: NodeJS.Timeout, req: object}>} */
 const pendingConfirms = new Map();
+/**
+ * 确认序号 → 确认编号。
+ *
+ * 卡片上让用户回 1/2，而结算需要的是完整的 `confirm-...` 编号，
+ * 中间这一层就是映射。为什么不用"直接拿第 N 条"：Map 的迭代顺序
+ * 在删除元素后虽仍稳定，但用户看到的序号是在**推送那一刻**定下的，
+ * 中途有人答掉一条后重新数会错位，必须冻结当时的映射。
+ *
+ * 序号按创建顺序分配，最小的可用正整数（释放后复用）。
+ */
+/** @type {Map<number, string>} */
+const confirmSeq = new Map();
 /**
  * 插件管理器：骨架改造后所有插件相关的事都归它管
  * （扫描/校验/启停/配置/工具登记/诊断）。
@@ -128,11 +273,73 @@ const roleStore = new RoleStore({ filePath: paths.rolePath });
  */
 const thinkingStore = new ThinkingStore({ dir: paths.thinkingDir });
 
+/**
+ * 会话楼层仓库：每条消息一个楼层号，加上「读到第几楼」。
+ *
+ * ## 它解决的是「回复混乱」的根，不只是存档
+ *
+ * 之前会话只活在内存里的 `messages` 数组（上限 500），重启即清空。
+ * 但更麻烦的是它没有「读到哪儿」的记号 —— 于是"这一回合该喂哪些消息"
+ * 只能靠 `最近 20 条` 这种模糊说法，一旦并发或补发就会重复喂、或者漏喂。
+ *
+ * 楼层 + 读楼层把这件事变成一个精确的事实，见 session/store.mjs 的文件头。
+ */
+const sessionStore = new SessionStore({ filePath: paths.sessionsPath });
+
+/**
+ * 日记仓库：一天一个文件 `data/state/diary/<YYYY-MM-DD>.json`。
+ *
+ * 它只负责**存**。怎么把一天的聊天变成一篇总结在 diary/generate.mjs 里，
+ * 因为那边要调 LLM —— 而"存"这块最需要能脱离模型单测。
+ */
+const diaryStore = new DiaryStore({ dir: paths.diaryDir });
+
+/**
+ * 跨日调度器。
+ *
+ * 它不读写磁盘、也不调模型，只依赖注入的四个回调（这也是它能单测的原因）。
+ * 两个触发点：
+ *   · 启动时 `catchUpOnStartup()` —— 补生成昨天（如果缺失且有活动）
+ *   · 运行中每分钟 `tick()` —— 跨过零点时生成昨日
+ *
+ * 幂等由两层保证：内存的已生成集合 + 磁盘存在性检查。
+ * 重启后内存集合必然空，靠后者兜住。
+ *
+ * @type {DiaryScheduler | null}
+ */
+let diaryScheduler = null;
+
 /* ---------------------------------------------------------------- 启动 */
 
 async function boot() {
   const userConfig = (await readJson(paths.configPath)) ?? {};
   config = validateConfig(userConfig);
+
+  /*
+   * 旧配置迁移：`llm.keywords` → `wake.keywords`。
+   *
+   * ## 为什么不直接把 llm.keywords 删掉
+   *
+   * `mergeStrict` 对未知键是**硬错误**（E40XX）。老用户的 config.json
+   * 里还写着 `llm.keywords`，删掉这个字段就等于让他们升不了级 ——
+   * 一启动就报"未知键"，而且看起来像程序坏了。
+   *
+   * 所以两边都留着：`llm.keywords` 继续被 schema 接受、迁移后不再使用，
+   * 这和 `dsh` 块的处理方式一致（保留但标记废弃）。
+   *
+   * ## 为什么迁移要保护用户已填的 wake.keywords
+   *
+   * 用户可能已经在新位置填了关键词。如果无脑用旧值覆盖，
+   * 他刚配好的东西就没了。所以只在**新位置为空**时才搬。
+   */
+  {
+    const legacy = Array.isArray(config.llm?.keywords) ? config.llm.keywords : [];
+    const current = Array.isArray(config.wake?.keywords) ? config.wake.keywords : [];
+    if (legacy.length > 0 && current.length === 0) {
+      config.wake.keywords = [...legacy];
+      log.info('已把 llm.keywords 迁移到 wake.keywords', { 数量: legacy.length });
+    }
+  }
 
   /*
    * 旧配置迁移：`config.dsh` → 插件 `dsh-bridge` 的配置与启用状态。
@@ -215,6 +422,89 @@ async function boot() {
     });
   }
 
+  /*
+   * 读回会话楼层。
+   *
+   * 这一步让「按条读取聊天记录」成为可能：重启之后历史还在，
+   * 而且读楼层也跟着回来 —— 不会一重启就把所有旧消息当成未读重跑一遍。
+   *
+   * 失败同样不能拦住启动：会话历史是"有更好"的数据，
+   * 但坏文件必须留证据（store 会改名成 .corrupt），不能悄悄删。
+   */
+  try {
+    const restored = await sessionStore.load();
+    if (restored.recovered) {
+      log.warn('会话楼层文件损坏，已留证并重建', { reason: restored.error });
+    } else if (restored.loaded > 0) {
+      log.info('已恢复会话楼层', { 会话数: restored.loaded });
+    }
+  } catch (err) {
+    log.warn('读取会话楼层失败（不影响对话）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
+
+  /*
+   * 读回日记 —— 「启动时，读取日记」。
+   *
+   * 顺序在 sessionStore 之后：跨日补生成要查"昨天有没有会话活动"，
+   * 那个数据在会话楼层里。
+   */
+  try {
+    const restored = await diaryStore.load();
+    if (restored.recovered) {
+      log.warn('部分日记文件损坏，已隔离为 .corrupt', { 已恢复: restored.loaded });
+    } else if (restored.loaded > 0) {
+      log.info('已恢复日记', { 天数: restored.loaded });
+    }
+  } catch (err) {
+    log.warn('读取日记失败（不影响对话）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
+
+  /*
+   * 装好跨日调度器并做一次启动补生成。
+   *
+   * ## 为什么补生成失败不能拦住启动
+   *
+   * 日记是"有更好"的数据。而且调度器自己会把失败的那天挂起来，
+   * 退避窗口过后由每分钟的 tick() 重试 —— 所以启动这一次失败
+   * 不等于这一天永远没有日记。
+   */
+  diaryScheduler = new DiaryScheduler({
+    hasDiary: (date) => diaryStore.has(date),
+    hasActivity: (date) => sessionStore.hasActivityOn(date),
+    onGenerate: (date, trigger) => generateYesterdayDiary(date, trigger),
+  });
+  try {
+    const caught = await diaryScheduler.catchUpOnStartup();
+    if (caught.generated) {
+      log.info('已补生成昨日日记', { date: caught.date });
+    } else if (caught.reason !== 'exists') {
+      log.info('昨日日记无需补生成', { date: caught.date, reason: caught.reason });
+    }
+  } catch (err) {
+    log.warn('补生成昨日日记失败（会在后续重试）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
+
+  /*
+   * 每分钟检查一次有没有跨日。
+   *
+   * 用 unref：这个定时器不该拖住进程退出 —— 否则用户点关闭后
+   * 要等最多一分钟程序才真的退，看起来像卡死。
+   */
+  {
+    const timer = setInterval(() => {
+      void diaryScheduler?.tick().catch((err) => {
+        log.warn('日记跨日检查失败', { message: String(/** @type {any} */ (err)?.message ?? err) });
+      });
+    }, 60_000);
+    timer.unref?.();
+  }
+
   // LLM 客户端：没配 key 也照常构造，只是 configured=false，界面据此提示
   llm = new LlmClient({
     baseUrl: config.llm.baseUrl,
@@ -249,10 +539,9 @@ async function boot() {
 
   // 内置插件铺盘。
   //
-  // 加载器只认 <userData>/plugins/，仓库里的 plugins/ 是出厂源。
-  // 不铺过去，"默认启用"的那个插件就永远不在磁盘上，而症状是
-  // **什么都没发生**（配置说启用、加载器说 0 个插件、端口没起），
-  // 排查成本远高于这里多做一步。
+  // 加载器只认插件目录，出厂源是随包的 plugins/。两者**现在默认是同一个
+  // 目录**（插件目录已从 %APPDATA% 改到程序目录下），这种情况下
+  // installBuiltinPlugins 会直接跳过 —— 见该函数里的路径相等判断。
   //
   // 失败不致命：一个可选功能装不上，不该让主程序起不来。
   try {
@@ -268,6 +557,19 @@ async function boot() {
       message: String(/** @type {any} */ (err)?.message ?? err),
     });
   }
+
+  /*
+   * 旧插件目录迁移。
+   *
+   * 插件目录从 `%APPDATA%\ling-bot\plugins` 改到了程序目录下。
+   * 不迁移的话，用户在旧目录里装的插件会**静默消失** ——
+   * 配置里还写着启用，加载器却说 0 个插件，界面上一切正常。
+   * 这种"什么都没发生"的故障最难解释。
+   *
+   * 只做**补齐**，不覆盖目标目录已有的东西：新目录里已经有同名插件，
+   * 说明用户已经在新位置改过了，旧副本不该反向冲掉它。
+   */
+  await migrateLegacyPlugins(paths, log);
 
   // 插件：空 enabled = 一个都不加载（默认关闭，光放文件不生效）
   plugins = new PluginManager({
@@ -357,33 +659,525 @@ function startStatusPoll() {
 /** @param {object} evt */
 function handleEvent(evt) {
   if (evt.kind === 'message') {
+    /*
+     * ---- 第一关：重复投递 ----
+     *
+     * 断线重连、上游补发都会把同一条消息再推一遍。如果放过去，
+     * 同一个问题会跑两个回合、发两条回复 —— 这是「回复混乱」的一种。
+     *
+     * 去重必须放在**最前面**：连界面展示和上下文都不该被同一条消息污染两次。
+     */
+    if (dedup.markSeen(evt.convKey, evt.messageId)) {
+      log.info('丢弃重复投递的消息', { convKey: evt.convKey, messageId: evt.messageId });
+      return;
+    }
+
     messages.push(evt);
     if (messages.length > 500) messages = messages.slice(-500);
 
-    // 记上下文：主动发言必须能"接上最近一句"
+    /*
+     * 分配楼层号。
+     *
+     * 放到 recent 之前：楼层是「这条消息被本会话收下」的事实，
+     * 而上下文只是它的一个视图。失败时（会话键非法）只记一行，
+     * 不拦对话 —— 一条消息进不了历史，不该让它连回复都没有。
+     */
+    const appended = sessionStore.append(evt.convKey, evt);
+    if (!appended.ok) {
+      log.warn('消息未写入会话楼层', { convKey: evt.convKey, code: appended.code, message: appended.message });
+    }
+
+    /*
+     * ---- 第二关：自己发的消息 ----
+     *
+     * ## 这是「回复混乱」最直接的来源
+     *
+     * 自己发出去的话如果被上游当作普通 message 事件推回来，原来会被
+     * 无差别塞进 recentByConv，下一轮 `buildMessages` 把它渲染成
+     * 「群友：<自己刚说的话>」。模型于是接自己的话、重复自己 ——
+     * 而且因为上下文看起来"很连贯"，这个 bug 极难从日志里看出来。
+     *
+     * 记成 assistant 而不是丢掉：主动发言要能"接上自己上一句"，
+     * 那正是 assistant 角色该表示的意思。
+     */
+    const fromSelf = isSelfMessage(evt, selfId);
     pushRecent(evt.convKey, {
-      role: 'user',
+      role: fromSelf ? 'assistant' : 'user',
       nickname: evt.sender?.nickname || evt.sender?.userId,
       text: evt.text || '（无文本）',
+      // 带上楼层号：回合开始时据此精确登记"哪些楼真的进了模型"
+      floor: appended.ok ? appended.floor : null,
     });
 
     // 真人说过话 —— 这是概率唤醒的第 1 道护栏的输入
-    if (String(evt.sender?.userId) !== String(selfId)) {
+    if (!fromSelf) {
       triggerLedger.noteHuman(evt.convKey);
     }
 
     rpc.notify('message', evt);
 
+    // 自己说的话不触发回合，否则就是自己跟自己对话
+    if (fromSelf) return;
+
     // 插件优先接管（例如 DSH 指令、审批回复）。
     // 有插件明确处理了就**不走 AI 回合**，避免"已经执行了还在回一句废话"。
-    void dispatchToPlugins(evt);  } else if (evt.kind === 'self-sent') {
+    void dispatchToPlugins(evt);
+  } else if (evt.kind === 'self-sent') {
     rpc.notify('self-sent', evt);
   } else if (evt.kind === 'poke') {
     rpc.notify('poke', evt);
+    /*
+     * 被拍一拍也要能触发回合。
+     *
+     * 拍一拍是 notice 事件、没有正文，所以走单独的判定函数
+     * （detectTrigger 的整条 message 路径都不适用）。
+     *
+     * 注意 POKE 是**弱触发**：它会看一眼，但不会插队到正在跑的回合前面 ——
+     * 拍一拍太轻，群里还常连环互拍，不值得为它打断一次认真回答。
+     */
+    if (evt.convKey && checkWhitelist(evt.convKey, config).ok) {
+      /*
+       * 静音期间拍一拍也不回应。
+       *
+       * 拍一拍走的是独立路径（不经过 considerTurn），所以这里必须
+       * **单独**再挡一次。只在 considerTurn 里挡的话，
+       * 静音期间别人拍它一下它还是会冒出来 —— 而拍一拍在群里
+       * 恰恰是最容易被随手用的动作。
+       */
+      if (silenceGate.check(evt.convKey, config).silent) {
+        log.info('静音中，忽略拍一拍', { convKey: evt.convKey });
+      } else {
+        const pokeTrigger = detectPokeTrigger(evt, { selfId, wake: config.wake });
+        if (pokeTrigger) {
+          const gate = wakeLedger.check(evt.convKey, {
+            maxPerMinute: config.wake?.maxWakePerMinute,
+            maxPerHour: config.wake?.maxWakePerHour,
+          });
+          if (gate.ok) {
+            wakeLedger.note(evt.convKey);
+            enqueue(evt.convKey, {
+              evt: {
+                ...evt,
+                kind: 'message',
+                isGroup: evt.convKey.startsWith('group:'),
+                text: '',
+                atSelf: true,
+              },
+              trigger: pokeTrigger.trigger,
+              reason: pokeTrigger.reason,
+              proactive: false,
+            });
+          }
+        }
+      }
+    }
   } else if (evt.kind === 'request') {
     // 只展示，不自动同意（F3 边界）
     log.info('收到好友加群请求（未自动处理）', { type: evt.requestType, user: evt.userId });
     rpc.notify('request', evt);
+  }
+}
+
+/**
+ * 日记的界面视图。
+ *
+ * ## 为什么在这里现算权重
+ *
+ * 落盘的只有 `weightBase` / `weightBaseDate`（写下那天的快照）。
+ * 当前权重必须按"今天 - 写下那天"现算，否则程序没开的那几天就不衰减了。
+ * 见 diary/decay.mjs 的文件头。
+ *
+ * ## 为什么失败要兜底成空
+ *
+ * 日记是纯展示数据。它算不出来绝不能让整份快照失败 ——
+ * 那样用户连消息列表都看不到，症状是"界面拉取失败"。
+ *
+ * @returns {object}
+ */
+function snapshotDiary() {
+  try {
+    const now = Date.now();
+    const items = diaryStore.list().map((rec) => {
+      const w = computeWeight({
+        weightBase: rec.weightBase,
+        weightBaseDate: rec.weightBaseDate,
+        locked: rec.locked,
+        lockedWeight: rec.lockedWeight,
+        decayPerDay: config?.diary?.decayPerDay,
+        now,
+      });
+      return {
+        ...rec,
+        weight: w.weight,
+        faded: w.faded,
+        daysElapsed: w.daysElapsed,
+        // 界面据此决定默认列表里要不要藏起来（等于阈值仍然可见）
+        hidden: isHidden(w.weight, config?.diary?.hiddenBelowWeight),
+        // 是否还够格进上下文（淡忘到一定程度就不再影响它的判断）
+        inContext: shouldIncludeInContext(w.weight, config?.diary?.contextMinWeight),
+      };
+    });
+    return { days: items, count: items.length };
+  } catch (err) {
+    log.warn('日记视图计算失败（不影响对话）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+    return { days: [], count: 0 };
+  }
+}
+
+/**
+ * 静音的界面视图（F20）。
+ *
+ * ## 为什么要分「配置里设的」和「现在实际生效的」
+ *
+ * 用户看到的必须是**现在为什么不说话**，而不是"我设了什么"。
+ * 时段静默可能在半夜自动生效、聊天指令可能开了 30 分钟临时静音 ——
+ * 只显示配置会让用户对着开关发愣：「我明明没开全局静音，它怎么不回话？」
+ *
+ * 所以除了原样给出配置，还要把每种来源**当前是否命中**算出来。
+ *
+ * @returns {object}
+ */
+function snapshotSilence() {
+  try {
+    const cfg = config?.silence ?? {};
+    const now = Date.now();
+
+    // 时段命中情况（只报告，不改配置）
+    const w = matchWindow(now, cfg.windows);
+
+    /*
+     * 全局静音已经开着时，逐会话检查没有意义 —— 结果全是"静音"，
+     * 而会话可能有几百个。UI 只需要知道"全都闭嘴了"。
+     */
+    const all = cfg.all === true;
+
+    return {
+      all,
+      convKeys: Array.isArray(cfg.convKeys) ? cfg.convKeys : [],
+      windows: Array.isArray(cfg.windows) ? cfg.windows : [],
+      allowCommand: cfg.allowCommand !== false,
+      adminIds: Array.isArray(cfg.adminIds) ? cfg.adminIds : [],
+      defaultMuteMs: cfg.defaultMuteMs ?? 1800000,
+      maxMuteMs: cfg.maxMuteMs ?? 86400000,
+      // 运行态
+      windowHit: w.hit,
+      windowNow: w.window ? `${w.window.start}–${w.window.end}` : '',
+      temporary: silenceGate.listTemporary(now),
+      // 一句话说明现在为什么闭嘴（没有静音时是空串）
+      summary: all
+        ? '全局静音：所有会话都不回复'
+        : w.hit
+          ? `静默时段 ${w.window?.start}–${w.window?.end}：所有会话都不回复`
+          : '',
+    };
+  } catch (err) {
+    log.warn('静音视图计算失败（不影响对话）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+    return { all: false, convKeys: [], windows: [], temporary: [], summary: '' };
+  }
+}
+
+/**
+ * 把一项唤醒设置写进 config。
+ *
+ * ## 为什么运行时必须自己校验
+ *
+ * `mergeStrict` 只在启动时跑。运行时改内存 config 是绕过它的，
+ * 所以类型和范围都得在这里把关。最容易踩的两个坑：
+ *
+ *   · 数字字段收到字符串（"5" / "abc"）→ 后者变 NaN，比较永远为 false，
+ *     表现为"这个设置怎么调都没反应"
+ *   · 数组字段收到逗号分隔的字符串（界面输入框常见）→ 存成字符串后
+ *     `.includes()` 变成子串匹配，关键词会误命中
+ *
+ * ## 语义约定
+ *
+ * `maxWakePerMinute` / `maxWakePerHour` 的 0 表示**不限制**，
+ * 不是"一次都不许"。用户清成 0 的意思是"我不管"，
+ * 真想让机器人闭嘴该关 wake 整组（或关 proactive.enabled）。
+ *
+ * @param {any} config
+ * @param {string} field
+ * @param {any} value
+ * @returns {{ok: true, echo?: any} | {ok: false, code: string, message: string}}
+ */
+function applyWakeSetting(config, field, value) {
+  if (!config.wake || typeof config.wake !== 'object') config.wake = {};
+
+  /** 布尔开关：只接受真正的布尔值，不做 "true"/"1" 的模糊转换 */
+  const BOOL_FIELDS = new Set(['atMention', 'nameMention', 'question', 'poke']);
+  /** 非负整数（毫秒或次数） */
+  const INT_FIELDS = new Set([
+    'batchWindowMs',
+    'minSleepMs',
+    'maxSleepMs',
+    'maxWakePerMinute',
+    'maxWakePerHour',
+    'noActionLimit',
+    'preSleepWaitMs',
+  ]);
+  /** 0~1 的浮点 */
+  const RATIO_FIELDS = new Set(['recommendedProbability']);
+  /** 字符串数组（QQ 号或关键词） */
+  const LIST_FIELDS = new Set(['speakerIds', 'keywords']);
+
+  if (BOOL_FIELDS.has(field)) {
+    if (typeof value !== 'boolean') {
+      return { ok: false, code: 'E40XX', message: `${field} 必须是布尔值` };
+    }
+    config.wake[field] = value;
+    return { ok: true, echo: value };
+  }
+
+  if (INT_FIELDS.has(field)) {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      return { ok: false, code: 'E40XX', message: `${field} 必须是非负整数` };
+    }
+    /*
+     * 上限保护：一小时以上没必要用更大的窗口，
+     * 而一个溢出成 1e15 的值会让"下次窗口"等到宇宙热死 —— 等于永久禁用。
+     */
+    const cap = field === 'batchWindowMs' ? 600_000 : 86_400_000;
+    config.wake[field] = Math.min(n, cap);
+    return { ok: true, echo: config.wake[field] };
+  }
+
+  if (RATIO_FIELDS.has(field)) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0 || n > 1) {
+      return { ok: false, code: 'E40XX', message: `${field} 必须在 0~1 之间` };
+    }
+    config.wake[field] = n;
+    return { ok: true, echo: n };
+  }
+
+  if (LIST_FIELDS.has(field)) {
+    // 界面可能传数组，也可能传逗号/空白分隔的字符串
+    const raw = Array.isArray(value) ? value : String(value ?? '').split(/[,，\s]+/);
+    const list = raw
+      .map((x) => String(x ?? '').trim())
+      .filter(Boolean)
+      // 去重，不然同一个关键词会在判定里被检查多次
+      .filter((x, i, arr) => arr.indexOf(x) === i)
+      /*
+       * 上限：关键词太多会让每条消息都要扫一遍整个列表；
+       * QQ 号太多同理。200 是个远超实际需要的值。
+       */
+      .slice(0, 200);
+    config.wake[field] = list;
+    return { ok: true, echo: list };
+  }
+
+  if (field === 'defaultMode') {
+    const v = String(value ?? '').trim();
+    if (v !== 'active' && v !== 'diving') {
+      return { ok: false, code: 'E40XX', message: 'defaultMode 只能是 active 或 diving' };
+    }
+    config.wake.defaultMode = v;
+    return { ok: true, echo: v };
+  }
+
+  /*
+   * 未支持的字段要明确报错，而不是静默忽略。
+   *
+   * 静默忽略会让界面显示"保存成功"但实际没存 ——
+   * 用户下次打开发现设置变回去了，会怀疑是程序坏了。
+   */
+  return { ok: false, code: 'E40XX', message: `未支持的唤醒设置项：${field}` };
+}
+
+/**
+ * 把一项静音设置写进 config（F20）。
+ *
+ * ## 和 `applyWakeSetting` 分开的原因
+ *
+ * 两者的校验规则不一样。最典型的是 `windows`：它是一个**对象数组**，
+ * 而 `applyWakeSetting` 的 LIST_FIELDS 只处理字符串数组。
+ * 混在一起会让 `windows` 要么存不进去、要么存进一个形状不对的东西，
+ * 然后在运行时静默失效 —— 用户以为设好了夜间静默。
+ *
+ * ## 为什么每个字段都要自己验
+ *
+ * `mergeStrict` 只在启动时跑。运行时改内存 config 是绕过它的，
+ * 存进一个形状不对的值会一直用到下次重启才暴露。
+ *
+ * @param {any} config
+ * @param {string} field
+ * @param {any} value
+ * @returns {{ok: true, echo?: any} | {ok: false, code: string, message: string}}
+ */
+function applySilenceSetting(config, field, value) {
+  if (!config.silence || typeof config.silence !== 'object') config.silence = {};
+
+  /** 布尔开关 */
+  const BOOL_FIELDS = new Set(['all', 'allowCommand']);
+  /** 非负整数（毫秒） */
+  const INT_FIELDS = new Set(['defaultMuteMs', 'maxMuteMs']);
+  /** 字符串数组（会话键 / QQ 号） */
+  const LIST_FIELDS = new Set(['convKeys', 'adminIds']);
+
+  if (BOOL_FIELDS.has(field)) {
+    if (typeof value !== 'boolean') {
+      return { ok: false, code: 'E40XX', message: `${field} 必须是布尔值` };
+    }
+    config.silence[field] = value;
+    return { ok: true, echo: value };
+  }
+
+  if (INT_FIELDS.has(field)) {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      return { ok: false, code: 'E40XX', message: `${field} 必须是非负整数` };
+    }
+    // 上限一年。更大的值等价于"永久"了，该用全局开关
+    const cap = 365 * 24 * 60 * 60 * 1000;
+    config.silence[field] = Math.min(n, cap);
+    return { ok: true, echo: config.silence[field] };
+  }
+
+  if (LIST_FIELDS.has(field)) {
+    const raw = Array.isArray(value) ? value : String(value ?? '').split(/[,，\s]+/);
+    const list = raw.map((x) => String(x ?? '').trim()).filter(Boolean);
+
+    if (field === 'convKeys') {
+      for (const k of list) {
+        if (!/^(group|private):\d+$/.test(k)) {
+          return { ok: false, code: 'E40XX', message: `"${k}" 不是合法会话键（应为 group:123 或 private:456）` };
+        }
+      }
+    } else {
+      for (const id of list) {
+        if (!/^\d+$/.test(id)) {
+          return { ok: false, code: 'E40XX', message: `"${id}" 不是合法 QQ 号（应为纯数字）` };
+        }
+      }
+    }
+
+    // 去重：同一个会话写两遍没有意义，只会让界面显示得莫名其妙
+    const deduped = list.filter((x, i, arr) => arr.indexOf(x) === i).slice(0, 500);
+    config.silence[field] = deduped;
+    return { ok: true, echo: deduped };
+  }
+
+  if (field === 'windows') {
+    /*
+     * 时段数组。界面传对象数组，也可能手工传 JSON 字符串。
+     * 两者都要接受 —— 但**验不过就整批拒绝**，不做部分接受：
+     * 接受一半会让用户看到"保存成功"却仍有段时段没生效。
+     */
+    let parsed = value;
+    if (typeof value === 'string') {
+      try {
+        parsed = JSON.parse(value);
+      } catch {
+        return { ok: false, code: 'E40XX', message: 'windows 不是合法 JSON' };
+      }
+    }
+    if (!Array.isArray(parsed)) {
+      return { ok: false, code: 'E40XX', message: 'windows 必须是数组' };
+    }
+
+    const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    const out = [];
+    for (const w of parsed) {
+      if (!w || typeof w !== 'object') {
+        return { ok: false, code: 'E40XX', message: 'windows 的每一项必须是 {start, end} 对象' };
+      }
+      const start = String(w.start ?? '').trim();
+      const end = String(w.end ?? '').trim();
+      if (!TIME_RE.test(start) || !TIME_RE.test(end)) {
+        return { ok: false, code: 'E40XX', message: `时段 ${start}–${end} 不合法（需 HH:MM，例如 23:00）` };
+      }
+      if (start === end) {
+        /*
+         * 起止相同等于"不生效"。直接拒绝比存进去好：
+         * 存进去之后界面上有个看起来正常的时段，而它什么都不做 ——
+         * 用户会一直以为夜间静音是开着的。
+         */
+        return { ok: false, code: 'E40XX', message: `时段 ${start}–${end} 起止相同，不会生效` };
+      }
+      out.push({ start, end });
+    }
+    config.silence.windows = out.slice(0, 24);
+    return { ok: true, echo: config.silence.windows };
+  }
+
+  return { ok: false, code: 'E40XX', message: `未支持的静音设置项：${field}` };
+}
+
+/**
+ * 生成某一天的日记（供调度器回调）。
+ *
+ * ## 为什么先落 degraded 占位再调模型
+ *
+ * 调模型可能要十几秒甚至超时。如果等它返回才写文件，
+ * 这期间进程被杀（用户关窗口、崩溃、断电），这一天就彻底没有日记了 ——
+ * 而调度器看到"文件不存在"会在下次启动再试一次，又可能再被杀。
+ *
+ * 所以顺序是：**先写一条降级占位（幂等、秒完成），再尝试用模型覆盖**。
+ * 最坏结果是一篇降级日记，而不是没有日记。这是"宁可糙，不可丢"的原则。
+ *
+ * @param {string} date 本地日期键
+ * @param {string} [trigger] 'startup' | 'rollover'，只用于日志
+ * @returns {Promise<boolean>} 是否成功写入
+ */
+async function generateYesterdayDiary(date, trigger = 'rollover') {
+  try {
+    const groups = collectGroupsForDate(sessionStore, date, localDateKey);
+
+    /*
+     * 第一步：先落占位。
+     *
+     * 只写一次 —— 已经有这一天时不覆盖（避免把上次生成好的内容
+     * 降级成占位）。keepLock 由 store 默认保证。
+     */
+    if (!diaryStore.has(date)) {
+      const placeholder = await generateDiary({ date, groups, store: diaryStore, llm: null });
+      log.info('日记占位已写入', { date, trigger, degraded: placeholder.degraded });
+    }
+
+    /*
+     * 第二步：有模型才尝试写真实总结。
+     *
+     * 已经有一篇**非降级**的日记就不再重写：重写会刷新 createdAt，
+     * 而且没有意义（内容不会更好，只可能更差）。
+     */
+    const existing = diaryStore.get(date);
+    if (existing && existing.degraded === false) {
+      log.info('该日已有日记，跳过生成', { date });
+      return true;
+    }
+
+    const result = await generateDiary({
+      date,
+      groups,
+      store: diaryStore,
+      llm: llm?.configured ? llm : null,
+      model: config?.llm?.model ?? '',
+    });
+
+    if (result.ok) {
+      log.info('日记已生成', {
+        date,
+        trigger,
+        degraded: result.degraded,
+        messageCount: result.messageCount,
+        error: result.error,
+      });
+    } else {
+      log.warn('日记写入失败（会重试）', { date, error: result.error });
+    }
+    return result.ok;
+  } catch (err) {
+    log.warn('生成日记失败（会重试）', {
+      date,
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+    return false;
   }
 }
 
@@ -400,7 +1194,146 @@ function handleEvent(evt) {
  *
  * @param {object} evt
  */
+/**
+ * 认一条「同意 / 拒绝 <确认编号>」的回复。
+ *
+ * ## 为什么要单独一层
+ *
+ * 确认卡现在会推到 QQ（见 askHumanConfirm）。卡片上写了「回复同意 #xxx」，
+ * 那就必须真的有人认这句话。否则卡片发出去只是噪音，用户回了也没用——
+ * 比不发更糟，因为它给了"我确认过了"的错觉。
+ *
+ * ## 三种回复形态
+ *
+ *   `同意 #confirm-xxx` / `拒绝 #confirm-xxx`   —— 带编号，精确
+ *   `同意` / `拒绝`                              —— 不带编号，仅当**只有一条**待确认时生效
+ *   其它                                          —— 不认识，交给后面的流程
+ *
+ * 不带编号时要求"只有一条"是刻意的：多条待确认时猜错对象，
+ * 等于用 A 的点头批准了 B 的操作，那是这里最危险的错误。
+ *
+ * @param {object} evt
+ * @returns {Promise<boolean>} 是否已处理（true = 这条消息到此为止）
+ */
+async function tryHandleConfirmReply(evt) {
+  const text = String(evt?.text ?? '').trim();
+  if (!text) return false;
+
+  // 只在 QQ 会话里认，桌面端有自己的确认界面
+  if (!/^(private|group):\d+$/.test(String(evt?.convKey ?? ''))) return false;
+
+  /*
+   * 接受三种写法，全部落到"同意/拒绝"：
+   *
+   *   `1` / `2`                    —— 与审批卡一致的主路径
+   *   `同意` / `拒绝`               —— 习惯打字的用户
+   *   `同意 1` / `拒绝 2`           —— 带序号，多条时用
+   *
+   * 只回裸数字时**仅当只有一条待确认**才认。多条还猜，等于用 A 的点头
+   * 批准 B 的操作，是这里最危险的错误。
+   */
+  let allow;
+  /** @type {number | null} */
+  let seq = null;
+
+  if (text === '1' || text === '2') {
+    allow = text === '1';
+  } else {
+    const m = /^(同意|拒绝|允许|取消)\s*#?\s*(\d+)?$/.exec(text);
+    if (!m) return false;
+    allow = m[1] === '同意' || m[1] === '允许';
+    if (m[2] !== undefined) seq = Number(m[2]);
+  }
+
+  const all = [...confirmSeq.entries()];
+
+  if (all.length === 0) {
+    // 没有任何待确认时，裸数字 1/2 大概率是闲聊（"2 点了"），别抢。
+    // 明确说了「同意」才回一句，否则交回正常流程。
+    if (text === '1' || text === '2') return false;
+    await sendConfirmReply(evt.convKey, '现在没有等你确认的操作。');
+    return true;
+  }
+
+  /** @type {string | null} */
+  let id = null;
+
+  if (seq !== null) {
+    const hit = confirmSeq.get(seq);
+    if (!hit) {
+      await sendConfirmReply(
+        evt.convKey,
+        `没有第 ${seq} 条待确认。当前有：${all.map(([n]) => n).join('、')}。`,
+      );
+      return true;
+    }
+    id = hit;
+  } else {
+    if (all.length > 1) {
+      await sendConfirmReply(
+        evt.convKey,
+        `现在有 ${all.length} 条待确认，请带上序号回复，例如「同意 ${all[0][0]}」，避免批错对象。`,
+      );
+      return true;
+    }
+    id = all[0][1];
+  }
+
+  const r = resolveConfirm(id, allow);
+  const n = seq ?? all.find(([, v]) => v === id)?.[0] ?? '';
+  await sendConfirmReply(
+    evt.convKey,
+    r.ok ? `${allow ? '已放行' : '已拒绝'}（第 ${n} 条）` : `处理失败：${r.message ?? '未知原因'}`,
+  );
+  log.info('QQ 侧确认结果', { id, seq: n, allow, ok: r.ok });
+  return true;
+}
+
+/**
+ * 发一条确认相关的回执。
+ *
+ * ## 为什么必须检查返回值
+ *
+ * 之前这里直接 `await sendText(...)` 就不管了。发送闸门可能因为
+ * 限流（E2030）、白名单、出站审计而**拒绝整条消息**，而 `sendText`
+ * 是 resolve 一个 `{ok:false}` 而不是 reject —— 于是 `await` 正常返回，
+ * 调用方以为发出去了，用户什么都没收到，日志里也没有任何记录。
+ *
+ * 这正是"点了确认却没有任何回信"的成因：确认确实生效了（工具跑成功），
+ * 但回执被闸门吞掉，且无人知晓。
+ *
+ * @param {string} convKey
+ * @param {string} text
+ */
+async function sendConfirmReply(convKey, text) {
+  try {
+    const r = await sendText(convKey, text);
+    if (r && r.ok === false) {
+      log.warn('确认回执未能送达', { convKey, code: r.code, message: r.message });
+    }
+    return r;
+  } catch (err) {
+    log.warn('确认回执发送异常', {
+      convKey,
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+    return { ok: false };
+  }
+}
+
 async function dispatchToPlugins(evt) {
+  /*
+   * ---- 第 0 关：确认回复 ----
+   *
+   * 「同意 confirm-xxx」「拒绝 confirm-xxx」是**对某个待确认请求的答复**，
+   * 不是聊天内容。必须在插件和 AI 之前截住，否则：
+   *   - 插件可能把「同意」当成别的指令；
+   *   - 更糟的是 AI 会煞有介事地回一句"好的我帮你确认了"，其实什么也没发生。
+   *
+   * 返回 true 表示已经处理完（含回执），这条消息到此为止。
+   */
+  if (await tryHandleConfirmReply(evt)) return;
+
   if (plugins) {
     try {
       const handled = await plugins.dispatchMessage(evt);
@@ -456,13 +1389,83 @@ async function considerTurn(evt) {
   if (!llm?.configured) return;
   if (!checkWhitelist(evt.convKey, config).ok) return; // 白名单外不参与
 
+  /*
+   * ══════════════════════════════════════════════════════════════
+   * 第 0 步：静音指令 —— **必须排在静音闸门之前**
+   * ══════════════════════════════════════════════════════════════
+   *
+   * 如果闸门先跑，用户一旦说「闭嘴」就**再也没有办法**用 QQ 叫它回来 ——
+   * 因为「说话」这条指令同样会被闸门挡掉。那用户只能去桌面端改配置，
+   * 而大多数用户不知道配置文件在哪。
+   *
+   * 所以顺序固定：先认指令（不看静音状态）→ 再看闸门 → 最后才走触发判定。
+   *
+   * 指令只允许**管理员**用：群里任何一个人都能让机器人闭嘴半小时，
+   * 那就是一个可以随意骚扰的工具了。
+   */
+  if (config.silence?.allowCommand !== false && isAdmin(evt)) {
+    const cmd = parseSilenceCommand(evt.text);
+    if (cmd) {
+      await handleSilenceCommand(evt, cmd);
+      return; // 指令本身不产生对话回合
+    }
+  }
+
+  /*
+   * ══════════════════════════════════════════════════════════════
+   * 第 1 步：静音闸门 —— 绝对压制，优先于一切语义判断
+   * ══════════════════════════════════════════════════════════════
+   *
+   * 这里刻意**不看**后面的 detected 是什么。静音就是不许说话，
+   * 不管这条消息多像在叫它。如果"特别像在叫"能穿透，静音就是假的 ——
+   * 而用户以为自己已经让它安静了。
+   *
+   * 代价是 @ 它也没反应，这是用户明确选择的语义。
+   */
+  const silence = silenceGate.check(evt.convKey, config);
+  if (silence.silent) {
+    log.info('静音中，不产生回合', {
+      convKey: evt.convKey,
+      reason: silence.reason,
+      detail: silence.detail,
+    });
+    return;
+  }
+
   const detected = detectTrigger(evt, {
     selfId,
     selfName: config.persona?.name,
-    config: { keywords: config.llm.keywords ?? [] },
+    // 触发关键词从 wake 取（llm.keywords 在启动时已迁移过来）
+    config: { keywords: config.wake?.keywords ?? config.llm.keywords ?? [] },
+    wake: config.wake,
   });
 
   if (detected) {
+    /*
+     * 唤醒频率硬限。
+     *
+     * ## 为什么超限时"不触发"而不是"排队"
+     *
+     * 排队的语义是"稍后回复"，但它解决的是"忙不过来"。
+     * 这里的问题是**不该回**：一个群每分钟几十条消息，每条都起回合
+     * 就是刷屏 + 烧钱，而且回合跑得比消息慢，队列只会越堆越长。
+     *
+     * 所以超限直接丢弃并记一行 —— 与弱触发遇到在途回合的处理一致。
+     */
+    const gate = wakeLedger.check(evt.convKey, {
+      maxPerMinute: config.wake?.maxWakePerMinute,
+      maxPerHour: config.wake?.maxWakePerHour,
+    });
+    if (!gate.ok) {
+      log.info('唤醒被频率硬限拦下', {
+        convKey: evt.convKey,
+        trigger: detected.trigger,
+        reason: gate.message,
+        retryAfterMs: gate.retryAfterMs,
+      });
+      return;
+    }
+    wakeLedger.note(evt.convKey);
     enqueue(evt.convKey, { evt, trigger: detected.trigger, reason: detected.reason, proactive: false });
     return;
   }
@@ -487,8 +1490,24 @@ function enqueue(convKey, job) {
 
   if (running) {
     if (isStrongTrigger(job.trigger)) {
-      pendingTurns.set(convKey, job);
-      log.info('回合排队（强触发）', { convKey, trigger: job.trigger });
+      /*
+       * 强触发排队。用 TurnQueue 而不是单槽 Map：
+       * 单槽会**静默覆盖**掉上一条排队中的强触发（连问两句只回最后一句）。
+       *
+       * 队列也有限度：刷屏的群可以把队列堆到很长，然后每条都跑一次模型 ——
+       * 既烧钱又让回复严重滞后。超限时丢最旧的那条，并**明确记一行日志**，
+       * 因为"丢了"必须可查，不能像原来那样无声无息。
+       */
+      const { dropped, length } = pendingTurns.push(convKey, job);
+      if (dropped) {
+        log.warn('回合队列已满，丢弃最早的排队项', {
+          convKey,
+          droppedTrigger: dropped.trigger,
+          droppedReason: dropped.reason,
+          queued: length,
+        });
+      }
+      log.info('回合排队（强触发）', { convKey, trigger: job.trigger, queued: length });
     } else {
       log.info('回合丢弃（弱触发遇到在途回合）', { convKey, trigger: job.trigger });
     }
@@ -545,6 +1564,23 @@ async function startTurn(convKey, job) {
         proactive: job.proactive,
       },
     });
+
+    /*
+     * 登记「这些楼层真的进模型了」。
+     *
+     * ## 为什么必须在 buildMessages 之后立刻做
+     *
+     * 读楼层的唯一前进条件是「喂过模型」或「已淘汰」。如果这里漏登记，
+     * 读楼层就会永远卡在这一楼 —— 每一回合都把同一批消息重新喂一遍，
+     * 模型反复回答同一个问题。反过来，如果登记了其实没喂的楼，
+     * 那条消息就永远不会被处理。所以这里精确取 recent 里的 floor。
+     *
+     * 回合被取消也照样算：模型确实看到过这些内容，重跑一遍没有意义。
+     */
+    const fedFloors = (recentByConv.get(convKey) ?? [])
+      .map((item) => item.floor)
+      .filter((f) => typeof f === 'number');
+    if (fedFloors.length > 0) sessionStore.markModelSeen(convKey, fedFloors);
 
     // 记录本轮产生的文本，供用量记账在缺 usage 时估算。
     // 注意两个坑：
@@ -627,13 +1663,31 @@ async function startTurn(convKey, job) {
     });
   } catch (err) {
     const e = /** @type {any} */ (err);
+    /*
+     * 回合失败 ≠ 它没想过。
+     *
+     * agent-loop 会把失败前已产生的 thinkingTrace 挂在错误对象上，
+     * 这里照常归档 —— 用户排查"它怎么答成这样"时，那几步推理才是关键。
+     * recordThinking 自己吞异常，不会把一次失败变成两次。
+     */
+    if (Array.isArray(e?.thinkingTrace) && e.thinkingTrace.length > 0) {
+      recordThinking(convKey, { thinkingTrace: e.thinkingTrace, text: '' });
+    }
     log.error('回合失败', { convKey, code: e?.code, message: String(e?.message ?? e) });
     rpc.notify('turn-end', { turnId, ok: false, code: e?.code ?? 'E50XX', message: String(e?.message ?? e) });
   } finally {
     inflight.delete(convKey);
-    const next = pendingTurns.get(convKey);
+    /*
+     * 消费队列：按 **FIFO** 取最早的一条，而不是"取任意一条"。
+     *
+     * 顺序很重要 —— 用户连着问两句时，先问的那句必须先得到回答，
+     * 否则就是「回复混乱」：答的是后一句，前一句的问题被彻底忽略。
+     *
+     * 用 while 而不是 if 只跑一条：一次只能有一个回合在跑，
+     * 所以这里只起一条就地返回（新起的回合会在它自己的 finally 里继续消费）。
+     */
+    const next = pendingTurns.shift(convKey);
     if (next) {
-      pendingTurns.delete(convKey);
       void startTurn(convKey, next);
     }
   }
@@ -755,9 +1809,19 @@ async function sendSegments(convKey, segments, auditText) {
   const gated = passSendGate({
     convKey,
     text: auditText,
-    // 管理员名单来自 dsh.admins：他们的私聊必须能收到审批，
-    // 不能再被"允许谁发指令"的白名单挡住（那是反方向的规则）。
-    config: { ...config, admins: config.dsh?.admins ?? [] },
+    /*
+     * 管理员名单现在住在**插件配置**里（`plugins.config['dsh-bridge'].admins`）。
+     *
+     * 这里原先读的是 `config.dsh?.admins` —— 那是迁移前的旧位置。
+     * `migrateLegacyDsh` 把值搬去插件配置后，旧字段就被清空了，
+     * 于是 `admins` 恒为 `[]`，下游两个豁免**从未生效**：
+     *   1. `checkWhitelist` 的管理员私聊豁免
+     *   2. `passSendGate` 的管理员私聊限流豁免
+     *
+     * 表现就是审批/确认卡被白名单或限流静默挡下，用户什么都收不到。
+     * 保留旧位置兜底：万一迁移还没跑到（冷启动第一轮）。
+     */
+    config: { ...config, admins: resolveAdminQqs(config) },
     audit: auditOutbound,
     limiter,
   });
@@ -782,6 +1846,42 @@ async function sendSegments(convKey, segments, auditText) {
     const e = /** @type {any} */ (err);
     return { ok: false, code: e?.code ?? 'E1030', message: String(e?.message ?? e) };
   }
+}
+
+/**
+ * 取管理员 QQ 列表（发给发送闸门用于白名单/限流豁免）。
+ *
+ * 来源优先级：
+ *   1. 插件配置 `plugins.config['dsh-bridge'].admins`（迁移后的**唯一**真源）
+ *   2. 旧字段 `config.dsh.admins`（迁移没跑到时的兜底）
+ *
+ * 迁移后旧字段是空数组，所以只读它会得到"没有管理员"这个错误结论 ——
+ * 而调用方（checkWhitelist / passSendGate）恰恰是**必须**知道管理员是谁的。
+ *
+ * 插件里 admins 是逗号分隔字符串（界面按字符串存），这里统一成分隔好的数组。
+ *
+ * @param {any} cfg
+ * @returns {string[]}
+ */
+function resolveAdminQqs(cfg) {
+  const fromPlugin = cfg?.plugins?.config?.['dsh-bridge']?.admins;
+  const legacy = cfg?.dsh?.admins;
+
+  /** @type {any[]} */
+  const raw = [];
+  for (const src of [fromPlugin, legacy]) {
+    if (Array.isArray(src)) raw.push(...src);
+    else if (typeof src === 'string') raw.push(...src.split(/[,，、\s]+/));
+  }
+
+  const out = [];
+  for (const v of raw) {
+    const id = String(v ?? '').trim();
+    // 只要纯数字 QQ 号：闸门里是直接拿字符串比对的，
+    // 混进空串或说明文字会让比较永远不成立
+    if (/^\d{4,15}$/.test(id) && !out.includes(id)) out.push(id);
+  }
+  return out;
 }
 
 /** 允许手动发送的媒体类型 → OneBot 消息段 */
@@ -893,20 +1993,52 @@ function makeRunner(origin, convKey) {
  * @param {{tool: string, risk: string, args: object, convKey: string}} req
  * @returns {Promise<'allow'|'deny'>}
  */
+/**
+ * 分配一个确认序号（最小可用正整数）。
+ *
+ * 复用被释放的号，避免长时间运行后序号涨到很大、用户在手机上看到"第 47 条"
+ * 却其实只有一条待确认。
+ *
+ * @param {string} id
+ * @returns {number}
+ */
+function allocConfirmSeq(id) {
+  let n = 1;
+  while (confirmSeq.has(n)) n += 1;
+  confirmSeq.set(n, id);
+  return n;
+}
+
+/**
+ * 释放序号。
+ *
+ * 必须和 pendingConfirms 同步释放：只删一边会让卡片上写的"第 N 条"
+ * 和实际能回复的序号对不上，用户回 "1" 会被判成"没有第 1 条"。
+ *
+ * @param {number} seq
+ */
+function releaseConfirmSeq(seq) {
+  if (typeof seq === 'number') confirmSeq.delete(seq);
+}
+
 function askHumanConfirm(req) {
   const id = `confirm-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const CONFIRM_TIMEOUT_MS = 60_000;
+  // 序号在**登记那一刻**定下并写进卡片，之后不再重排：
+  // 用户看到的是"第 3 条"，中途有人答掉一条也不能让这张卡变成"第 2 条"。
+  const seq = allocConfirmSeq(id);
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingConfirms.delete(id);
-      log.warn('确认超时，按拒绝处理', { tool: req.tool, id });
+      releaseConfirmSeq(seq);
+      log.warn('确认超时，按拒绝处理', { tool: req.tool, id, seq });
       rpc.notify('confirm-timeout', { id, tool: req.tool });
       resolve('deny');
     }, CONFIRM_TIMEOUT_MS);
     timer.unref?.();
 
-    pendingConfirms.set(id, { resolve, timer, req });
+    pendingConfirms.set(id, { resolve, timer, req, seq });
     // 参数摘要要脱敏后再给界面看
     rpc.notify('confirm-request', {
       id,
@@ -917,7 +2049,89 @@ function askHumanConfirm(req) {
       timeoutMs: CONFIRM_TIMEOUT_MS,
     });
     log.info('请求人工确认', { id, tool: req.tool, risk: req.risk });
+
+    /*
+     * 确认卡也要发到 QQ。
+     *
+     * ## 为什么这是必须的
+     *
+     * 用户从 QQ 发来 `/dsh ...`，插件 `plugin_dsh_ask` 是 R1，宿主按
+     * `deriveToolPolicy` 一律要求人工点头（R0 之外都是 confirm: always）。
+     * 而确认卡原来**只**走 rpc.notify 发给桌面端。
+     *
+     * 结果就是：人不在电脑前，从 QQ 下的指令卡在桌面端一个没人看见的弹窗上，
+     * 60 秒后按拒绝处理。用户看到的是"指令发出去了，DSH 没反应"。
+     *
+     * ## 只对 QQ 来源发
+     *
+     * convKey 形如 `private:123` / `group:456` 才是 QQ 会话；
+     * 桌面端自己操作时 convKey 不是这种形状（或为空），那就只走界面。
+     * 给桌面端也推一份 QQ 消息没有意义，还多一条噪音。
+     *
+     * 发失败只记日志：确认流程本身仍然有效（桌面端还能点），
+     * 不能因为 QQ 掉线让整条链路变成异常。
+     */
+    const qqConv = /^(private|group):\d+$/.test(String(req.convKey ?? ''));
+    if (qqConv) {
+      void sendConfirmToQq(id, req, CONFIRM_TIMEOUT_MS, seq).catch((err) => {
+        log.warn('确认卡推送 QQ 失败（桌面端仍可确认）', {
+          id,
+          message: String(/** @type {any} */ (err)?.message ?? err),
+        });
+      });
+    }
   });
+}
+
+/**
+ * 把一张确认卡发到发起指令的 QQ 会话。
+ *
+ * ## 为什么用 1 / 2 而不是编号
+ *
+ * 用户要的是「像审批那样回个数字」。编号 `confirm-1792686540396-c60ac6`
+ * 三十多个字符，手机上根本没法准确抄写，抄错一位就变成"没有这条待确认"。
+ *
+ * 所以卡片上给**短序号**（1 = 同意，2 = 拒绝），序号到编号的映射留在
+ * 内存里（`confirmSeq`）。这和 DSH 审批卡的交互完全一致：
+ * 引用那条消息回数字即可。
+ *
+ * 序号只在**当前待确认集合**内唯一。并发多条时按创建顺序编号，
+ * 卡片上会写出这次是哪一条（工具名 + 参数），所以不会批错对象。
+ *
+ * @param {string} id
+ * @param {{tool: string, risk: string, args: object, convKey: string}} req
+ * @param {number} timeoutMs
+ * @param {number} seq 登记时定下的序号，写进卡片供用户回复
+ */
+async function sendConfirmToQq(id, req, timeoutMs, seq) {
+  const mins = Math.max(1, Math.round(timeoutMs / 60000));
+  const args = redactArgs(req.args);
+
+  const lines = [`需要你点头才能继续（${req.tool}，${req.risk}）`];
+
+  const pairs = Object.entries(args ?? {})
+    .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+    .slice(0, 6);
+  if (pairs.length > 0) lines.push(`参数：${pairs.join('，')}`);
+
+  // 多条待确认时把序号显式写出来，避免"到底在批哪一条"
+  const total = confirmSeq.size;
+  if (total > 1) {
+    lines.push(`这是第 ${seq} 条（共 ${total} 条待确认）。`);
+  }
+
+  lines.push(`回 1 同意，回 2 拒绝${total > 1 ? `；多条时可用「同意 ${seq}」` : ''}。${mins} 分钟内没回按拒绝处理。`);
+
+  const r = await sendText(req.convKey, lines.join('\n'));
+  if (r && r.ok === false) {
+    // 推送失败必须留痕：不然用户既没看到卡片、日志里也没有任何线索，
+    // 只能等到超时后看到一个"未获批准"，完全查不出原因。
+    log.warn('确认卡推送 QQ 失败（桌面端仍可确认）', {
+      id,
+      code: r.code,
+      message: r.message,
+    });
+  }
 }
 
 /**
@@ -932,6 +2146,8 @@ function resolveConfirm(id, allow) {
   if (!pending) return { ok: false, message: '该确认已过期或不存在' };
   pendingConfirms.delete(id);
   clearTimeout(pending.timer);
+  // 与 pendingConfirms 同步释放：漏掉这一句，卡片上的序号和实际能回的对不上
+  releaseConfirmSeq(pending.seq);
   pending.resolve(allow ? 'allow' : 'deny');
   log.info('人工确认结果', { id, allow });
   return { ok: true };
@@ -1055,7 +2271,14 @@ const rpc = {
             account: { selfId: null },
             messages: [],
             counts: { messages: 0, toolCalls: 0 },
-            registry: { actions: [], tools: [], pages: [], timers: [] },
+            /*
+             * 形状与正常快照一致（只保留真实存在的字段）。
+             *
+             * 这里曾写着 pages/timers，而 snapshotRegistry 已经不产出它们了 ——
+             * 兜底快照和正常快照形状不一致，界面在"启动中"和"启动完成"
+             * 之间会遇到两套结构，任何按字段假设写的代码都会在某一侧出错。
+             */
+            registry: { actions: [], tools: [] },
             persona: '',
             config: null,
             lastError,
@@ -1064,11 +2287,31 @@ const rpc = {
             thinking: rpc.emptyThinkingView(),
           };
         }
+        /*
+         * 会话概要算一次，下面 sessions 与 brain.conversations 共用。
+         *
+         * 不各调一次 `sessionStore.list()`：它是全量遍历 + 排序，
+         * 2 秒一次的快照里跑两遍纯属浪费；而且两次结果可能不一致
+         * （中间正好有新消息落盘），界面会看到自相矛盾的两个计数。
+         */
+        const sessionList = sessionStore.list();
         return {
           state: client?.state ?? 'idle',
           health: health.snapshot(),
           account: { selfId: selfId || null },
+          /*
+           * 首屏仍是最近 100 条（2 秒一次的快照不该拖着一整个历史），
+           * 但它现在来自**楼层仓库**而不是内存数组 —— 重启后还在，
+           * 而且每条都带楼层号，界面可以据此做「向上翻更早」的分页。
+           *
+           * 真正要翻历史走 action `session.page`，见下面。
+           */
           messages: messages.slice(-100),
+          /*
+           * 会话楼层概要：界面用它显示每个会话的未读数与最高楼层，
+           * 也是分页的入口参数。
+           */
+          sessions: sessionList,
           counts: { messages: messages.length, toolCalls: toolCallLog.length },
           registry: snapshotRegistry(),
           /*
@@ -1089,6 +2332,48 @@ const rpc = {
            */
           personaCards: personaStore.view([...recentByConv.keys()]),
           roleCards: roleStore.view([...recentByConv.keys()]),
+          /*
+           * 唤醒设置（只读回显）。
+           *
+           * 界面需要它来渲染每个开关的当前状态，以及关键词标签。
+           * 写入仍走 setting 通道的 `wake.*` 键，不在这里做。
+           */
+          wake: {
+            ...config.wake,
+            // 附带运行态：让界面能显示"这一分钟还剩几次"
+            runtime: Object.fromEntries(
+              [...recentByConv.keys()].map((k) => [k, wakeLedger.snapshot(k)]),
+            ),
+          },
+          /*
+           * 日记（只读）。
+           *
+           * 传全部记录（含已淡忘的），由界面按 hiddenBelowWeight 决定是否隐藏 ——
+           * 后端不替用户"藏起来"，因为用户可能就是想翻很久以前的东西。
+           * 权重在这里现算，不读落盘的 weightBase（那是写下那天的快照）。
+           */
+          diary: snapshotDiary(),
+          /*
+           * 日记的配置面（阈值）。
+           *
+           * 单独给一份，而不是让界面从 diary 里推：
+           * 界面要拿它决定"低于多少隐藏、低于多少不进上下文"，
+           * 那是**配置**不是数据，混在 days 里会让界面自己发明默认值。
+           */
+          diaryConfig: {
+            initialWeight: config?.diary?.initialWeight ?? 100,
+            decayPerDay: config?.diary?.decayPerDay ?? 1,
+            hiddenBelowWeight: config?.diary?.hiddenBelowWeight ?? 0,
+            contextMinWeight: config?.diary?.contextMinWeight ?? 60,
+          },
+          /*
+           * 静音状态（F20）。
+           *
+           * 配了 `silence` 原始配置，也配了**当前实际在静音哪些会话** ——
+           * 两者不是一回事：前者是用户设的，后者还要算上时段命中
+           * 和聊天里用指令开的临时静音。界面要显示后者才有用。
+           */
+          silence: snapshotSilence(),
           /*
            * 思考链路（只给界面看）。
            *
@@ -1131,14 +2416,75 @@ const rpc = {
              */
             keySource,
             inflight: inflight.size,
-            queued: pendingTurns.size,
+            /*
+             * 排队总数用 `total`（getter）：TurnQueue 是"每会话一个队列"，
+             * 没有 `.size` 这种单值。写错了界面会一直显示 undefined。
+             */
+            queued: pendingTurns.total,
             pendingConfirms: [...pendingConfirms.entries()].map(([id, p]) => ({ id, ...p.req })),
-            /** 每个会话的触发状态：主动发言的 30 分钟间隔就靠它 */
-            conversations: [...recentByConv.keys()].map((k) => ({
-              convKey: k,
-              recent: (recentByConv.get(k) ?? []).length,
-              ...triggerLedger.snapshot(k),
-            })),
+            /**
+             * 每个会话的触发状态：主动发言的 30 分钟间隔就靠它。
+             *
+             * ## 会话列表来自**落盘的楼层仓库**，不是内存 Map
+             *
+             * 之前这里只遍历 `recentByConv`（内存 Map，只装最近 20 条模型消息）。
+             * 后果是重启后整块必然为空 —— 用户看到"还没有会话记录"，
+             * 但会话和楼层明明都在 `state/sessions.json` 里。
+             *
+             * 现在以 `sessionStore.list()` 为基准（它读的是落盘数据），
+             * 再并上 `recentByConv` 里的键（可能有刚进来还没落盘的）。
+             * 两个都取到，重启前后都能显示真实存在的会话。
+             *
+             * `proactiveCount` 是**真实累计值**（由 TriggerLedger 累加）。
+             * `proactive` 是**当前可用性**：为什么现在不能主动、还要等多久。
+             * 它比累计次数有用 —— 用户真正的困惑是"它刚才怎么不说话"，
+             * 而 12 次这个数字回答不了。
+             */
+            conversations: (() => {
+              /*
+               * 合并两个来源的会话键。
+               *
+               * sessions 提供持久化的（带楼层与未读），recentByConv 提供
+               * 内存里刚到的。用 Set 去重，再让持久化的排在前面
+               * （它带更多信息，也是用户更关心的"历史会话"）。
+               */
+              const keys = [];
+              const seen = new Set();
+              for (const s of sessionList) {
+                if (!seen.has(s.convKey)) {
+                  seen.add(s.convKey);
+                  keys.push(s.convKey);
+                }
+              }
+              for (const k of recentByConv.keys()) {
+                if (!seen.has(k)) {
+                  seen.add(k);
+                  keys.push(k);
+                }
+              }
+
+              const sessByKey = new Map(sessionList.map((s) => [s.convKey, s]));
+
+              return keys.map((k) => {
+                const isGroup = k.startsWith('group:');
+                const sess = sessByKey.get(k);
+                return {
+                  convKey: k,
+                  /*
+                   * 「近期消息」用楼层仓库的条数，而不是内存 Map 的长度：
+                   * 后者最多 20（那是喂给模型的窗口），拿它当"近期消息数"
+                   * 会让所有活跃会话都显示 20，看起来完全一样。
+                   */
+                  recent: sess?.count ?? (recentByConv.get(k) ?? []).length,
+                  queued: pendingTurns.size(k),
+                  // 未读数来自楼层系统，重启后仍然正确
+                  unread: sess?.unread ?? 0,
+                  lastFloor: sess?.lastFloor ?? 0,
+                  ...triggerLedger.snapshot(k),
+                  proactive: triggerLedger.proactiveStatus(k, config.proactive, isGroup),
+                };
+              });
+            })(),
           },
           usage: usageLedger
             ? { ...usageLedger.summary(), ...(params?.usage ? { range: await usageLedger.range(params.usage) } : {}) }
@@ -1149,6 +2495,98 @@ const rpc = {
         const name = params?.name;
         const arg = params?.params ?? {};
         if (name === 'usage.query') return { ok: true, range: await usageLedger.range(arg) };
+        /*
+         * ---- 会话楼层（只读）----
+         *
+         * 「按条读取聊天记录」的入口。走 action 而不是新开一个 method：
+         * IPC 只有 snapshot / action / setting 三条通道（不变式 I11）。
+         *
+         * 参数形状与错误码由 store 决定（非法 afterFloor 一律 E4010，
+         * 不猜、不返回空列表——空列表会被误读成"没有更多了"）。
+         */
+        if (name === 'session.page') return sessionStore.page(arg?.convKey, arg ?? {});
+        if (name === 'session.list') return { ok: true, sessions: sessionStore.list() };
+        if (name === 'session.markRead') {
+          const r = sessionStore.acknowledge(arg?.convKey, arg?.floor);
+          if (!r.ok) return { ok: false, code: 'E4010', message: 'convKey 或 floor 非法' };
+          return { ok: true, readThroughFloor: r.readThroughFloor };
+        }
+        /*
+         * ---- 日记 ----
+         *
+         * diary.lock / diary.unlock 是**用户动作**（把某天的日记钉住，
+         * 不让它继续淡忘），所以走 action 而不是 setting：
+         * 它们操作的是数据本身，不是配置。
+         */
+        if (name === 'diary.get') {
+          const date = String(arg?.date ?? '');
+          const rec = diaryStore.get(date);
+          if (!rec) return { ok: false, code: 'E4041', message: `没有这一天（${date}）的日记` };
+          return { ok: true, record: rec };
+        }
+        if (name === 'diary.lock' || name === 'diary.unlock') {
+          const date = String(arg?.date ?? '');
+          const r = name === 'diary.lock' ? await diaryStore.lock(date) : await diaryStore.unlock(date);
+          if (!r.ok) {
+            // 区分"没有这一天"和"写盘失败"：前者是用户点错了，后者要重试
+            return r.record
+              ? { ok: false, code: 'E5001', message: r.error ?? '写盘失败，请重试' }
+              : { ok: false, code: 'E4041', message: `没有这一天（${date}）的日记` };
+          }
+          log.info(name === 'diary.lock' ? '日记已锁定' : '日记已解锁', { date });
+          return { ok: true, record: r.record };
+        }
+        if (name === 'diary.regenerate') {
+          /*
+           * 手动重生成某天的日记。
+           *
+           * 和自动生成走同一个函数，所以行为完全一致（先占位再覆盖）。
+           * 但如果那天是锁定的，不覆盖 —— 用户钉住的意思就是"别动它"。
+           */
+          const date = String(arg?.date ?? '');
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+            return { ok: false, code: 'E4041', message: 'date 必须是 YYYY-MM-DD' };
+          }
+          const rec = diaryStore.get(date);
+          if (rec?.locked === true) {
+            return { ok: false, code: 'E4030', message: '这一天已锁定，先解锁再重生成' };
+          }
+          const ok = await generateYesterdayDiary(date, 'manual');
+          return ok ? { ok: true } : { ok: false, code: 'E5001', message: '生成失败，详见日志' };
+        }
+        /*
+         * ---- 静音（F20「闭嘴」）----
+         *
+         * 这些都是**用户动作**，走 action 而不是 setting：
+         * 临时静音操作的是运行态，不是配置。
+         *
+         * 但全局开关和按会话名单在配置里，得走 setting（见下面 setting 分支）。
+         */
+        if (name === 'silence.mute') {
+          const convKey = String(arg?.convKey ?? '');
+          if (!/^(group|private):\d+$/.test(convKey)) {
+            return { ok: false, code: 'E4010', message: 'convKey 非法（应为 group:123 或 private:456）' };
+          }
+          const cap = Number(config.silence?.maxMuteMs) > 0 ? Number(config.silence.maxMuteMs) : MAX_MUTE_MS;
+          // 没传时长就用配置的默认值，再夹到上限内
+          const want = Number(arg?.ms) > 0 ? Number(arg.ms) : Number(config.silence?.defaultMuteMs ?? 1800000);
+          const ms = Math.min(want, cap);
+          const r = silenceGate.mute(convKey, ms);
+          log.info('临时静音已开启', { convKey, ms });
+          return { ok: true, until: r.until, ms };
+        }
+        if (name === 'silence.unmute') {
+          const convKey = String(arg?.convKey ?? '');
+          const r = silenceGate.unmute(convKey);
+          log.info('临时静音已解除', { convKey, wasSilent: r.wasSilent });
+          return { ok: true, wasSilent: r.wasSilent };
+        }
+        if (name === 'silence.clear') {
+          // 「全部恢复」：清掉所有临时静音，但不动配置里的全局/按会话静音
+          const n = silenceGate.clear();
+          log.info('已清空全部临时静音', { count: n });
+          return { ok: true, cleared: n };
+        }
         if (name === 'thinking.query') return { ok: true, ...rpc.thinkingView(arg) };
         if (name === 'persona.setDefault') return personaStore.setDefault(arg.id);
         if (name === 'role.setDefault') return roleStore.setDefault(arg.id);
@@ -1583,6 +3021,47 @@ const rpc = {
             after: shape.value.groups.length + shape.value.private.length,
           });
           return { ok: true };
+        }
+
+        // ---- 唤醒设置 ----
+        /*
+         * `wake.*` 一整组。
+         *
+         * ## 为什么用一个前缀匹配而不是逐个 if
+         *
+         * wake 有十几个字段，逐个写 if 会让这里涨到两屏，而且每加一个字段
+         * 就要改三处（schema 默认值、这里、界面）。用前缀匹配 + 字段白名单，
+         * 新增字段只改两处。
+         *
+         * ## 校验必须在这里做，不能靠 schema
+         *
+         * schema 的 `mergeStrict` 只在**启动时**跑一次。运行时直接改内存
+         * 的 config 对象是绕过它的 —— 所以这里对每个字段做类型/范围校验，
+         * 否则界面传个字符串 "abc" 进来，`probability` 就变成 NaN，
+         * 概率判定的比较永远为 false，表现为"概率唤醒永不触发"。
+         */
+        if (typeof key === 'string' && key.startsWith('wake.')) {
+          const field = key.slice('wake.'.length);
+          const r = applyWakeSetting(config, field, value);
+          if (!r.ok) return r;
+          await persistConfig();
+          log.info('唤醒设置已更新', { field, value: r.echo ?? value });
+          return { ok: true, value: r.echo };
+        }
+
+        /*
+         * 静音的持久配置（F20）。
+         *
+         * 和临时静音分开：这些是用户显式设的、要落盘的，
+         * 所以走 setting + persistConfig。临时静音走 action。
+         */
+        if (typeof key === 'string' && key.startsWith('silence.')) {
+          const field = key.slice('silence.'.length);
+          const r = applySilenceSetting(config, field, value);
+          if (!r.ok) return r;
+          await persistConfig();
+          log.info('静音设置已更新', { field, value: r.echo ?? value });
+          return { ok: true, value: r.echo };
         }
 
         if (key === 'persona') {
@@ -2159,6 +3638,22 @@ async function shutdown(code) {
     await thinkingStore.flush();
   } catch {
     /* 已尽力 */
+  }
+  /*
+   * 会话楼层也要显式落一次。
+   *
+   * 它比思考记录更该保住：思考是"看过就算了"的展示数据，
+   * 而楼层丢了等于用户的历史消息和「读到第几楼」一起没了 ——
+   * 下次启动会从空仓库开始，旧消息既不显示也不再被处理。
+   *
+   * 同样地，失败不拦退出：卡在退出比丢一次落盘更糟（用户会以为关不掉）。
+   */
+  try {
+    await sessionStore.close();
+  } catch (err) {
+    log.warn('会话楼层落盘失败（不影响退出）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
   }
   process.exit(code);
 }

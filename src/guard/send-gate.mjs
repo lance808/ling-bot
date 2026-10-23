@@ -102,6 +102,20 @@ export class RateLimiter {
 }
 
 /**
+ * 这个会话是不是管理员私聊。
+ *
+ * @param {string} convKey
+ * @param {GateConfig} cfg
+ * @returns {boolean}
+ */
+export function isAdminPrivate(convKey, cfg) {
+  if (!isValidConvKey(convKey)) return false;
+  const [kind, id] = convKey.split(':');
+  if (kind !== 'private') return false;
+  return (cfg.admins ?? []).some((x) => String(x) === id);
+}
+
+/**
  * 发送闸门。
  *
  * @param {object} req
@@ -127,8 +141,34 @@ export function passSendGate(req) {
     return { ok: false, denied: true, code: audited.code ?? 'E2020', message: audited.message ?? '出站审计拦截' };
   }
 
-  const rl = limiter.take(convKey);
-  if (!rl.ok) return { ok: false, denied: true, code: rl.code, message: rl.message };
+  /*
+   * 限流对**管理员私聊**不设限。
+   *
+   * ## 为什么必须豁免
+   *
+   * 限流回答的是"别把消息刷爆"，它针对的是群发、主动发言、AI 回合这些
+   * 可能连续产出的场景。而管理员私聊是**一对一的服务通道**：
+   *
+   *   - 审批推送、提问推送、确认卡、确认回执，全部走它；
+   *   - 一次审批往返至少 2 条（卡片 + 回执），一个稍微忙一点的回合就是 6~8 条。
+   *
+   * 默认 8 条/分钟、60 条/小时，**正常使用就会撞上**。后果不是"少发一条"，
+   * 而是：确认卡发不出去 → 用户不知道要确认 → 60 秒后按拒绝处理；
+   * 或者回执发不出去 → 用户确认成功了却什么都没收到，只能反复重试。
+   *
+   * 这两种失败都是静默的（`sendText` 返回 `{ok:false}` 而不是抛异常），
+   * 排查时几乎无从下手。
+   *
+   * ## 这不是放宽安全边界
+   *
+   * - 白名单和出站审计**照旧生效**，管理员也不能让凭据/本机路径发出去；
+   * - 只对 `private:<admin QQ>` 生效，群聊与陌生人私聊完全不受影响；
+   * - 管理员本来就有最高权限，不让他收到自己要求的通知没有安全收益。
+   */
+  if (!isAdminPrivate(convKey, config)) {
+    const rl = limiter.take(convKey);
+    if (!rl.ok) return { ok: false, denied: true, code: rl.code, message: rl.message };
+  }
 
   return { ok: true, text };
 }

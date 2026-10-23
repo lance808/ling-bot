@@ -1,15 +1,27 @@
 /**
  * 「思考链路」页
  *
- * ## 布局：左 1/5 会话列表 + 右 4/5 内容
+ * ## 布局：左侧会话目录 + 右侧对话流
  *
  * 思考记录天然按「会话」分开：一个群的思考过程和另一个私聊的完全是两回事。
  * 全部堆在一条时间线上，用户要在一堆 `群 123456` 里靠眼睛找自己想看的那条。
  * 所以左栏先选会话，右栏只看它。
  *
- * 左栏同时承担「目录」职责：它列出**所有有记录的会话**（群聊 / 私聊分组），
+ * 左栏按**最近活跃时间**分成「今日 / 7 天内 / 30 天内 / 更早」四段 ——
+ * 和聊天软件的会话列表一样，用户通常只关心最近聊过的那些。
  * 数据来自后端 `thinking.conversations`，**不受分页与筛选影响** ——
  * 翻到第 2 页时目录不能少几个会话，否则用户会以为记录丢了。
+ *
+ * ## 为什么是对话式
+ *
+ * 原来的右栏是「按日折叠的卡片 + 步骤列表」，读起来像日志。但思考
+ * 本质上是模型在**一次对话**里逐步展开的推理，用户熟悉的参照物是
+ * 聊天记录：一条回合一个气泡，气泡里每一句思考都直接显示，也可以
+ * 单独收起/展开。群聊消息多、往往只关心最新一条，所以提供正序/倒序切换；
+ * 私聊里一句话往往较长，逐句收起后一屏能扫过很多条。
+ *
+ * 默认**全部展开**：那些"想了但没回答"的步骤也要能直接看到，
+ * 不能只有最终回答那一步显得有内容。
  *
  * ## 状态为什么由调用方持有
  *
@@ -30,7 +42,7 @@
  * CSP 是 `style-src 'self'`，内联样式会被静默拦掉，看起来像"样式没生效"。
  */
 
-import { el, clock } from '../render.mjs';
+import { el } from '../render.mjs';
 
 /* ------------------------------------------------------------ 数据整形 */
 
@@ -39,7 +51,7 @@ import { el, clock } from '../render.mjs';
  * @typedef {{at: number, convKey: string, steps: ThinkStep[]}} ThinkEntry
  * @typedef {{date: string, entries: ThinkEntry[]}} ThinkDay
  * @typedef {{convKey: string, entries: number, steps: number, lastAt: number}} ThinkConv
- * @typedef {{ready: boolean, total: number, days: ThinkDay[], conversations: ThinkConv[], dayKeys: string[], hasMore: boolean, nextBefore: string | null}} ThinkView
+ * @typedef {{ready: boolean, total: number, days: ThinkDay[], conversations: ThinkConv[], dayKeys: string[], hasMore: boolean, nextBefore: string | null, lastSkip: {convKey: string, at: number} | null}} ThinkView
  */
 
 /**
@@ -257,6 +269,55 @@ function countSteps(days) {
   return n;
 }
 
+/* ------------------------------------------------------------ 会话分组 */
+
+const DAY_MS = 86_400_000;
+
+/**
+ * 会话列表的时间分组。
+ *
+ * 用本地零点而不是「now - 24h」：用户说"今天"指的是日历上的今天，
+ * 凌晨一点看昨天晚上的记录，那属于「7 天内」而不是「今日」。
+ *
+ * @param {number} lastAt
+ * @param {number} now
+ * @returns {'today'|'week'|'month'|'earlier'}
+ */
+function convBucket(lastAt, now) {
+  if (!lastAt) return 'earlier';
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  const start = today.getTime();
+  if (lastAt >= start) return 'today';
+  if (lastAt >= start - 6 * DAY_MS) return 'week';
+  if (lastAt >= start - 29 * DAY_MS) return 'month';
+  return 'earlier';
+}
+
+/** @type {{id: 'today'|'week'|'month'|'earlier', label: string}[]} */
+const CONV_BUCKETS = [
+  { id: 'today', label: '今日' },
+  { id: 'week', label: '7 天内' },
+  { id: 'month', label: '30 天内' },
+  { id: 'earlier', label: '更早' },
+];
+
+/**
+ * 把会话按最近活跃时间装进四个桶里。
+ *
+ * 空桶直接不返回：左栏不该出现四个标题、其中三个下面什么都没有。
+ *
+ * @param {ThinkConv[]} convs 已按 lastAt 降序
+ * @param {number} now
+ * @returns {{id: string, label: string, items: ThinkConv[]}[]}
+ */
+function groupConversations(convs, now = Date.now()) {
+  /** @type {Map<string, ThinkConv[]>} */
+  const buckets = new Map(CONV_BUCKETS.map((b) => [b.id, []]));
+  for (const conv of convs) buckets.get(convBucket(conv.lastAt, now))?.push(conv);
+  return CONV_BUCKETS.map((b) => ({ ...b, items: buckets.get(b.id) ?? [] })).filter((b) => b.items.length > 0);
+}
+
 /* ------------------------------------------------------------ 格式化 */
 
 /**
@@ -279,6 +340,18 @@ function convLabel(key) {
   return `${kind} ${id}`;
 }
 
+/**
+ * 会话类型徽章。左栏按时间分组之后，群聊和私聊混在同一段里，
+ * 需要一个小标签让人一眼分清。
+ *
+ * @param {string} key
+ */
+function convKind(key) {
+  if (String(key).startsWith('group:')) return '群聊';
+  if (String(key).startsWith('private:')) return '私聊';
+  return '其他';
+}
+
 /** 本地日期 → YYYY-MM-DD（不能用 toISOString：那是 UTC，晚上会差一天） */
 function localDateKey(d) {
   const y = d.getFullYear();
@@ -299,7 +372,7 @@ function dayLabel(date) {
   if (!date) return '未知日期';
   const now = new Date();
   if (date === localDateKey(now)) return '今天';
-  if (date === localDateKey(new Date(now.getTime() - 86_400_000))) return '昨天';
+  if (date === localDateKey(new Date(now.getTime() - DAY_MS))) return '昨天';
 
   const m = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return date;
@@ -323,6 +396,34 @@ function shortStamp(ts) {
   if (localDateKey(d) === localDateKey(now)) return time;
   if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日`;
   return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/**
+ * 气泡里的时间：只要时分。
+ *
+ * 秒级时间戳在对话流里没有信息量，反而让每条消息的头部显得很吵。
+ *
+ * @param {number} ts
+ */
+function timeOf(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * 折叠态的一行摘要。
+ *
+ * 连续空白压成单个空格：思考文本里常有换行和缩进，直接截断会出现
+ * 一行占不满、后面全是空白的怪样子。
+ *
+ * @param {string} value
+ * @param {number} max
+ */
+function oneLine(value, max) {
+  const flat = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (flat.length <= max) return flat;
+  return `${flat.slice(0, max)}…`;
 }
 
 /**
@@ -384,33 +485,28 @@ export function renderThinkingPanel(snap, ctx = {}) {
   }
 
   const root = el('div', { class: 'think-shell' }, [
-    renderConvColumn(data, selected, ui, ctx),
+    renderConvColumn(data, selected, ctx),
     renderMainColumn(data, days, selected, ui, ctx),
   ]);
   return root;
 }
 
-/* ------------------------------------------------------- 左栏：会话列表 */
+/* ------------------------------------------------------- 左栏：会话目录 */
 
 /**
  * 左栏（约占 1/5）。
  *
- * 三个区块：「全部会话」置顶，然后群聊、私聊分开列。
- * 分开的理由和会话总览一样：群里的思考和私聊里的不是一回事，
- * 混在一起用户容易在错的会话上找。
+ * 「全部会话」置顶，下面按最近活跃时间分成今日 / 7 天内 / 30 天内 / 更早。
+ * 每项都带类型徽章（群聊/私聊）—— 时间分组之后两类混在一起，
+ * 没有徽章用户就得靠群号猜。
  *
  * @param {ThinkView} data
  * @param {string} selected
- * @param {any} ui
  * @param {any} ctx
  * @returns {HTMLElement}
  */
-function renderConvColumn(data, selected, ui, ctx) {
+function renderConvColumn(data, selected, ctx) {
   const convs = data.conversations;
-  const groups = convs.filter((c) => c.convKey.startsWith('group:'));
-  const privates = convs.filter((c) => c.convKey.startsWith('private:'));
-  const others = convs.filter((c) => !c.convKey.startsWith('group:') && !c.convKey.startsWith('private:'));
-
   const totalSteps = convs.reduce((n, c) => n + c.steps, 0);
 
   /** @param {ThinkConv} conv */
@@ -427,7 +523,10 @@ function renderConvColumn(data, selected, ui, ctx) {
         onclick: () => ctx.onSelectConv?.(conv.convKey),
       },
       [
-        el('span', { class: 'think-pick-title', text: convLabel(conv.convKey) }),
+        el('span', { class: 'think-pick-row' }, [
+          el('span', { class: 'think-pick-title', text: convLabel(conv.convKey) }),
+          el('span', { class: 'think-pick-kind', text: convKind(conv.convKey) }),
+        ]),
         el('span', {
           class: 'think-pick-sub',
           text: `${conv.entries} 回合 · ${conv.steps} 步 · ${shortStamp(conv.lastAt)}`,
@@ -451,14 +550,17 @@ function renderConvColumn(data, selected, ui, ctx) {
           onclick: () => ctx.onSelectConv?.(''),
         },
         [
-          el('span', { class: 'think-pick-title', text: '全部会话' }),
+          el('span', { class: 'think-pick-row' }, [
+            el('span', { class: 'think-pick-title', text: '全部会话' }),
+          ]),
           el('span', { class: 'think-pick-sub', text: `${convs.length} 个会话 · ${totalSteps} 步` }),
         ],
       ),
     );
-    if (groups.length > 0) body.push(el('div', { class: 'think-nav-group', text: `群聊 ${groups.length}` }), ...groups.map(item));
-    if (privates.length > 0) body.push(el('div', { class: 'think-nav-group', text: `私聊 ${privates.length}` }), ...privates.map(item));
-    if (others.length > 0) body.push(el('div', { class: 'think-nav-group', text: `其他 ${others.length}` }), ...others.map(item));
+
+    for (const bucket of groupConversations(convs)) {
+      body.push(el('div', { class: 'think-nav-group', text: bucket.label }), ...bucket.items.map(item));
+    }
   }
 
   return el('aside', { class: 'think-col-left', 'aria-label': '会话列表' }, [
@@ -467,10 +569,10 @@ function renderConvColumn(data, selected, ui, ctx) {
   ]);
 }
 
-/* ------------------------------------------------------- 右栏：内容 */
+/* ------------------------------------------------------- 右栏：对话流 */
 
 /**
- * 右栏（约占 4/5）：筛选 + 滚动内容。
+ * 右栏（约占 4/5）：标题 + 筛选条 + 对话流。
  *
  * @param {ThinkView} data
  * @param {ThinkDay[]} days
@@ -481,6 +583,7 @@ function renderConvColumn(data, selected, ui, ctx) {
  */
 function renderMainColumn(data, days, selected, ui, ctx) {
   const shown = countSteps(days);
+  const desc = ui.order === 'desc';
 
   const head = el('header', { class: 'think-head' }, [
     el('div', { class: 'think-head-row' }, [
@@ -505,6 +608,13 @@ function renderMainColumn(data, days, selected, ui, ctx) {
     ]),
     el('div', { class: 'row wrap think-tools-row' }, [
       ...[1, 7, 30].map((n) => segBtn(`最近 ${n} 个记录日`, (ui.days ?? 1) === n, () => ctx.onDays?.(n))),
+      el('span', { class: 'think-tools-sep', 'aria-hidden': 'true' }),
+      /*
+       * 群聊里消息多，用户经常只想看最新的一两条 —— 倒序把最新的放在最上面。
+       * 正序则是聊天软件的习惯：旧的在上面，顺着往下读。
+       */
+      segBtn('正序', !desc, () => ctx.onOrder?.('asc'), false, '最早在上，顺着往下读'),
+      segBtn('倒序', desc, () => ctx.onOrder?.('desc'), false, '最新在上，不用滚到底'),
       el('button', {
         type: 'button',
         class: 'btn btn-sm',
@@ -556,7 +666,12 @@ function renderMainColumn(data, days, selected, ui, ctx) {
       ]),
     );
   } else {
-    for (const day of days) scroll.append(renderDay(day, ui, ctx));
+    /*
+     * 倒序时日期和回合一起翻转，但**步骤内部保持正序** ——
+     * 一步推理里的先后顺序是内容本身，翻过来读会看不懂。
+     */
+    const ordered = desc ? [...days].reverse() : days;
+    for (const day of ordered) scroll.append(renderDay(day, ui, ctx, desc));
   }
 
   return el('div', { class: 'think-col-main' }, [head, scroll]);
@@ -600,7 +715,7 @@ function emptyHint(data, selected) {
 }
 
 /**
- * 一个日期分组。
+ * 一个日期分组：聊天软件式的日期分隔条 + 当天的对话。
  *
  * 头部由「折叠按钮」和「删除按钮」两个独立按钮组成 —— 不能嵌套按钮
  * （HTML 不允许，浏览器会把内层那个吞掉，表现成删不掉）。
@@ -608,8 +723,9 @@ function emptyHint(data, selected) {
  * @param {ThinkDay} day
  * @param {any} ui
  * @param {any} ctx
+ * @param {boolean} desc
  */
-function renderDay(day, ui, ctx) {
+function renderDay(day, ui, ctx, desc) {
   const closed = ui.closedDays instanceof Set ? ui.closedDays.has(day.date) : false;
   const n = countSteps([day]);
   // 这一天是否处于"等你再点一次"的状态
@@ -659,34 +775,57 @@ function renderDay(day, ui, ctx) {
         }),
   ]);
 
+  const entries = desc ? [...day.entries].reverse() : day.entries;
+
   return el('section', { class: `think-day${closed ? ' is-closed' : ''}` }, [
     head,
-    closed ? null : el('div', { class: 'think-day-body' }, day.entries.map((e) => renderEntry(e, ui, ctx))),
+    closed ? null : el('div', { class: 'think-day-body' }, entries.map((e) => renderEntry(e, ui, ctx))),
   ]);
 }
 
 /**
- * 一次回合：头部是时间 + 会话，下面是它的各步思考。
+ * 一个回合 = 一条助手消息。
+ *
+ * 对话式布局里它由「头像 + 气泡」组成；气泡内部是这次回合的每一步思考，
+ * 以及最后那条回答的预览。
  *
  * @param {ThinkEntry} entry
  * @param {any} ui
  * @param {any} ctx
  */
 function renderEntry(entry, ui, ctx) {
-  return el('article', { class: 'think-entry' }, [
-    el('div', { class: 'think-entry-head' }, [
-      el('span', { class: 'think-time', text: clock(entry.at) }),
-      el('span', { class: 'think-conv', title: entry.convKey, text: convLabel(entry.convKey) }),
+  const answer = [...entry.steps].reverse().find((s) => s.answerPreview)?.answerPreview ?? '';
+
+  return el('article', { class: 'think-msg think-entry' }, [
+    el('div', { class: 'think-avatar', 'aria-hidden': 'true', text: 'L' }),
+    el('div', { class: 'think-msg-main' }, [
+      el('div', { class: 'think-msg-meta' }, [
+        el('span', { class: 'think-msg-who', text: 'Ling' }),
+        el('span', { class: 'think-time', text: timeOf(entry.at), title: clockOf(entry.at) }),
+        el('span', { class: 'think-conv', title: entry.convKey, text: convLabel(entry.convKey) }),
+      ]),
+      el('div', { class: 'think-bubble' }, [
+        ...entry.steps.map((step, i) => renderThought(entry, step, i, ui, ctx)),
+        answer
+          ? el('div', { class: 'think-answer', title: answer }, [
+              el('span', { class: 'think-answer-label', text: '回答' }),
+              el('span', { class: 'think-answer-text', text: answer }),
+            ])
+          : null,
+      ]),
     ]),
-    ...entry.steps.map((step, i) => renderStep(entry, step, i, ui, ctx)),
   ]);
 }
 
 /**
- * 一步思考。
+ * 一步思考 = 气泡里的一条消息。
  *
- * 默认截断到 3 行（CSS line-clamp），点正文展开全文。
- * 展开态按 stepKey 存，所以整页重建后仍然展开。
+ * **默认展开**：思考内容要能直接看见 —— 包括那些"想了但没回答"的步骤。
+ * 点标题可以把它收成一行摘要（步骤号 + 前 64 字 + 工具标签），
+ * 再点一下展开。收起状态记在 ui.folded 里，轮询重绘后仍然保持。
+ *
+ * 正文**始终渲染**、靠 hidden 控制可见性：轮询重建时展开态由 ui.folded
+ * 决定，正文如果按需创建，测试和"复制文本"都会拿不到内容。
  *
  * @param {ThinkEntry} entry
  * @param {ThinkStep} step
@@ -694,45 +833,68 @@ function renderEntry(entry, ui, ctx) {
  * @param {any} ui
  * @param {any} ctx
  */
-function renderStep(entry, step, index, ui, ctx) {
+function renderThought(entry, step, index, ui, ctx) {
   const key = stepKey(entry, index);
-  const open = ui.expanded instanceof Set ? ui.expanded.has(key) : false;
-
+  // 默认展开；只有用户主动收起过的才在 folded 里
+  const open = !(ui.folded instanceof Set && ui.folded.has(key));
   const toggle = () => ctx.onToggleStep?.(key);
 
-  return el('div', { class: `think-step${open ? ' is-open' : ''}` }, [
-    el('div', { class: 'think-step-head' }, [
-      el('span', { class: 'think-step-n', text: `第 ${step.n} 步` }),
-      step.tools.length > 0
-        ? el(
-            'span',
-            { class: 'think-tools' },
-            step.tools.map((t) => el('span', { class: 'think-tool', text: t })),
-          )
-        : null,
-    ]),
+  const tools = step.tools;
+  /*
+   * 折叠态只放前两个工具 + "+N"，把一行的高度留给摘要；
+   * 展开态把完整工具列表挪进正文，头部只留步骤号。
+   */
+  const headTools = open ? [] : tools.slice(0, 2);
+  const moreTools = open ? 0 : tools.length - headTools.length;
+
+  return el('div', { class: `think-thought${open ? ' is-open' : ''}` }, [
     el(
-      'div',
+      'button',
       {
-        class: 'think-reason-wrap',
-        role: 'button',
-        tabindex: '0',
-        title: open ? '点击收起' : '点击展开全文',
+        class: 'think-thought-head',
+        type: 'button',
         'aria-expanded': open ? 'true' : 'false',
+        title: open ? '收起这句思考' : '展开这句思考',
         // 重绘后要能把焦点还给同一条 —— 否则键盘用户每展开一次就丢一次焦点
         dataset: { thinkKey: key },
         onclick: toggle,
-        onkeydown: (e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            toggle();
-          }
-        },
       },
-      [el('div', { class: `think-reason${open ? ' is-open' : ''}`, text: step.reasoning })],
+      [
+        el('span', { class: 'think-thought-icon', 'aria-hidden': 'true', text: '✧' }),
+        el('span', { class: 'think-thought-label', text: `第 ${step.n} 步` }),
+        open
+          ? null
+          : el('span', { class: 'think-thought-preview', text: oneLine(step.reasoning, 64) }),
+        headTools.length > 0
+          ? el(
+              'span',
+              { class: 'think-tools' },
+              headTools.map((t) => el('span', { class: 'think-tool', text: t })),
+            )
+          : null,
+        moreTools > 0 ? el('span', { class: 'think-tool think-tool-more', text: `+${moreTools}` }) : null,
+        el('span', { class: 'think-thought-arrow', 'aria-hidden': 'true', text: open ? '⌃' : '⌄' }),
+      ],
     ),
-    step.answerPreview
-      ? el('div', { class: 'think-answer', title: step.answerPreview, text: `回答预览：${step.answerPreview}` })
-      : null,
+    el('div', { class: 'think-thought-body', hidden: !open }, [
+      open && tools.length > 0
+        ? el(
+            'div',
+            { class: 'think-tools think-thought-tools' },
+            tools.map((t) => el('span', { class: 'think-tool', text: t })),
+          )
+        : null,
+      el('div', { class: 'think-reason', text: step.reasoning }),
+    ]),
   ]);
+}
+
+/**
+ * 完整时间戳（秒级），放在气泡时间的 title 里。
+ *
+ * @param {number} ts
+ */
+function clockOf(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleString('zh-CN', { hour12: false });
 }

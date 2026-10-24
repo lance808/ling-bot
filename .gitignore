@@ -47,6 +47,18 @@ plugins/*
 plugins/*/.staging-*/
 plugins/*/.backup/
 
+# 插件运行期数据：正常在 %APPDATA%/ling-bot/plugin-data/<id>/；
+# 这里兜底，防止有人把数据目录改到程序目录后误提交任务库、图片或锁文件。
+plugins/*/plugin-data/
+plugins/image-generation/tasks.json
+plugins/image-generation/images/
+plugins/image-generation/*.lock
+plugins/image-generation/config.json
+plugins/image-generation/secrets*
+# 插件包内不应含用户配置；即使误放，也不入库
+plugins/*/config.json
+plugins/*/secrets*
+
 # 编辑器与本机杂项
 .DS_Store
 Thumbs.db

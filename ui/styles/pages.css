@@ -64,6 +64,29 @@
   color: var(--fg-dim);
 }
 
+/*
+ * 协议/示例块（分条页的模型输出约定）。
+ *
+ * `pre` 默认是 `white-space: pre` 且自带浏览器默认字体 —— 两个问题：
+ *   1. 长行不换行，在窄栏里会横向溢出，把卡片撑破；
+ *   2. 默认等宽字体与页面其它等宽文本（--mono）不是一套，看起来像另一个页面。
+ * 所以显式给 pre-wrap + 与 .log-tail 一致的外观。
+ */
+pre.mono {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin: 0;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+  color: var(--fg-dim);
+}
+
 .persona-editor {
   display: grid;
   grid-template-columns: 1fr 220px;
@@ -2080,3 +2103,214 @@ td { overflow-wrap: anywhere; }
   opacity: 0;
   pointer-events: none;
 }
+
+/* ============================================================ 视觉页 */
+
+/*
+ * 这一页的五块是"结论 → 意图 → 能力 → 预算 → 统计"的排查顺序，
+ * 所以纵向堆叠、块间留白一致：用户从上往下读就是在按顺序排除。
+ *
+ * 为什么不做成左右两栏：左栏会让「开关」和「能力探测」并排，
+ * 而这两块恰恰是最容易被误读成同一件事的两块（"开了"vs"能读"）。
+ * 上下分开、各自一张卡，读起来才有先后关系。
+ */
+.vision-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+}
+
+/*
+ * 「实际效果」必须是单独一行、并且视觉上比别的块更靠前。
+ *
+ * 它是用户点进来第一眼要找的答案（"现在到底带不带图"），
+ * 加一层左侧强调色条让它在五张卡里第一个被看到，
+ * 而不是靠字号放大 —— 放大字号会把 kv 的基线撑歪。
+ */
+.vision-effective {
+  min-width: 0;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding-left: 2px;
+}
+
+/*
+ * 预算区里的输入框：它们和「说明」是一对，不能占满整行。
+ *
+ * 数字很小（张数、字节数），撑满整行的输入框会让人下意识以为
+ * 这里要填一大段文字。给个上限宽度既省空间也暗示"这是个数"。
+ */
+.vision-budget .text-input {
+  max-width: 220px;
+}
+
+/*
+ * 开关与探测两块各占一张卡，这里只做最小结构约束：
+ * 不额外加边框，避免和 .card 自己的边框叠成双层。
+ */
+.vision-switch,
+.vision-cap,
+.vision-runtime {
+  min-width: 0;
+}
+
+/*
+ * 窄窗口下预算行的说明会挤成一列，给个最小高度让"保存"按钮不至于
+ * 和上面的数字输入贴在一起（编号键值对在窄屏会换行）。
+ */
+@media (max-width: 720px) {
+  .vision-budget .field .row {
+    margin-top: 8px;
+  }
+}
+
+/* -------------------------------------------------- 联网搜索页 */
+
+/*
+ * 与视觉页同构：纵向分块排布，第一块（实际效果）是用户点进来第一眼
+ * 要找的答案。这里只补这个页面**新引入**的类，通用样式（card / kv /
+ * pill / field / list）一律复用既有定义 —— 复制一份会让两处样式随版本
+ * 漂移，而漂移的表现是"某个开关看起来像另一类控件"。
+ *
+ * 块数从五块变成七块（新增「联网模式」与「原生联网证据」）：
+ * 模式是用户意图，证据是后端事实，两者混在一张卡里会让"我选的"和
+ * "实际发生的"看起来是同一件事。
+ */
+.web-search-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+}
+
+/*
+ * 「实际效果」单独成行、排在开关之前，并沿用视觉页的强调边。
+ *
+ * 顺序是有意的：用户来这一页通常是因为"它说能搜却搜不到"或者
+ * "我不想让它联网"。先给结论，改开关的动作放后面。
+ */
+.ws-effective {
+  min-width: 0;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding-left: 2px;
+}
+
+.ws-mode,
+.ws-native,
+.ws-switch,
+.ws-config,
+.ws-try,
+.ws-runtime {
+  min-width: 0;
+}
+
+/*
+ * 模式单选：一行一个选项，说明文字跟着选项走。
+ *
+ * 为什么不把说明集中写在下面一段：三态最容易出的错就是"用户点了 A，
+ * 却按 B 的说明去理解"。说明必须贴在它自己的选项上。
+ */
+.ws-mode-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.ws-mode-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+/* 单选框不被 flex 压缩，也不跟着文字基线乱跑 */
+.ws-mode-choice input {
+  flex: none;
+  margin: 3px 0 0;
+}
+
+.ws-mode-choice-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* 选项内的标题不要额外下边距：它和下面的说明是一体的 */
+.ws-mode-choice-body .field-label {
+  margin-bottom: 2px;
+}
+
+.ws-mode-choice-body .field-hint {
+  margin-top: 0;
+}
+
+/* 试搜输入框与按钮一行：输入框吃掉剩余宽度，按钮不被压缩 */
+.ws-query {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ws-query .text-input {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+/*
+ * 结果列表：每条来源一张薄卡。
+ *
+ * 用左边框而不是整块背景色区分，是因为结果条数不定：整块背景在 10 条
+ * 时会变成一片色块，反而看不出"这是一条一条的来源"。
+ */
+.ws-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ws-result {
+  border-left: 3px solid var(--border);
+  padding: 4px 0 4px 10px;
+  min-width: 0;
+}
+
+.ws-result-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * URL 用它自己的等宽样式，并允许任意换行：搜索结果里的长链接撑破
+ * 布局是最常见的视觉问题，而用户恰恰需要能完整看到它。
+ */
+.ws-result-url {
+  display: block;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.ws-result-snippet {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.ws-result-host,
+.ws-result-meta {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* 失败与成功两种结果都单独成行，颜色只做提示，不替代文字说明 */
+.ws-error,
+.ws-query-error,
+.ws-ok {
+  overflow-wrap: anywhere;
+}
+
+

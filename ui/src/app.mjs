@@ -4,8 +4,21 @@
  * 页面按「看 / 配 / 查」分成三组（见 PAGES 的 group 字段）：
  *
  *   概览  数据总览 / 会话总览 / 思考链路
- *   配置  模型设置 / 人物设置 / 工具记忆 / 插件 / 系统安全
+ *   配置  模型设置 / 人物设置 / 插件设置 / 视觉 / 语言 / 记忆 / 工具调用 / 系统安全
  *   记录  词元消耗 / 运行日志
+ *
+ * ## 配置组为什么是这个顺序
+ *
+ * 按"用户先要跑通什么"排：
+ *
+ *   1. 模型设置   —— 没有模型，其它都无从谈起
+ *   2. 人物设置   —— 它是谁、怎么说话
+ *   3. 插件设置   —— 能做什么额外的事（联网、生图、DSH 桥）
+ *   4. 视觉       —— 图片能不能真的进对话
+ *   5. 语言       —— 什么时候开口、怎么分条、什么时候闭嘴
+ *   6. 记忆       —— 它记得什么
+ *   7. 工具调用   —— 工具能力清单与授权口径
+ *   8. 系统安全   —— 谁能用它、边界在哪（收尾）
  *
  * 分组不只是好看：页面平铺在侧栏里，用户要一行行读完才知道
  * "我要改的东西在哪"。分组后「改配置」有固定的位置。
@@ -26,8 +39,8 @@ import { renderOverview } from './views/overview.mjs';
 import { renderSessions } from './views/sessions.mjs';
 import { renderPersona, renderBehaviorLayer } from './views/persona.mjs';
 import { renderSecurity } from './views/security.mjs';
-import { renderWake } from './views/wake.mjs';
-import { renderSilence } from './views/silence.mjs';
+import { renderLanguage } from './views/language.mjs';
+import { renderVision } from './views/vision.mjs';
 import { renderLogs } from './views/logs.mjs';
 import { renderConfirmBar } from './views/confirm.mjs';
 import { renderModelSettings } from './views/model.mjs';
@@ -56,12 +69,42 @@ const PAGES = [
 
   { id: 'model', group: '配置', label: '模型设置', sub: '提供商、密钥、模型列表与能力探测', render: (s, ctx) => renderModelSettings(s, ctx.model) },
   { id: 'persona', group: '配置', label: '人物设置', sub: '人格 = 它是谁；角色 = 它在什么场景扮演什么', render: (s, ctx) => el('div', {}, [renderPersona(s, { persona: ctx.persona, role: ctx.role, tab: ctx.tab, onTab: ctx.onTab }), el('div', { class: 'spacer-12' }), renderBehaviorLayer()]) },
+  { id: 'plugins', group: '配置', label: '插件设置', sub: '启用停用、配置、工具与诊断', render: (s, ctx) => renderPlugins(s, ctx.plugins) },
+  /*
+   * 视觉是独立一页，不并进「模型设置」。
+   *
+   * 模型页那里的「读图✓」是**能力探测**（这个模型接不接受图片），
+   * 而这一页管的是**要不要真的把图取回来提交**（开关 + 预算 + 降级）。
+   * 两件事的失败方式完全不同：前者是"模型不行"，后者是"图没取到 / 超预算 /
+   * 开关关着"。并在一页里，用户看到"读图✓"却收不到图时无从判断是哪一层。
+   */
+  { id: 'vision', group: '配置', label: '视觉', sub: '要不要带图、带多少、以及模型到底能不能读', render: (s, ctx) => renderVision(s, { rerender: ctx.sessions?.rerender }) },
+  /*
+   * 语言页 = 唤醒 + 分条 + 静音。
+   *
+   * 这三块回答的是同一件事的三个侧面，而且互相牵制：
+   * 唤醒决定"该不该开口"，分条决定"开口了怎么说"，静音决定"现在能不能说"。
+   * 拆成三个入口时，用户想调"说话太密"得在两页之间来回跳，
+   * 而「语言」这个入口本身就说明了范围。
+   */
+  { id: 'language', group: '配置', label: '语言', sub: '什么时候开口、怎么分条、什么时候闭嘴', render: (s, ctx) => renderLanguage(s, { rerender: ctx.sessions?.rerender }) },
   { id: 'memory', group: '配置', label: '记忆', sub: '情境知识、日记与淡忘、人格卡', render: (s, ctx) => renderMemory(s, { rerender: ctx.sessions?.rerender }) },
   { id: 'tool-calls', group: '配置', label: '工具调用', sub: '它现在能做什么：注册的工具、可用来源与确认要求', render: (s, ctx) => renderToolCalls(s, ctx.tools) },
-  { id: 'plugins', group: '配置', label: '插件设置', sub: '启用停用、配置、工具与诊断', render: (s, ctx) => renderPlugins(s, ctx.plugins) },
   { id: 'security', group: '配置', label: '系统安全', sub: '白名单、管理员与控制台凭证', render: (s, ctx) => renderSecurity(s, ctx.security) },
-  { id: 'wake', group: '配置', label: '唤醒设置', sub: '什么消息值得起一个回合，以及频率硬限', render: (s, ctx) => renderWake(s, { rerender: ctx.sessions?.rerender }) },
-  { id: 'silence', group: '配置', label: '静音', sub: '让它闭嘴：全局 / 按会话 / 时段 / 聊天指令', render: (s, ctx) => renderSilence(s, { rerender: ctx.sessions?.rerender }) },
+  /*
+   * 联网搜索**不再单独占一页**，已并入《插件设置》：选中「联网搜索」插件后，
+   * 在插件列表与插件详情之间会渲染宿主级的联网设置（总开关、三态通道、原生服务商、证据、试搜）。
+   *
+   * 为什么合回去：用户要改的东西（独立搜索的 Key/地址、总开关、三态模式、
+   * 原生服务商）本质上都在回答同一个问题 ——「这台机器上的联网怎么配」。
+   * 分在「插件页」和另一个「联网页」两处时，用户看到"插件已启用"却搜不到，
+   * 还得判断是总闸关着、Key 没存，还是走了原生通道。
+   *
+   * 边界仍要写清：总开关/通道/原生服务商是**宿主级**设置，不是插件清单里的
+   * 配置项；独立搜索 API 是 Ling-bot 自己发 HTTP(S) 出站，关掉即零请求；
+   * 服务商原生联网只是模型请求体里的声明，关掉后不再发送，但服务商是否仍在
+   * 其服务端自行检索，我们看不到也无法验证（契约 §0）。
+   */
 
   { id: 'usage', group: '记录', label: '词元消耗', sub: '输入 / 输出、缓存命中与时间范围', render: (s, ctx) => renderUsage(s, ctx.usage) },
   { id: 'logs', group: '记录', label: '运行日志', sub: '工具调用历史与每次唤醒的消耗', render: (s, ctx) => renderLogs(s, ctx.logs) },
@@ -1224,6 +1267,14 @@ function render() {
     },
 
     model: {
+      /**
+       * 模型页内的页面跳转。
+       *
+       * 生图的配置全在插件页，模型页只留一个引导按钮。这里**不能**引用
+       * 外层 ctx（那个对象还在构造中，且每次渲染都是新的），所以直接用
+       * 模块里的 set —— 和外面那个 gotoPage 是同一个行为。
+       */
+      gotoPage: (id) => set({ page: id }),
       onSaveSetting: (k, v) => withPaintLock(async () => {
         const r = await setting(k, v);
         await pull();

@@ -34,8 +34,10 @@ test('页面视图文件都存在', () => {
   // DSH 接入已并入通用插件页，不再有独立的 dsh.mjs
   const pages = [
     'overview', 'sessions', 'model', 'persona', 'plugins', 'security', 'usage', 'logs',
-    // F19 唤醒设置 / F20 静音
-    'wake', 'silence',
+    // F23：《语言》页把唤醒 / 分条 / 静音合成一个入口（页内分栏）
+    'language', 'wake', 'reply-split', 'silence',
+    // F22：视觉是独立一页
+    'vision',
     // F21：工具记忆改名为「记忆」并并入日记；工具列表拆到「工具调用」
     'memory', 'tool-calls',
   ];
@@ -121,7 +123,17 @@ test('app.mjs 注册的页面里包含插件页，且不再有 DSH 专用页', (
    *
    * 变化史：DSH 页移除后 10 个 → F19 唤醒 / F20 静音 加到 12
    * → F21 把「日记」并进「记忆」、工具列表拆出「工具调用」，
-   * 日记页不再是独立入口，净增 1（记忆 + 工具调用 − 日记）= 13。
+   * 日记页不再是独立入口，净增 1（记忆 + 工具调用 − 日记）= 13
+   * → F22 分条发送是独立一页 = 14
+   * → 视觉读图是独立一页 = 15。它管的是"要不要真的取图并提交"（开关 +
+   * 预算 + 降级），和《模型设置》里的能力探测（模型接不接受图片）是两层：
+   * 并进模型页的话，用户看到「读图✓」却收不到图时，根本分不清是哪一层坏了。
+   * → 联网搜索并入《插件设置》后回到 15。
+   * → F23 把唤醒 / 分条 / 静音合成一页《语言》，三页并为 1：15 − 3 + 1 = 13。
+   * 它们本来就是同一件事的三个侧面（该不该开口 / 开口怎么说 / 现在能不能说），
+   * 拆成三个侧栏入口时，调"说话太密"得在两页之间来回跳。
+   * 视觉同时从「视觉读图」改名为「视觉」——这一页还管预算、降级与统计，
+   * 叫"读图"会让人以为只有那一个开关。
    */
   const pagesBlock = src.slice(src.indexOf('const PAGES'), src.indexOf('];', src.indexOf('const PAGES')));
   const ids = [...pagesBlock.matchAll(/id: '([\w-]+)'/g)].map((m) => m[1]);
@@ -135,15 +147,76 @@ test('app.mjs 注册的页面里包含插件页，且不再有 DSH 专用页', (
   // 日记已并入《记忆》，不再是独立页面
   assert.ok(!ids.includes('diary'), '日记已并入《记忆》页，不该再占一个侧栏入口');
 
-  // F19 唤醒设置页 / F20 静音页
-  assert.ok(ids.includes('wake'), '缺唤醒设置页（F19）');
-  assert.ok(ids.includes('silence'), '缺静音页（F20）');
+  /*
+   * F23：唤醒 / 分条 / 静音合称《语言》。
+   *
+   * 三个旧 id 必须真的从侧栏消失 —— 留着任何一个就是第二份入口，
+   * 而"该去哪个入口改"正是这次合并要消灭的问题。
+   */
+  assert.ok(ids.includes('language'), '缺《语言》页（F23）');
+  for (const gone of ['wake', 'silence', 'reply-split']) {
+    assert.ok(!ids.includes(gone), `「${gone}」已并入《语言》页，不该再有独立入口`);
+  }
+  // F22：视觉是独立一页，且名字是「视觉」而不是「视觉读图」
+  assert.ok(ids.includes('vision'), '缺《视觉》页');
+  assert.ok(!/label: '视觉读图'/.test(src), '页名已改为「视觉」');
+  // 联网搜索已并入《插件设置》，不再占独立侧栏入口
+  assert.ok(!ids.includes('web-search'), '联网搜索已并入插件设置页，不该再有独立页面');
+  assert.ok(!/renderWebSearch/.test(src), '不该再 import renderWebSearch 页面');
   // 思考链路属于「概览」组，且排在会话总览之后
   assert.ok(ids.includes('thinking'), '缺思考链路页');
   assert.ok(ids.indexOf('thinking') > ids.indexOf('sessions'), '思考链路应在会话总览之后');
   // DSH 不能作为独立页面存在
   assert.ok(!ids.includes('dsh'), 'DSH 已并入插件页，不该再有独立页面');
   assert.ok(!/renderDsh/.test(src), '不该再 import renderDsh');
+});
+
+/* ------------------------------------------------ 配置组的排列顺序 */
+
+test('★ 配置组按「先跑通、再调行为、最后收边界」排列', () => {
+  /*
+   * 顺序是有意的，不是随手排的：
+   *
+   *   1. 模型设置   没有模型，其它都无从谈起
+   *   2. 人物设置   它是谁、怎么说话
+   *   3. 插件设置   能做什么额外的事
+   *   4. 视觉       图片能不能真的进对话
+   *   5. 语言       什么时候开口、怎么分条、什么时候闭嘴
+   *   6. 记忆       它记得什么
+   *   7. 工具调用   工具能力清单与授权口径
+   *   8. 系统安全   谁能用它、边界在哪
+   *
+   * 用户找"我要改的东西"时按的是这个直觉顺序；
+   * 打乱不会报错，只会让人多翻三页。
+   */
+  const src = read('ui/src/app.mjs');
+  const block = src.slice(src.indexOf('const PAGES'), src.indexOf('];', src.indexOf('const PAGES')));
+  const configIds = [...block.matchAll(/id: '([\w-]+)',\s*group: '配置'/g)].map((m) => m[1]);
+  assert.deepEqual(
+    configIds,
+    ['model', 'persona', 'plugins', 'vision', 'language', 'memory', 'tool-calls', 'security'],
+    `配置组顺序不对：${configIds.join(' → ')}`,
+  );
+});
+
+/* ------------------------------------------------ 语言页的分栏 */
+
+test('★ 语言页包含唤醒 / 分条 / 静音三栏，且默认停在唤醒', async () => {
+  /*
+   * 合并之后最容易出的问题是"合并了但只显示其中一块"——
+   * 那样用户点进《语言》会以为静音设置没了。
+   * 所以三个区块的渲染函数必须都真的被调用。
+   */
+  const src = read('ui/src/views/language.mjs');
+  for (const mod of ['renderWake', 'renderReplySplit', 'renderSilence']) {
+    assert.match(src, new RegExp(`import \\{ ${mod} \\}`), `语言页没 import ${mod}`);
+    assert.match(src, new RegExp(`${mod}\\(snap, ctx\\)`), `${mod} 没有被调用`);
+  }
+  for (const label of ['唤醒', '分条', '静音']) {
+    assert.match(src, new RegExp(`label: '${label}'`), `分栏缺「${label}」`);
+  }
+  // 默认栏：用户点进来最常调的是"该不该开口"，不是"怎么闭嘴"
+  assert.match(src, /const ui = \{ tab: 'wake' \}/, '默认应停在唤醒栏');
 });
 
 /* --------------------------------------------------- 主题 */
@@ -568,12 +641,27 @@ test('★ 总览的能力要按当前模型去取', () => {
   );
 });
 
-test('★ 能力字段名必须是 vision / image', () => {
-  // 探测结果写的是 image，总览读的是 imageGen，差一个词就永远显示 ?
-  const src = read('ui/src/views/overview.mjs');
-  assert.match(src, /caps\.vision/, '要读 vision');
-  assert.match(src, /caps\.image\b/, '要读 image');
-  assert.ok(!/caps\.imageGen/.test(src), '不能读 imageGen');
+test('★ 聊天模型界面不再展示生图能力', () => {
+  /*
+   * 生图已整体归独立插件 `plugins/image-generation`：另一套地址、另一把 Key、
+   * 另一个模型。所以聊天模型这一侧不能再出现「生图」这个能力项 ——
+   * 一旦某处又开始读 `caps.image`，用户就会看到一个来路不明、且永远
+   * 不会更新的「生图 ✓/✗」。
+   *
+   * 视觉三态必须保留（那是聊天模型自己的能力）。
+   */
+  const overview = read('ui/src/views/overview.mjs');
+  assert.match(overview, /caps\.vision/, '总览仍要读视觉三态');
+  assert.ok(!/caps\.image\b/.test(overview), '总览不能再读 caps.image');
+  assert.ok(!/caps\.imageGen/.test(overview), '也不该读 imageGen');
+  assert.ok(!/视觉与生图/.test(overview), '不要再说「视觉与生图」');
+
+  const model = read('ui/src/views/model.mjs');
+  assert.ok(!model.includes('生图✓'), '下拉里不能再有「生图✓」');
+  const probeLine = model.split('\n').find((l) => l.includes('ctx.onProbe(')) ?? '';
+  assert.ok(probeLine, '要能调用探测');
+  assert.match(probeLine, /\['vision'\]/, '探测只请求视觉');
+  assert.ok(!/image/i.test(probeLine), "探测调用里不能出现 'image'");
 });
 
 test('★ 插件危险权限必须有开关，不能只是药丸', () => {

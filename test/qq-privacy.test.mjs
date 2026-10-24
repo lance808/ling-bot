@@ -25,10 +25,12 @@ import assert from 'node:assert/strict';
  *
  * ⚠️ 下面的样例号全部是**构造的**，不对应任何真实账号。
  *
- * 这类测试曾经用过真实号并加 `scan-secrets:allow-qq` 豁免整个文件 ——
+ * 这类测试曾经用过真实号，并给整个文件加过"允许 QQ 号"的豁免 ——
  * 那是错的：豁免让扫描器把**整个文件**的 QQ 号检测关掉，真号就是这样
  * 混进来的。测规则不需要真号，"看起来像真号"就够：只要是 6~11 位、
  * 不是连号/整十/纯重复的普通数字串，规则分不清真假，测试照样有效。
+ * 所以下面的样例号一律标注「示例号」——扫描器见到这个标记会跳过，
+ * 它们也不对应任何真实账号。
  */
 const QQ_CONTEXT = [
   /(?:group|private)\s*:\s*['"`]?(\d{6,12})\b/g,
@@ -70,22 +72,22 @@ function findRealQQ(line) {
 /* ---------------------------------------------------------------- 该抓 */
 
 test('★ 会话 key 里的真实号会被抓到', () => {
-  assert.ok(findRealQQ("convKey: 'group:369912345'").length > 0);
-  assert.ok(findRealQQ('private:12345678').length > 0);
+  assert.ok(findRealQQ("convKey: 'group:287163904'").length > 0); // 示例号
+  assert.ok(findRealQQ('private:12345678').length > 0); // 示例号：长连号仍按真号处理
 });
 
 test('★ 管理员列表里的真实号会被抓到', () => {
-  assert.ok(findRealQQ("const admins = ['155266789'];").length > 0);
-  assert.ok(findRealQQ('admins: "139785234,155266789"').length > 0);
+  assert.ok(findRealQQ("const admins = ['315602847'];").length > 0); // 示例号
+  assert.ok(findRealQQ('admins: "476390218,315602847"').length > 0); // 示例号
 });
 
 test('★ ownerQQ 之类的字段名会被抓到', () => {
-  assert.ok(findRealQQ("ownerQQ: '139785234'").length > 0);
-  assert.ok(findRealQQ("setupQQ: '155266789'").length > 0);
+  assert.ok(findRealQQ("ownerQQ: '476390218'").length > 0); // 示例号
+  assert.ok(findRealQQ("setupQQ: '528104763'").length > 0); // 示例号
 });
 
 test('中文「群号」后面的数字会被抓到', () => {
-  assert.ok(findRealQQ('群号：369912345').length > 0);
+  assert.ok(findRealQQ('群号：287163904').length > 0); // 示例号
 });
 
 /* ---------------------------------------------------------------- 该放 */
@@ -95,7 +97,7 @@ test('★ 明显的假号必须放行（否则测试没法写）', () => {
   assert.equal(findRealQQ("groups: ['100000001']").length, 0);
   assert.equal(findRealQQ('group:123456').length, 0, '短连号是假的');
   // 8 位以上的连号当真实号处理：宁可误报也不漏
-  assert.ok(findRealQQ('private:12345678').length > 0, '长连号仍要报');
+  assert.ok(findRealQQ('private:12345678').length > 0, '长连号仍要报'); // 示例号
   assert.equal(findRealQQ('group:11111111').length, 0, '全同号是假的');
 });
 

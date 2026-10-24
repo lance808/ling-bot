@@ -1,5 +1,14 @@
 /**
- * 模型能力探测 —— 视觉 / 生图 / 通道类型
+ * 聊天模型能力探测 —— 视觉（读图）与通道类型
+ *
+ * ## 这里**不探测生图**
+ *
+ * 生图（`POST /images/generations` 那类接口）是**另一套服务、另一把 Key、
+ * 另一个模型**，归独立插件 `plugins/image-generation` 管理。拿聊天模型的
+ * 地址和 Key 去试生图端点，既可能误判（中转的聊天与生图常常不是同一家），
+ * 又会在用户只是想知道"能不能读图"时**真的花掉一次生图的钱**。
+ *
+ * 所以本模块只负责视觉能力；生图能力不由聊天模型宣布，也不按模型名推断。
  *
  * ## 为什么不查表
  *
@@ -12,7 +21,7 @@
  *
  * ## 一个必须说清的边界
  *
- * 探测发的是**真实请求**，会消耗额度（虽然极少：一张 1×1 图 + 几个 token）。
+ * 探测发的是**真实请求**，会消耗额度（虽然极少：一张 64×64 图 + 几个 token）。
  * 所以只在用户点按钮时探测，绝不在启动时自动跑。
  *
  * ## "没测出来" ≠ "不支持"
@@ -131,7 +140,7 @@ export async function probeVision({ baseUrl, apiKey, model, timeoutMs = 20000, s
     }
     // 4xx/5xx：看错误信息判断是不是"不支持图片"
     const msg = extractErr(res.data, res.status);
-    return { supported: capabilityRejection(res.status, msg, 'vision'), code: `E${res.status}`, detail: msg };
+    return { supported: capabilityRejection(res.status, msg), code: `E${res.status}`, detail: msg };
   } catch (err) {
     // 网络层失败：没结论，不能判成"不支持"
     const e = /** @type {any} */ (err);
@@ -204,93 +213,142 @@ export function judgeVisionAnswer(data) {
 }
 
 /**
- * 探测模型是否支持生图。
+ * 探测聊天模型的能力 —— **只有视觉**。
  *
- * 两种常见形态都要试：
- *   1. `/images/generations`（OpenAI 标准生图端点）
- *   2. chat 接口里带 `modalities: ['image']`（部分中转的多模态形态）
- *
- * 只发最小的 1 张图请求。不支持时服务端会返回 4xx 或明确报错。
+ * 抽成一个入口是为了让"聊天探测会发哪些请求"这件事可被测到：
+ * 调用方（宿主的 `llm.probe`）只拿这个函数，不存在某个参数能让它
+ * 顺手去请求 `/images/generations`。生图归独立插件，不在这条链路上。
  *
  * @param {object} o
  * @param {string} o.baseUrl
  * @param {string} o.apiKey
  * @param {string} o.model
  * @param {number} [o.timeoutMs]
- * @returns {Promise<ProbeResult & {via?: string}>}
+ * @param {AbortSignal} [o.signal]
+ * @returns {Promise<{probes: {vision: ProbeResult}, channel: {channel: string, label: string, basis: string}}>}
  */
-export async function probeImageGen({ baseUrl, apiKey, model, timeoutMs = 30000 }) {
-  if (!apiKey) return { supported: null, code: 'E3020', detail: '还没配置 API Key' };
+export async function probeModel({ baseUrl, apiKey, model, timeoutMs = 20000, signal }) {
+  const vision = await probeVision({ baseUrl, apiKey, model, timeoutMs, signal });
+  const caps = typeof vision.supported === 'boolean' ? { vision: vision.supported } : {};
+  return { probes: { vision }, channel: inferChannel({ model, caps }) };
+}
 
-  // (1) 先试标准生图端点
-  let standardRejected = false;
-  const imgUrl = imagesUrlOf(baseUrl);
-  try {
-    const res = await postJson(
-      imgUrl,
-      apiKey,
-      { model, prompt: 'a red dot', n: 1, size: '256x256' },
-      timeoutMs,
-    );
-    if (res.status === 200) {
-      const n = Array.isArray(res.data?.data) ? res.data.data.filter(hasImageEvidence).length : 0;
-      if (n > 0) return { supported: true, via: 'images', detail: `返回 ${n} 张图` };
-      return { supported: null, via: 'images', detail: '接口正常但没有可验证图片' };
+/**
+ * 清掉旧配置里遗留的**生图探测状态**。
+ *
+ * 早先的聊天模型探测会同时写 `image` / `probes.image`，还可能记下
+ * `channel: 'imageGen'`。这些结论现在既没有出处（不再探测），也没有用途
+ * （生图归独立插件），留着只会让界面显示一个来路不明的"生图 ✓/✗"。
+ *
+ * ## 什么该删、什么该留
+ *
+ * - 删：`image`、`imageGen` 字段；`probes.image`；`channel === 'imageGen'`
+ *   （它是旧探测的结论，不是名字推断，留着会让界面继续宣称"生图可用"）。
+ * - 留：`vision`、`probes.vision`、`probedAt`、`endpoint` 及其它未知字段
+ *   —— 视觉结论仍然有效，配置层也不该丢掉它不认识的元信息。
+ * - **整条删**：删完既没有 `vision` 布尔值、也没有 `probes.vision` 的条目。
+ *   那种条目只测过生图，对聊天模型能力**一句话都没说过**；留着会显示成
+ *   "探测失败"，而用户其实从没测过读图 —— 那比空着更误导。
+ *
+ * 幂等：对已经清理过的配置再跑一次不会产生变化（changed=false）。
+ *
+ * @param {Record<string, any>} capsByEndpoint
+ * @returns {{caps: Record<string, any>, changed: boolean}}
+ */
+export function sanitizeModelCapabilities(capsByEndpoint) {
+  if (!capsByEndpoint || typeof capsByEndpoint !== 'object' || Array.isArray(capsByEndpoint)) {
+    return { caps: capsByEndpoint ?? {}, changed: false };
+  }
+
+  let changed = false;
+  /** @type {Record<string, any>} */
+  const out = {};
+
+  for (const [endpoint, models] of Object.entries(capsByEndpoint)) {
+    if (!models || typeof models !== 'object' || Array.isArray(models)) {
+      out[endpoint] = models;
+      continue;
     }
-    // 404/405 说明这家根本没有生图端点，继续试第二种形态
-    if (res.status !== 404 && res.status !== 405) {
-      const msg = extractErr(res.data, res.status);
-      // 有些站对不支持的模型返回 400 且信息里带 "not support"
-      if (capabilityRejection(res.status, msg, 'image') === false) {
-        standardRejected = true;
+
+    /** @type {Record<string, any>} */
+    const kept = {};
+    for (const [model, entry] of Object.entries(models)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        kept[model] = entry;
+        continue;
       }
-      // 其它 4xx 也可能是模型不支持，但证据不足 → 继续试 chat 形态
+
+      const next = { ...entry };
+      let droppedLegacy = false;
+      for (const legacy of ['image', 'imageGen']) {
+        if (legacy in next) {
+          delete next[legacy];
+          droppedLegacy = true;
+          changed = true;
+        }
+      }
+
+      if (next.probes && typeof next.probes === 'object' && !Array.isArray(next.probes)) {
+        if ('image' in next.probes) {
+          const probes = { ...next.probes };
+          delete probes.image;
+          next.probes = Object.keys(probes).length > 0 ? probes : undefined;
+          if (next.probes === undefined) delete next.probes;
+          changed = true;
+          droppedLegacy = true;
+        }
+      }
+
+      if (next.channel === 'imageGen') {
+        /*
+         * `channel: 'imageGen'` 只可能来自旧探测（名字推断现在用 `other`）。
+         * 删掉它；若整条只剩这个字段，下面的"无视觉证据"规则会把条目
+         * 一起丢掉 —— 一个空的 `{}` 对界面没有意义，反而会让"最近探测过"
+         * 看起来像真的。
+         */
+        delete next.channel;
+        changed = true;
+        droppedLegacy = true;
+      }
+
+      /*
+       * 只测过生图的条目：删完没有任何视觉证据，整条丢掉。
+       * 注意 `probes.vision` 存在时即使结论是 null 也要留 —— 那是"测过但没测出来"。
+       */
+      if (droppedLegacy && typeof next.vision !== 'boolean' && !next.probes?.vision) {
+        changed = true;
+        continue;
+      }
+
+      kept[model] = next;
     }
-  } catch {
-    /* 网络问题：继续试下一种形态 */
+    out[endpoint] = kept;
   }
 
-  // (2) 再试 chat + modalities
-  try {
-    const res = await postJson(
-      chatUrlOf(baseUrl),
-      apiKey,
-      {
-        model,
-        messages: [{ role: 'user', content: '画一个红点' }],
-        modalities: ['image'],
-        max_tokens: 32,
-      },
-      timeoutMs,
-    );
-    if (res.status === 200) {
-      const msg = res.data?.choices?.[0]?.message;
-      const hasImage = (Array.isArray(msg?.images) && msg.images.some(hasImageEvidence)) || (Array.isArray(msg?.content) && msg.content.some(b => /image/.test(b?.type ?? '') && hasImageEvidence(b)));
-      if (hasImage) return { supported: true, via: 'chat', detail: '对话接口返回了图片' };
-      return { supported: null, via: 'chat', detail: '接口接受了请求但没有可验证图片' };
-    }
-    const m = extractErr(res.data, res.status);
-    return { supported: standardRejected && capabilityRejection(res.status, m, 'image') === false ? false : null, via: 'chat', detail: m };
-  } catch (err) {
-    const e = /** @type {any} */ (err);
-    return { supported: null, code: e?.code ?? 'E3012', detail: String(e?.message ?? e) };
-  }
+  return { caps: changed ? out : capsByEndpoint, changed };
 }
 
 /**
  * 判定模型通道类型。
  *
  * 这是**基于模型目录元信息的推断**，不是实测——所以标签用词必须留余地：
- * 说"文本通道"而不是"只能处理文本"。
+ * 说"文本通道"而不是"只能处理文本"，说"疑似非对话模型"而不是"这是生图模型"。
  *
  * 依据（按优先级）：
  *   1. 已实测过视觉 → 多模态通道
  *   2. 模型 id 里带 embed/rerank → 向量通道
- *   3. id 里带 image/dall-e/sd/flux → 生图通道
+ *   3. id 里带 image/dall-e/sd/flux → 疑似非对话模型（**不据此宣布能生图**）
  *   4. id 里带 audio/tts/whisper → 音频通道
  *   5. 其它 → 文本通道
  *
- * @param {{model: string, caps?: {vision?: boolean, image?: boolean}}} o
+ * ## 为什么第 3 条不再标成"生图"
+ *
+ * 名字像生图模型（`dall-e-3`、`flux-1.1`）**不等于**当前服务商的这套地址
+ * 真能生图：能力要实测，而生图归独立插件、由它自己的地址与 Key 决定。
+ * 聊天模型页按名字宣布"生图"，用户就会拿聊天 Key 去期待生图 —— 这正是
+ * 本次清理要消掉的误导。所以这里只提示"它可能不是用来对话的"。
+ *
+ * @param {{model: string, caps?: {vision?: boolean}}} o
  * @returns {{channel: string, label: string, basis: string}}
  */
 export function inferChannel({ model, caps }) {
@@ -298,9 +356,6 @@ export function inferChannel({ model, caps }) {
 
   if (caps?.vision === true) {
     return { channel: 'multimodal', label: '多模态（可读图）', basis: '已实测：图片输入可用' };
-  }
-  if (caps?.image === true) {
-    return { channel: 'imageGen', label: '生图', basis: '已实测：生图可用' };
   }
 
   // 实测**否定**过视觉的，名字再像也不能判成多模态。
@@ -311,7 +366,11 @@ export function inferChannel({ model, caps }) {
     return { channel: 'embedding', label: '向量', basis: '模型名含 embed/rerank' };
   }
   if (/(^|[-_/])(dall-e|dalle|sd|sdxl|flux|image|imagen|kolors)/.test(id)) {
-    return { channel: 'imageGen', label: '生图', basis: '模型名像生图模型' };
+    return {
+      channel: 'other',
+      label: '疑似非对话模型',
+      basis: '模型名像图像类模型；生图能力归独立插件，不按名字认定',
+    };
   }
   if (/whisper|tts|audio|speech|voice/.test(id)) {
     return { channel: 'audio', label: '音频', basis: '模型名像音频模型' };
@@ -333,9 +392,12 @@ export function inferChannel({ model, caps }) {
 /**
  * 把模型 id 列表整理成带能力信息的目录。
  *
+ * 只带**视觉**三态：生图不是聊天模型的能力，目录里不出现它，
+ * 免得界面把"这个模型可能能生图"当成一个可选项呈现。
+ *
  * @param {string[]} ids
  * @param {Record<string, any>} capsByModel
- * @returns {Array<{id: string, channel: string, channelLabel: string, basis: string, vision: boolean|null, image: boolean|null}>}
+ * @returns {Array<{id: string, channel: string, channelLabel: string, basis: string, vision: boolean|null}>}
  */
 export function endpointKey(baseUrl) {
   const u = new URL(chatUrlOf(baseUrl));
@@ -355,7 +417,6 @@ export function describeCatalog(ids, capsByModel = {}) {
       basis: ch.basis,
       // 三态：true / false / null（未测）。null 必须保留，不能压成 false。
       vision: typeof caps.vision === 'boolean' ? caps.vision : null,
-      image: typeof caps.image === 'boolean' ? caps.image : null,
     };
   });
 }
@@ -373,16 +434,6 @@ export function chatUrlOf(baseUrl) {
   if (/\/chat\/completions$/.test(base)) return base;
   if (/\/v\d+$/.test(base)) return `${base}/chat/completions`;
   return `${base}/v1/chat/completions`;
-}
-
-/** 生图端点（同样的规范化思路） */
-export function imagesUrlOf(baseUrl) {
-  const base = trimSlash(baseUrl);
-  if (/\/chat\/completions$/.test(base)) {
-    return `${base.replace(/\/chat\/completions$/, '')}/images/generations`;
-  }
-  if (/\/v\d+$/.test(base)) return `${base}/images/generations`;
-  return `${base}/v1/images/generations`;
 }
 
 /**
@@ -424,18 +475,16 @@ async function postJson(url, apiKey, body, timeoutMs, signal) {
   return { status: res.status, data };
 }
 
-/** 从各家不同的错误形状里抠出人能看懂的句子 */
-function capabilityRejection(status, msg, kind) {
+/**
+ * 从各家不同的错误形状里抠出"这个模型不支持图片输入"的证据。
+ *
+ * `kind` 参数随生图探测一起删掉了：现在只会用来判定视觉。
+ * 403/429/5xx 一律不算"不支持"——那是配额或服务端问题，不能当成能力结论。
+ */
+function capabilityRejection(status, msg) {
   if ([401, 403, 408, 409, 429].includes(status) || status >= 500) return null;
   if (/size|dimension|resolution|width|height|参数|尺寸|分辨率/i.test(msg)) return null;
-  return /(?:model|vision|image|visual).*(?:not\s*support|unsupported)|(?:not\s*support|unsupported).*(?:model|vision|image|visual)|不支持.*(?:图片|图像|视觉|生图)|无法.*(?:图片|图像|视觉)/i.test(msg) ? false : null;
-}
-function hasImageEvidence(value) {
-  if (typeof value === 'string') return /^(https?:\/\/|data:image\/|base64:)/i.test(value);
-  if (!value || typeof value !== 'object') return false;
-  if (typeof value.b64_json === 'string' && value.b64_json.length >= 16 && /^[A-Za-z0-9+/]+={0,2}$/.test(value.b64_json)) return true;
-  if (value.image_url && typeof value.image_url === 'object') return hasImageEvidence(value.image_url);
-  return ['url', 'image_url', 'data'].some(k => typeof value[k] === 'string' && /^(https?:\/\/|data:image\/|base64:)/i.test(value[k]));
+  return /(?:model|vision|image|visual).*(?:not\s*support|unsupported)|(?:not\s*support|unsupported).*(?:model|vision|image|visual)|不支持.*(?:图片|图像|视觉)|无法.*(?:图片|图像|视觉)/i.test(msg) ? false : null;
 }
 
 function extractErr(data, status) {

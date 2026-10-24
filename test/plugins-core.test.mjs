@@ -70,6 +70,24 @@ function makeManager(pluginsDir, root) {
   return { mgr, getCfg: () => cfg, setCfg: (n) => (cfg = n) };
 }
 
+/**
+ * 需要**真正启用**插件的用例用的清单：显式 in-process。
+ *
+ * 为什么不用默认的 `process`：本仓库的单测在某些环境（CI 沙箱、受限的
+ * Windows 容器）里禁止 spawn 子进程，`process` 运行时会以
+ * `E4066 无法启动插件进程：spawn EPERM` 失败。而这些用例验证的是
+ * 「管理器怎么登记/注销工具」「init 抛异常怎么归因」，与运行时是哪种无关；
+ * 钉死在 process 上只会让"跑不了子进程的地方"整片红灯，掩盖真正的问题。
+ *
+ * 运行时本身的差异由 `plugin-runtime-parity.test.mjs` 覆盖（那里用假的 child
+ * 验证协议，不需要真的起进程）。
+ *
+ * @param {object} [over]
+ */
+function enabledManifest(over = {}) {
+  return baseManifest({ runtime: 'in-process', trusted: true, ...over });
+}
+
 /* ---------------------------------------------------------------- 清单 */
 
 test('清单：合法的最小清单通过，并补全默认值', () => {
@@ -134,14 +152,36 @@ test('清单：工具名与参数非法一律拒绝', () => {
   );
   assert.equal(badName.ok, false);
 
+  /*
+   * 这里原来用 `type: 'object'` 当"非法类型"的样本。改造后 object 是**合法**
+   * 类型了（课程表插件要靠它声明 `patch` 与对象数组元素），所以样本换成
+   * 一个真正不存在的类型。要守的东西没变：不认识的 type 必须被拒绝，
+   * 而不是默默当成某个默认类型。
+   */
   const badParam = normalizeManifest(
     baseManifest({
-      tools: [{ name: 'ok_name', description: 'x', needs: 'qq', params: { a: { type: 'object' } } }],
+      tools: [{ name: 'ok_name', description: 'x', needs: 'qq', params: { a: { type: 'json' } } }],
     }),
     { dirName: 'demo' },
   );
   assert.equal(badParam.ok, false);
   assert.match(badParam.message, /类型不受支持/);
+
+  // object 现在是合法类型（“合法”不等于“任意形状都行”，形状另有用例守）
+  const goodObject = normalizeManifest(
+    baseManifest({
+      tools: [
+        {
+          name: 'ok_name',
+          description: 'x',
+          needs: 'qq',
+          params: { patch: { type: 'object', properties: { a: { type: 'string' } } } },
+        },
+      ],
+    }),
+    { dirName: 'demo' },
+  );
+  assert.equal(goodObject.ok, true, goodObject.message);
 });
 
 test('清单：插件内工具重名被拒绝', () => {
@@ -195,8 +235,25 @@ test('权限：needs 决定 origins，插件无权声明', () => {
   assert.equal(host.confirm, 'always');
 
   const qq = deriveToolPolicy({ needs: 'qq', risk: 'R0' });
-  assert.deepEqual(qq.origins, ['owner-private', 'owner-group', 'console']);
+  /*
+   * qq 类工具的候选来源里**包含** group 与 proactive。
+   *
+   * 改造前这里是 `['owner-private','owner-group','console']`，也就是
+   * 普通群友和主动回合根本不在候选集里 —— 于是"授权给群"这件事
+   * 无论怎么配都不可能生效（isToolGranted 第一步就返回 false）。
+   *
+   * 现在拆成两层：
+   *   · origins 回答"这个工具**最多**能去哪"（qq 类含 group/proactive）；
+   *   · plugins.chatTools 回答"管理员**实际**放开了哪一档"（默认全关）。
+   * 两者是与的关系，所以默认行为没有放宽，只是"能配了"。
+   *
+   * host 类工具**保持**不含 group/proactive —— 那是 I13 的落点：
+   * 有宿主机能力的工具永远进不了群。
+   */
+  assert.deepEqual(qq.origins, ['owner-private', 'owner-group', 'group', 'proactive', 'console']);
   assert.equal(qq.confirm, 'never');
+  assert.equal(host.origins.includes('group'), false);
+  assert.equal(host.origins.includes('proactive'), false);
 });
 
 test('权限：R2/R3 需要显式放行', () => {
@@ -304,7 +361,7 @@ test('管理器：启用→工具登记→停用→工具立刻消失', async ()
   const pluginsDir = path.join(root, 'plugins');
   const dir = path.join(pluginsDir, 'demo');
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, 'plugin.json'), JSON.stringify(baseManifest()));
+  await fs.writeFile(path.join(dir, 'plugin.json'), JSON.stringify(enabledManifest()));
   await fs.writeFile(
     path.join(dir, 'index.mjs'),
     `export default {
@@ -326,7 +383,11 @@ test('管理器：启用→工具登记→停用→工具立刻消失', async ()
   const tool = getTool('plugin_ping');
   assert.ok(tool, '工具应当已登记');
   // 宿主推导，不是插件声明的
-  assert.deepEqual(tool.origins, ['owner-private', 'owner-group', 'console']);
+  //
+  // 注意 origins 的**候选集**现在包含 group / proactive：它们回答的是
+  // "这个工具最多能去哪"，实际能不能进群还要过 plugins.chatTools
+  // （默认全关）。旧断言只列了三个来源，是 chatTools 那层改造之前的形状。
+  assert.deepEqual(tool.origins, ['owner-private', 'owner-group', 'group', 'proactive', 'console']);
   assert.equal(tool.confirm, 'never');
   assert.equal(tool.plugin, 'demo');
 
@@ -380,7 +441,7 @@ test('管理器：工具名冲突时整个插件不启用（不留半个插件�
   const pluginsDir = path.join(root, 'plugins');
   const dir = path.join(pluginsDir, 'dup');
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, 'plugin.json'), JSON.stringify(baseManifest({ id: 'dup' })));
+  await fs.writeFile(path.join(dir, 'plugin.json'), JSON.stringify(enabledManifest({ id: 'dup' })));
   await fs.writeFile(
     path.join(dir, 'index.mjs'),
     `export default { async callTool() { return 1; }, async dispose() {} };`,
@@ -394,7 +455,7 @@ test('管理器：工具名冲突时整个插件不启用（不留半个插件�
   // 第二个插件用同一个工具名 → 必须整体失败
   const dir2 = path.join(pluginsDir, 'dup2');
   await fs.mkdir(dir2, { recursive: true });
-  await fs.writeFile(path.join(dir2, 'plugin.json'), JSON.stringify(baseManifest({ id: 'dup2' })));
+  await fs.writeFile(path.join(dir2, 'plugin.json'), JSON.stringify(enabledManifest({ id: 'dup2' })));
   await fs.writeFile(
     path.join(dir2, 'index.mjs'),
     `export default { async callTool() { return 2; }, async dispose() {} };`,
@@ -417,7 +478,7 @@ test('管理器：init 抛异常只影响自己，状态是 error', async () => 
   const pluginsDir = path.join(root, 'plugins');
   const dir = path.join(pluginsDir, 'boom');
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, 'plugin.json'), JSON.stringify(baseManifest({ id: 'boom' })));
+  await fs.writeFile(path.join(dir, 'plugin.json'), JSON.stringify(enabledManifest({ id: 'boom' })));
   await fs.writeFile(
     path.join(dir, 'index.mjs'),
     `export default { async init() { throw new Error('炸了'); }, async callTool() { return 1; } };`,

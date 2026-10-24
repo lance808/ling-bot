@@ -9,6 +9,12 @@
  *   3. **重试只对连接类错误**：4xx 重试没有意义，只会放大问题。
  */
 
+import {
+  createEvidenceCollector,
+  looksLikeNativeSearchRejection,
+  rejectedNativeSearchReport,
+} from './provider-search.mjs';
+
 /** 连接类错误（值得重试一次）；4xx 一律不重试 */
 const RETRYABLE_CODES = new Set([
   'ECONNRESET',
@@ -29,6 +35,10 @@ const RETRYABLE_CODES = new Set([
  * @property {number} [maxRetries]
  * @property {'auto' | 'off' | 'deepseek' | 'openai' | 'anthropic' | 'qwen'} [thinking]
  *   思考开关注入方式，见 resolveThinkingBody()
+ * @property {() => object | null} [webSearch]
+ *   服务商原生联网的**现读**解析器（每次请求调用一次）。
+ *   返回 `resolveNativeSearch().plan` 或 null。为什么是函数：联网开关与模式
+ *   可能在两次请求之间被改掉，缓存成对象会让"刚关掉还在联网"。
  */
 
 /**
@@ -82,8 +92,80 @@ export function resolveThinkingBody(style) {
   return { ...(THINKING_STYLES[/** @type {keyof typeof THINKING_STYLES} */ (style)] ?? {}) };
 }
 
-export class LlmError extends Error {
-  /**
+/**
+ * 只有这些状态码，才可能是"这个模型/通道不接受图片"。
+ *
+ * 分工很重要，错了会导致完全相反的降级动作：
+ *   · 400 请求体不合法（含"不支持 image_url"）
+ *   · 413 请求体太大（图片把 payload 撑爆了，去掉图通常就能过）
+ *   · 415 媒体类型不支持
+ *   · 422 语义上无法处理（部分上游用这个报图片参数错）
+ *
+ * **401/403 是 key/权限问题，429 是额度/限流，5xx 是服务端故障** ——
+ * 这几种情况把图片删掉重发完全是白费一次请求：key 还是错、额度还是空、
+ * 服务还是挂着。更糟的是如果把 401 误判成"不支持图片"，我们会把
+ * "key 配错了"记录成"模型不支持读图"，用户去改配置永远改不到点子上。
+ */
+const IMAGE_REJECTION_STATUSES = new Set([400, 413, 415, 422]);
+
+/**
+ * 上游错误文本里出现这些词，才认为它是在说图片。
+ *
+ * 中文与英文都要认：国内中转大多回中文，官方与自建代理回英文。
+ * 关键词刻意写得偏具体（`image`、`vision`、`unsupported image` 之类），
+ * 而不是泛泛的 `invalid` / `invalid_request` —— 400 的绝大多数原因
+ * 和图片无关（max_tokens 越界、消息角色顺序、tools 格式），
+ * 拿这些当"图片被拒"会让带图请求被无端降级成纯文本，而且此后再也不带图。
+ */
+const IMAGE_REJECTION_KEYWORDS = [
+  'image',
+  'image_url',
+  'vision',
+  'multimodal',
+  'multi-modal',
+  'image input',
+  '不支持图片',
+  '不支持图像',
+  '不支持该图片',
+  '图片不支持',
+  '无法处理图片',
+  '不能处理图片',
+  '图片格式',
+  '图像输入',
+  '多模态',
+  '视觉',
+];
+
+/**
+ * 这次失败是不是"图片被上游拒收"。
+ *
+ * ## 为什么要单独判断，而不是让调用方自己看错误文本
+ *
+ * 这个判断直接决定要不要"去掉图片重试一次"（docs/vision-contract.md §8）。
+ * 判宽了，正常的配置错误会被误当成"模型不支持读图"，然后这个结论被写进
+ * capabilities，用户看到的提示是"当前模型不支持读图"—— 明明只是 key 填错。
+ * 判窄了，真的不支持图片的模型会一直失败，用户每回合都收到 400。
+ *
+ * 所以是"状态码白名单 + 关键词"两重条件，缺一不可。两个入参都容错：
+ * `status` 不是数字、`message` 不是字符串时一律返回 false（宁可不降级，
+ * 也不要基于脏输入做一次"看起来合理"的误判）。
+ *
+ * @param {unknown} status HTTP 状态码
+ * @param {unknown} message 上游返回的错误文本（或整条错误消息）
+ * @returns {boolean}
+ */
+export function looksLikeImageRejection(status, message) {
+  const code = typeof status === 'number' ? status : Number(status);
+  if (!Number.isInteger(code) || !IMAGE_REJECTION_STATUSES.has(code)) return false;
+
+  const text = typeof message === 'string' ? message : '';
+  if (!text) return false;
+
+  const lower = text.toLowerCase();
+  return IMAGE_REJECTION_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()));
+}
+
+export class LlmError extends Error {  /**
    * @param {string} message
    * @param {{code?: string, status?: number, retryable?: boolean, reason?: string}} [meta]
    */
@@ -229,7 +311,9 @@ export class LlmClient {
    * 发起一次对话（流式）。
    *
    * @param {object} req
-   * @param {Array<{role: string, content: string}>} req.messages
+   * @param {Array<{role: string, content: string | Array<{type: string, text?: string, image_url?: {url: string}}>}>} req.messages
+   *   content 既可以是字符串（纯文本，与旧行为完全一致），也可以是
+   *   `[{type:'text'}, {type:'image_url'}]` 数组（多模态，见 prompt.mjs §6）
    * @param {object[]} [req.tools] OpenAI 兼容的 function tools
    * @param {AbortSignal} [req.signal] 外部中断信号（界面「停止」）
    * @param {(delta: string) => void} [req.onDelta] 逐块回调（只给界面看）
@@ -238,12 +322,60 @@ export class LlmClient {
    * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], usage: object, model: string, cancelled: boolean}>}
    */
   async chat(req) {
+    const plan = this.#webSearchPlan();
+    try {
+      return await this.#chatWithRetries(req, plan);
+    } catch (err) {
+      const e = /** @type {any} */ (err);
+      /*
+       * 上游明确拒绝原生联网参数（典型：中转不认识 `web_search_options`）。
+       *
+       * 这是**可选能力**的失败，不该把整轮对话打死：去掉联网参数重试一次，
+       * 并把"这次没用上原生联网"如实带回去。只对"明确拒绝"生效 ——
+       * 普通 400（max_tokens、消息顺序）不在这里兜，照样原样报错。
+       */
+      if (e?.nativeSearchRejected === true && plan) {
+        const retried = await this.#chatWithRetries(req, null);
+        return {
+          ...retried,
+          webSearch: rejectedNativeSearchReport(plan, e?.nativeDetail ?? e?.message, true),
+        };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * 现读原生联网计划。
+   *
+   * 解析器抛错时按"不联网"处理：可选能力不该让整轮对话起不来。
+   * 注意这里**不缓存** —— 用户可能刚在界面上关掉了联网。
+   *
+   * @returns {object | null}
+   */
+  #webSearchPlan() {
+    const resolver = this.#opts.webSearch;
+    if (typeof resolver !== 'function') return null;
+    try {
+      const plan = resolver();
+      return plan && typeof plan === 'object' && plan.provider ? plan : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * @param {object} req
+   * @param {object | null} plan 原生联网计划（null = 本次不带联网参数）
+   * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], usage: object, model: string, cancelled: boolean, webSearch?: object|null}>}
+   */
+  async #chatWithRetries(req, plan) {
     let lastErr = null;
     const attempts = (this.#opts.maxRetries ?? 1) + 1;
 
     for (let i = 0; i < attempts; i++) {
       try {
-        return await this.#once(req);
+        return await this.#once(req, plan);
       } catch (err) {
         const e = /** @type {LlmError} */ (err);
         lastErr = e;
@@ -261,9 +393,10 @@ export class LlmClient {
 
   /**
    * @param {object} req
-   * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], usage: object, model: string, cancelled: boolean}>}
+   * @param {object | null} [plan]
+   * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], usage: object, model: string, cancelled: boolean, webSearch?: object|null}>}
    */
-  async #once(req) {
+  async #once(req, plan = null) {
     // 外部中断与超时合并成一个信号
     const timeoutSignal = AbortSignal.timeout(this.#opts.timeoutMs);
     const signal = req.signal ? anySignal([req.signal, timeoutSignal]) : timeoutSignal;
@@ -280,8 +413,26 @@ export class LlmClient {
        */
       ...resolveThinkingBody(this.#opts.thinking),
     };
-    if (req.tools?.length) {
-      body.tools = req.tools;
+    /*
+     * 原生联网：**只在请求体上追加字段/工具**，不覆盖既有的 function tools。
+     *
+     * `body.tools` 原本是整体赋值；直接写会丢掉插件工具（模型再也调不了
+     * 课程表/表情包），所以这里是数组合并。原生搜索工具本身是服务端工具
+     * （智谱的 web_search 不是 function），不会进入 agent-loop 的工具循环。
+     */
+    if (plan) {
+      Object.assign(body, plan.bodyPatch ?? {});
+      const nativeTools = Array.isArray(plan.tools) ? plan.tools : [];
+      if (nativeTools.length > 0) {
+        body.tools = [...(req.tools ?? []), ...nativeTools];
+      }
+    }
+    /*
+     * 有工具（function 工具或服务端联网工具）时显式写 auto。
+     * 没有工具时**不写** `tools` / `tool_choice`，保持旧请求体一字不差 ——
+     * 大多数中转对 `tools: []` 的处理并不一致。
+     */
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
       body.tool_choice = 'auto';
     }
 
@@ -312,6 +463,29 @@ export class LlmClient {
 
     if (!res.ok) {
       const detail = await safeText(res);
+      /*
+       * 原生联网被明确拒绝（参数/工具名被点名）。
+       *
+       * 与普通 400 分开：这条错误会在 `chat()` 里触发一次"去掉联网参数"
+       * 的重试，并把结果标成 rejected。判据是 400/404/422 + 窄关键词，
+       * 避免把 max_tokens、消息顺序这类 400 误当成"不支持联网"。
+       */
+      if (plan && looksLikeNativeSearchRejection(res.status, detail)) {
+        /*
+         * 错误体会进错误消息，也可能被快照的"上次证据"记录。
+         * 有些网关会把请求头里的 Key 前缀回显在错误里，所以先把已知 Key
+         * 从这段文本里替换掉 —— 与联网搜索那条链的脱敏口径保持一致。
+         */
+        const safeDetail = redactKey(detail, this.#opts.apiKey).slice(0, 300);
+        const e = /** @type {any} */ (new LlmError(
+          `上游拒绝了原生联网参数（HTTP ${res.status}）：${safeDetail.slice(0, 200)}。`
+          + '可在《插件设置 → 联网搜索》里切回「独立搜索 API」或关闭原生联网。',
+          { code: 'E3021', status: res.status, retryable: false, reason: 'native-search-rejected' },
+        ));
+        e.nativeSearchRejected = true;
+        e.nativeDetail = safeDetail;
+        throw e;
+      }
       // 4xx 不重试：key 错、模型名错，重试只会重复失败
       throw new LlmError(`模型返回 ${res.status}：${detail.slice(0, 300)}`, {
         code: res.status === 401 || res.status === 403 ? 'E3020' : 'E3021',
@@ -320,7 +494,8 @@ export class LlmClient {
       });
     }
 
-    return parseSse(res, req.onDelta, this.#opts.model, req.onReasoningDelta);
+    const collector = plan ? createEvidenceCollector(plan) : null;
+    return parseSse(res, req.onDelta, this.#opts.model, req.onReasoningDelta, collector);
   }
 }
 
@@ -358,8 +533,9 @@ function cancelledResult(model) {
  * @param {((d: string) => void) | undefined} onDelta
  * @param {string} model
  * @param {((d: string) => void) | undefined} [onReasoningDelta]
+ * @param {{pushChunk: (chunk: any) => void, finish: (text: string) => object|null} | null} [evidence]
  */
-async function parseSse(res, onDelta, model, onReasoningDelta) {
+async function parseSse(res, onDelta, model, onReasoningDelta, evidence = null) {
   if (!res.body) throw new LlmError('模型响应没有 body', { code: 'E3021' });
 
   const reader = res.body.getReader();
@@ -399,6 +575,14 @@ async function parseSse(res, onDelta, model, onReasoningDelta) {
 
         if (chunk.model) usedModel = chunk.model;
         if (chunk.usage) usage = normalizeUsage(chunk.usage);
+        /*
+         * 原生联网证据：每个 chunk 都交给适配器看一遍。
+         *
+         * 这一行必须放在 `if (!choice) continue` **之前** —— 智谱的
+         * `web_search` 数组在顶层，可能出现在没有 choices 的 chunk 里；
+         * 放后面就会把它当成"无关 chunk"丢掉。
+         */
+        evidence?.pushChunk(chunk);
 
         const choice = chunk.choices?.[0];
         if (!choice) continue;
@@ -440,7 +624,13 @@ async function parseSse(res, onDelta, model, onReasoningDelta) {
     .sort((a, b) => a[0] - b[0])
     .map(([, v]) => ({ id: v.id, name: v.name, arguments: v.args }));
 
-  return { text, reasoning, toolCalls, usage, model: usedModel, cancelled: false };
+  /*
+   * 联网证据只从**本次响应**里取。没有证据时 collector 返回 unknown，
+   * 不是成功、也不是失败 —— 绝不用"HTTP 200"补一个成功。
+   */
+  const webSearch = evidence ? evidence.finish(text) : null;
+
+  return { text, reasoning, toolCalls, usage, model: usedModel, cancelled: false, webSearch };
 }
 
 /**
@@ -497,6 +687,23 @@ function anySignal(signals) {
     s.addEventListener('abort', () => controller.abort(s.reason), { once: true });
   }
   return controller.signal;
+}
+
+/**
+ * 把已知 Key 从一段文本里替换掉（用于可能回显请求头的上游错误体）。
+ *
+ * 只替换这一个已知值，不做"猜哪些字符串像 Key"—— 猜错会误伤正常内容，
+ * 而漏掉的其实只有"上游用别的方式回显"这一种情况，那需要的是别的手段。
+ *
+ * @param {string} text
+ * @param {string | undefined} key
+ * @returns {string}
+ */
+function redactKey(text, key) {
+  const s = String(text ?? '');
+  const k = String(key ?? '');
+  if (k.length < 8) return s;
+  return s.split(k).join('[REDACTED]');
 }
 
 /**

@@ -285,12 +285,28 @@ export class PluginConfigStore {
   /**
    * 保存一个插件的配置。
    *
+   * ## `opts.validate` 是"落盘前的一道问询"
+   *
+   * 有些配置值在**类型上**合法、在**语义上**是坏的：一段 JSON 规则、
+   * 一条正则、一组编号。类型校验（`coerceValue`）拦不住它们，
+   * 只有插件自己知道怎么判断。
+   *
+   * 所以这里留一个钩子：宿主在**写盘之前**调用它，失败则整次保存作废。
+   * 顺序（先校验、后写盘）是这条钩子的全部价值所在 —— 反过来写，
+   * 就会出现"配置已经存进去了，然后告诉你它不能用"：
+   * 用户下一次打开插件页，看到的是那份坏配置，而他改之前那份好配置
+   * 已经没了。那不是"保存失败"，那是数据丢失。
+   *
+   * 钩子抛异常也按失败处理（不放行）：校验函数自己崩了，说明它
+   * 没法给出"能用"的结论，此时默认放行等于把不确定性当成了许可。
+   *
    * @param {string} pluginId
    * @param {object[]} decls 配置项声明
    * @param {{config?: Record<string, any>, secrets?: Record<string, any>}} input
+   * @param {{validate?: (values: Record<string, any>) => Promise<{ok: boolean, message?: string}>}} [opts]
    * @returns {Promise<{ok: boolean, code?: string, message?: string, config?: Record<string, any>, invalid?: {key: string, message: string}[]}>}
    */
-  async save(pluginId, decls, input) {
+  async save(pluginId, decls, input, opts) {
     const inConfig = input?.config && typeof input.config === 'object' ? input.config : {};
     const inSecrets = input?.secrets && typeof input.secrets === 'object' ? input.secrets : {};
 
@@ -341,6 +357,37 @@ export class PluginConfigStore {
         }
       }
       plaintext[spec.key] = v;
+    }
+
+    /*
+     * ---- 插件自校验（**落盘之前**）----
+     *
+     * 位置是这条钩子的全部价值：写在 `writeConfigMap` 之后，就会变成
+     * "配置已经存进去了，然后才告诉你它不能用"。用户下一次打开插件页
+     * 看到的是那份坏配置，而他改之前那份好配置已经被覆盖 ——
+     * 那不是"保存失败"，那是数据丢失。
+     *
+     * 校验函数抛异常也按失败处理，不放行：它自己崩了，说明它给不出
+     * "能用"的结论；此时默认放行等于把不确定性当成了许可。
+     */
+    if (typeof opts?.validate === 'function') {
+      let v;
+      try {
+        v = await opts.validate(nextValues);
+      } catch (err) {
+        return {
+          ok: false,
+          code: 'E4062',
+          message: `配置校验时出错（未保存）：${String(/** @type {any} */ (err)?.message ?? err)}`,
+        };
+      }
+      if (!v || v.ok !== true) {
+        return {
+          ok: false,
+          code: 'E4062',
+          message: String(v?.message ?? '配置未通过插件自校验（未保存）'),
+        };
+      }
     }
 
     // ---- 写普通配置 ----

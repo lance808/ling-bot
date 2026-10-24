@@ -86,6 +86,13 @@ const PUBLIC_API_HOSTS = [
   'visualstudio.com',
   'rust-lang.org',
   'tauri.app',
+  // 本项目实际对接的公开服务：搜索 API、国内模型厂商文档
+  'tavily.com',
+  'bigmodel.cn',
+  // 腾讯 / QQ 的公开 CDN 域名（聊天图片与多媒体资源）
+  'qq.com',
+  'qq.com.cn',
+  'qpic.cn',
 ];
 
 /**
@@ -95,7 +102,12 @@ const PUBLIC_API_HOSTS = [
  * @returns {boolean}
  */
 function isPublicHost(host) {
-  const h = host.toLowerCase();
+  /*
+   * 末尾的点是 FQDN 的绝对形式（`localhost.` / `example.com.`），
+   * 指向的还是同一台主机。先规范化掉，否则同一条规则会因为多一个点而失效。
+   * 顺带把 `...` 这类纯占位规范成空串，后面按"无点短主机"放行。
+   */
+  const h = host.toLowerCase().replace(/\.+$/, '');
   if (PUBLIC_API_HOSTS.some((x) => h === x || h.endsWith('.' + x))) return true;
   /*
    * 明显的占位域名。测试里必须能写"某个奇怪的域名"，否则规则没法测。
@@ -117,12 +129,26 @@ function isPublicHost(host) {
   // 内网 / 回环地址：不含身份信息，且测试要用
   if (/^(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))\./.test(h)) return true;
   /*
+   * 链路本地（169.254.0.0/16）：云主机元数据服务就在这一段
+   * （169.254.169.254）。安全测试必须能写它来验证 SSRF 拦截，
+   * 而且它不指向任何个人信息。
+   */
+  if (/^169\.254\./.test(h)) return true;
+  /*
+   * 纯点占位（`https://...?a=1`）：文档里用省略号表示"这里还有内容"，
+   * 不是真实主机。不认出来会把大量正常注释示例判成私有域名。
+   */
+  if (/^\.+$/.test(h)) return true;
+  /*
    * RFC 2606 / RFC 6761 保留的"永不可解析"顶级域与二级域：
    *   .invalid / .test / .example / .localhost
    * 它们的存在意义就是"保证不是真实主机"，测试里用它最规范，
    * 也该被认成占位 —— 否则 fake.invalid 这种反而过不了检查。
+   *
+   * `.internal` 是 RFC 8375 保留给私网的，同样不可能解析到公网服务，
+   * 因此也不可能定位到"某个人的中转站"。
    */
-  if (/\.(?:invalid|test|example|localhost)$/.test(h)) return true;
+  if (/\.(?:invalid|test|example|localhost|internal)\.?$/.test(h)) return true;
   // 测试用的短主机名（无点）
   if (!h.includes('.')) return true;
   return false;

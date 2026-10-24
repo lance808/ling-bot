@@ -105,6 +105,15 @@ const kvRow = (root, label) => {
   const row = nodes(root).find((n) => n.className === 'kv' && text(n).includes(label));
   return row ? text(row) : '';
 };
+/**
+ * 按**键名精确匹配**找 kv 行。
+ *
+ * kv() 的结构是 [span.k(键), span.v(值)]，所以 `text(row)` 里"生图"会
+ * 同时命中「生图探测」这种别的行 —— 判断"能力卡里还有没有生图那一行"
+ * 必须看键名本身，不能用 includes。
+ */
+const kvByLabel = (root, label) =>
+  nodes(root).find((n) => n.className === 'kv' && n.children?.[0]?.textContent === label) ?? null;
 /** 属性统一走 attributes：render.mjs 对非特殊键用的是 setAttribute */
 const attr = (node, key) => node?.attributes?.[key] ?? node?.[key];
 
@@ -124,15 +133,21 @@ function snap(o = {}) {
       },
     },
     brain: { configured: o.configured === true, model: o.model ?? 'm-1', baseUrl: o.baseUrl, keySource: o.keySource ?? 'none' },
+    // 插件面：只有测试明确给了才出现（生图插件的加载状态来自这里）
+    ...(o.plugins ? { plugins: o.plugins } : {}),
   };
 }
 
 /** 收集渲染期用到的 ctx */
 function ctxOf(o = {}) {
-  const calls = { probe: [], save: [], models: 0 };
+  const calls = { probe: [], save: [], models: 0, goto: [] };
   return {
     calls,
     ctx: {
+      // 「去插件设置」跳转：生图引导块的出口
+      gotoPage: (id) => {
+        calls.goto.push(id);
+      },
       onSaveSetting: async (k, v) => {
         calls.save.push([k, v]);
         return { ok: true };
@@ -180,13 +195,14 @@ test('★ 测试连接失败后「可否对话」变「不可以」', async () =
   assert.match(line, /不可以/, '失败证据必须反映出来');
 });
 
-test('★ 图像能力探测成功仍不能代替文本对话验证', async () => {
-  const { ctx } = ctxOf({
+test('★ 视觉探测成功仍不能代替文本对话验证', async () => {
+  const { ctx, calls } = ctxOf({
     probeResult: { ok: true, caps: { vision: true }, probes: { vision: { supported: true } }, channel: { label: '多模态' } },
   });
   const s = () => snap({ configured: true, model: 'm-1', baseUrl: 'https://c.example/v1' });
   const root = renderModelSettings(s(), ctx);
   await button(root, '探测模型').listeners.click();
+  assert.deepEqual(calls.probe.at(-1)[1], ['vision'], '探测只请求视觉，不带 image');
   const line = kvRow(root, '可否对话');
   assert.match(line, /未验证/);
 });
@@ -222,9 +238,9 @@ test('★ 落了盘但没结论的探测结果算「探测失败」，不是「�
   assert.match(text(root), /探测失败/);
 });
 
-test('★ 落盘且有明确结论 → 「已探测」', () => {
+test('★ 落了盘且有明确结论 → 「已探测」', () => {
   const root = renderModelSettings(
-    snap({ configured: true, caps: { 'm-1': { vision: true, image: false, probedAt: '2026-10-21T00:00:00Z' } } }),
+    snap({ configured: true, caps: { 'm-1': { vision: true, probedAt: '2026-10-21T00:00:00Z' } } }),
     ctxOf().ctx,
   );
   assert.match(text(root), /已探测/);
@@ -233,6 +249,55 @@ test('★ 落盘且有明确结论 → 「已探测」', () => {
   assert.ok(row, '要有探测状态行');
   assert.match(text(row), /已探测/);
   assert.ok(!/探测失败/.test(text(row)), '有结论的不该显示失败');
+});
+
+/* -------------------------- 2.5 生图不归聊天模型页 -------------------------- */
+
+test('★ 探测只请求视觉：onProbe 的 kinds 恒为 [vision]', async () => {
+  const { ctx, calls } = ctxOf();
+  const root = renderModelSettings(snap({ configured: true, baseUrl: 'https://vision-only.example/v1' }), ctx);
+  await button(root, '探测模型').listeners.click();
+  assert.equal(calls.probe.length, 1, '点一次只探一次');
+  assert.deepEqual(calls.probe[0][1], ['vision'], "不能把 'image' 传给宿主 —— 聊天接口没有生图能力");
+});
+
+test('★ 能力卡不再有「生图」行，改为指向独立插件的引导', () => {
+  const root = renderModelSettings(
+    // 老配置里可能还留着 image:true —— 界面不能再把它画成一行能力
+    snap({ configured: true, caps: { 'm-1': { vision: true, image: true, probedAt: '2026-10-21T00:00:00Z' } } }),
+    ctxOf().ctx,
+  );
+  assert.equal(kvByLabel(root, '生图'), null, '不能有「生图」这一行');
+  const t = text(root);
+  assert.doesNotMatch(t, /生图✓/, '不能出现「生图✓」');
+  assert.doesNotMatch(t, /生图\s*[✗✘]/, '也不该出现「生图✗」—— 本页根本不再给生图结论');
+  assert.match(t, /独立文生图/, '要指出生图归独立插件');
+  assert.match(t, /插件设置/, '要指出去哪里配置');
+  assert.match(t, /image-generation/, '要给出插件 id，便于对照插件页');
+});
+
+test('★ 点「去插件设置」跳转到插件页', () => {
+  const { ctx, calls } = ctxOf();
+  const root = renderModelSettings(snap({ configured: true, baseUrl: 'https://goto-plugin.example/v1' }), ctx);
+  const btn = button(root, '去插件设置');
+  assert.ok(btn, '要有跳转按钮 —— 只说"不在这儿"等于把问题丢掉');
+  btn.listeners.click();
+  assert.deepEqual(calls.goto, ['plugins'], "要跳到插件设置页（ctx.gotoPage('plugins')）");
+});
+
+test('★ 快照能看到生图插件状态时如实显示，看不到就不编造', () => {
+  const loaded = renderModelSettings(
+    snap({ configured: true, plugins: { items: [{ id: 'image-generation', status: 'ready' }] } }),
+    ctxOf().ctx,
+  );
+  assert.match(kvRow(loaded, '插件状态'), /已加载/);
+
+  // 列表里没有这个插件：说不准是没装还是没扫到，不能编一个「未加载」
+  const unknown = renderModelSettings(
+    snap({ configured: true, baseUrl: 'https://no-plugin.example/v1', plugins: { items: [] } }),
+    ctxOf().ctx,
+  );
+  assert.equal(kvByLabel(unknown, '插件状态'), null, '看不到插件就不显示状态');
 });
 
 /* --------------------------------------- 3. 探测后选择模型区必须更新 */
@@ -249,13 +314,16 @@ test('★ 探测成功后下拉里的能力标注要跟着变', async () => {
   await button(root, '读取模型列表').listeners.click();
 
   await button(root, '探测模型').listeners.click();
-  assert.deepEqual(calls.probe.at(-1)[0], 'm-1', '要探测下拉里当前选中的那个');
+  assert.equal(calls.probe.at(-1)[0], 'm-1', '要探测下拉里当前选中的那个');
+  assert.deepEqual(calls.probe.at(-1)[1], ['vision'], '探测只请求视觉');
+  assert.equal(calls.probe.length, 1, '一次点击只发一次请求');
 
   const after = root;
   const opts = options(after).map((o) => o.textContent);
   assert.ok(opts.some((o) => o.includes('m-1') && o.includes('读图✓')), `探测结果要进下拉标注：${opts.join(' | ')}`);
   assert.match(text(after), /已探测/);
   assert.ok(!opts.some((o) => o.includes('读图✓') && o.includes('｜文本')), '最新视觉结果必须更新旧目录通道');
+  assert.ok(!opts.some((o) => o.includes('生图✓')), '下拉里不该再有「生图✓」');
 });
 
 test('★ 探测哪个模型由下拉的当前值决定，不用已保存的模型', async () => {
@@ -362,12 +430,12 @@ test('保存思考风格后撤销旧连接验证，重绘后保持未验证', as
   assert.match(kvRow(switched, '可否对话'), /未验证/);
 });
 
-test('明确不支持图像或仅生图成功，都不宣告可以对话', async () => {
+test('视觉探测成功或不支持，都不宣告可以对话', async () => {
   for (const supported of [false, true]) {
-    const { ctx } = ctxOf({ probeResult: { ok: true, caps: { image: supported }, probes: { image: { supported } } } });
-    const root = renderModelSettings(snap({ configured: true, baseUrl: `https://image-${supported}.example/v1` }), ctx);
+    const { ctx } = ctxOf({ probeResult: { ok: true, caps: { vision: supported }, probes: { vision: { supported } }, channel: { label: supported ? '多模态' : '文本' } } });
+    const root = renderModelSettings(snap({ configured: true, baseUrl: `https://vision-${supported}.example/v1` }), ctx);
     await button(root, '探测模型').listeners.click();
-    assert.match(kvRow(root, '可否对话'), /未验证/);
+    assert.match(kvRow(root, '可否对话'), /未验证/, `视觉 supported=${supported} 不能当成对话可用`);
   }
 });
 

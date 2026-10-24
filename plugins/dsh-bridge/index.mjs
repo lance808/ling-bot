@@ -138,6 +138,21 @@ export function normalizePort(raw) {
 }
 
 /**
+ * 「形似确认回复」的文本。
+ *
+ * 两个用途，同一个词表：
+ *
+ *   1. **宿主有待确认时让路**（`gate.confirmPending === true`）：宿主确认卡
+ *      与 DSH 审批卡都可能是"第 1 条"，不带引用时只有宿主知道用户想批哪张。
+ *   2. **DSH 自己有待审批时兜住**：文本明显是在回复审批、却看不出批哪一条，
+ *      就提示带编号，而不是让它落到正则口令/AI 回合里被当成闲聊。
+ *
+ * 词汇与 DSH 的审批短句一致（见 lib/command.mjs 的 APPROVE / REJECT，
+ * 以及裸数字 "1" / "2"）。宁可多认几个"是/否/ok"，也别让确认被误当口令。
+ */
+const CONFIRM_LIKE_RE = /^(?:[12]|同意|批准|通过|驳回|拒绝|允许|取消|是|否|yes|y|no|n|ok|allow|approve|deny|reject)[。.!！]?$/i;
+
+/**
  * 从宿主上下文读配置。
  *
  * **密钥走 ctx.secrets**：契约规定 secret 字段的值永远不进 config，
@@ -430,13 +445,29 @@ function describeChoice(r) {
  *
  * 注意：群聊一律不接管——群里任何人都看得见，不能让群友遥控 DSH。
  *
+ * `gate` 是宿主派发前算好的**结构性事实**（docs/plugin-api.md §5）：白名单、
+ * 静音、是否有待确认。插件读不到那几份状态，所以只能由宿主告诉我们；
+ * 在这里据此**让路**，而不是替宿主判定"谁该批"。
+ *
  * @param {object} evt
  * @param {(convKey: string, text: string) => Promise<any>} sendText
  * @param {any} [ctx]
+ * @param {{whitelisted?: boolean, silenced?: boolean, confirmPending?: boolean} | null} [gate]
  * @returns {Promise<boolean>}
  */
-async function onMessage(evt, sendText, ctx) {
+async function onMessage(evt, sendText, ctx, gate = null) {
   if (!rt.bridge) return false;
+
+  /*
+   * 宿主说"这条不该由插件抢"的时候，一票否决，且在任何结算之前。
+   *
+   *   · whitelisted === false：宿主都不参与的会话，插件不该抢在前面说话；
+   *   · silenced === true：静音是用户明确要求的"别说话"，插件不该穿透它。
+   *
+   * 只在明确为 false / true 时让路：读不到（null / undefined）时按"没有额外
+   * 限制"处理——插件的默认方向不能被"宿主没传 gate"变成永久停摆。
+   */
+  if (gate?.whitelisted === false || gate?.silenced === true) return false;
 
   const text = String(evt?.text ?? '').trim();
   if (!text) return false;
@@ -481,6 +512,23 @@ async function onMessage(evt, sendText, ctx) {
       await send(convKey, describeChoice(r));
       return true;
     }
+    // 引用了其他插件/宿主的消息：不得继续按“只有一条待回复”猜测归属。
+    return false;
+  }
+
+  /*
+   * 宿主还有待确认卡片时，**不带引用**的形似确认回复一律让路。
+   *
+   * 真实事故形状：管理员私聊里同时有宿主确认卡（第 1 条）与 DSH 审批卡
+   * （编号 1），用户回一句「1」。旧实现按"恰好一条待回复"把 DSH 那条批了，
+   * 宿主的确认卡随后被当成拒绝 —— 用户以为批的是另一张。
+   *
+   * 带引用的路径在上面已经按 messageId 精确认领，**不受**这条影响：
+   * 引用本身已经消歧，让路反而会让 DSH 审批在宿主有待确认时失效。
+   */
+  if (gate?.confirmPending === true && CONFIRM_LIKE_RE.test(text)) {
+    log?.('宿主还有待确认卡片：DSH 不接管这条不带引用的确认回复');
+    return false;
   }
 
   // 没引用但回了数字：只有在恰好一条待回复时才接受。
@@ -502,7 +550,30 @@ async function onMessage(evt, sendText, ctx) {
   const pendingIds = rt.bridge.listPending().map((p) => p.id);
   const parsed = parseCommand(text, { pendingIds });
 
-  if (parsed.kind === 'unknown') return false;
+  if (parsed.kind === 'unknown') {
+    /*
+     * 反方向缺口：DSH 还有在册审批，用户回了一句明显的确认短句（是/否/ok…），
+     * 但看不出批哪一条（多条待审批时 parseCommand 会拒绝猜）。
+     *
+     * 这里**必须自己收住并提示**，不能 return false：消息会落到正则口令插件
+     * 或 AI 回合，用户看到"已回复"、审批却纹丝不动，而且没有任何报错。
+     *
+     * 顺序上有一条硬约束：宿主还有确认卡时（confirmPending === true）上面已经
+     * 让路了；这里只处理"宿主没有待确认、DSH 自己有"的情形，避免和宿主抢。
+     */
+    if (
+      gate?.confirmPending !== true
+      && pendingIds.length > 0
+      && CONFIRM_LIKE_RE.test(text)
+    ) {
+      await send(
+        convKey,
+        `还有 ${pendingIds.length} 条待处理审批，请带上编号或引用那条消息回复（例如：同意 ${pendingIds[0]}）。`,
+      );
+      return true;
+    }
+    return false;
+  }
 
   if (parsed.kind === 'approve' || parsed.kind === 'reject') {
     const outcome = parsed.kind === 'approve' ? 'allowed-once' : 'rejected';
@@ -683,10 +754,13 @@ export default {
    *
    * 返回 true = 已处理，不再走 AI 回合。
    *
-   * @param {{evt: object, sendText: (convKey: string, text: string) => Promise<any>, ctx: any}} input
+   * `gate` 必须原样往下传：白名单 / 静音 / 是否有待确认都只有宿主知道
+   * （见 src/plugins/runtime-inprocess.mjs 的 handleMessage 与 plugin-api §5）。
+   *
+   * @param {{evt: object, sendText: (convKey: string, text: string) => Promise<any>, ctx: any, gate?: object | null}} input
    */
-  async handleMessage({ evt, sendText, ctx }) {
-    return onMessage(evt, sendText, ctx);
+  async handleMessage({ evt, sendText, ctx, gate = null }) {
+    return onMessage(evt, sendText, ctx, gate);
   },
 };
 

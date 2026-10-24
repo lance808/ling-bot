@@ -24,6 +24,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfig } from '../src/config/schema.mjs';
+import { sanitizeModelCapabilities } from '../src/llm/capability.mjs';
 import { resolveThinkingBody } from '../src/llm/client.mjs';
 
 test('未配置思考风格时默认发送 reasoning_effort: medium，保留显式选择', () => {
@@ -75,14 +76,58 @@ test('★ 真正的拼写错误仍然要抓出来', () => {
   assert.throws(() => validateConfig({ llm: { provider: 'x' }, typo: 1 }), /未知配置项/);
 });
 
-test('★ 嵌套在动态字典里的值不做深度校验', () => {
-  // 里面存的是探测结论，形状由 llm.probe 决定，配置层不该理解它
-  const cfg = validateConfig({
+test('★ 旧配置里的生图字段能通过校验，sanitize 后消失', () => {
+  /*
+   * 两个方向都要守：
+   *
+   *   1. 老用户磁盘上还留着 `image` / `imageGen` / `probes.image` /
+   *      `channel:'imageGen'`（旧版聊天模型真的探测过生图）。
+   *      配置层不能因为这些字段报"未知配置项"—— 那等于不给升级。
+   *   2. 但"能加载"不等于"继续用"：这些结论已经无源，启动时会被
+   *      sanitizeModelCapabilities 清掉，视觉结论与未知元信息必须留下。
+   */
+  const legacy = {
     llm: {
+      // 真实形状是两层：modelCapabilities[端点][模型名] = 结论
       modelCapabilities: {
-        m1: { vision: true, image: false, channel: 'openai', probedAt: 'x', 任意字段: 1 },
+        'https://a.example/v1/chat/completions': {
+          m1: {
+            vision: true,
+            image: false,
+            imageGen: true,
+            channel: 'imageGen',
+            probedAt: '2026-10-19T00:00:00Z',
+            probes: { vision: { supported: true }, image: { supported: false } },
+            任意字段: 1,
+          },
+        },
       },
     },
-  });
-  assert.equal(cfg.llm.modelCapabilities.m1.channel, 'openai');
+  };
+
+  // (1) 加载：不抛"未知配置项"，也不抛类型错误
+  const cfg = validateConfig(legacy);
+  const ep = 'https://a.example/v1/chat/completions';
+  const saved = cfg.llm.modelCapabilities[ep].m1;
+  assert.equal(saved.image, false, '校验层不深度理解动态字典里的值，原样放行');
+  assert.equal(saved.channel, 'imageGen');
+
+  // (2) 清理：旧生图字段消失，视觉与未知字段保留
+  const { caps, changed } = sanitizeModelCapabilities(cfg.llm.modelCapabilities);
+  assert.equal(changed, true, '有旧字段就要报 changed，宿主据此写回磁盘');
+  const m1 = caps[ep].m1;
+  assert.equal('image' in m1, false, 'image 要删');
+  assert.equal('imageGen' in m1, false, 'imageGen 要删');
+  assert.equal('channel' in m1, false, "channel:'imageGen' 要删");
+  assert.equal('image' in m1.probes, false, 'probes.image 要删');
+  assert.equal(m1.vision, true, '视觉结论仍然有效');
+  assert.deepEqual(m1.probes, { vision: { supported: true } }, 'probes.vision 要保留');
+  assert.equal(m1.probedAt, '2026-10-19T00:00:00Z', '探测时间要保留');
+  assert.equal(m1.任意字段, 1, '不认识的元信息不该被丢');
+
+  // (3) 清理后的配置再走一遍校验：写回磁盘后下次启动仍然起得来
+  const cleaned = { ...legacy, llm: { ...legacy.llm, modelCapabilities: caps } };
+  assert.doesNotThrow(() => validateConfig(cleaned));
+  // 幂等：第二次不再产生变化
+  assert.equal(sanitizeModelCapabilities(caps).changed, false);
 });

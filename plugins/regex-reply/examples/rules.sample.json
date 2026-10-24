@@ -1,0 +1,130 @@
+[
+  {
+    "id": "help-menu",
+    "name": "帮助菜单",
+    "enabled": true,
+    "pattern": "^(?:帮助|菜单|help)$",
+    "flags": "i",
+    "reply": "可用指令：\n打卡 1-7    记录今天\n改名叫<名字>  换个称呼\n查状态      看当前状态\n本群规则     看本群专用规则",
+    "priority": 60,
+    "scope": {
+      "kinds": ["group", "private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": false
+    },
+    "cooldownMs": 0
+  },
+  {
+    "id": "checkin",
+    "name": "每日打卡",
+    "enabled": true,
+    "pattern": "^打卡\\s*(\\d+)$",
+    "flags": "u",
+    "reply": "{user} 打卡成功：第 {1} 天。现在是 {time}，位置 {convKey}。",
+    "priority": 50,
+    "scope": {
+      "kinds": ["group", "private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": false
+    },
+    "cooldownMs": 60000
+  },
+  {
+    "id": "rename",
+    "name": "改称呼",
+    "enabled": true,
+    "pattern": "^改名叫(?<name>.+)$",
+    "flags": "u",
+    "reply": "好，以后我就自称「{name}」了。（原名：「{rule}」）",
+    "priority": 50,
+    "scope": {
+      "kinds": ["private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": false
+    },
+    "cooldownMs": 0
+  },
+  {
+    "id": "status-any",
+    "name": "状态（宽泛）",
+    "enabled": true,
+    "pattern": "^查状态(.*)$",
+    "flags": "u",
+    "reply": "状态正常。想看细节就发「查状态 详细」。",
+    "priority": 0,
+    "scope": {
+      "kinds": ["group", "private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": false
+    },
+    "cooldownMs": 0
+  },
+  {
+    "id": "status-detail",
+    "name": "状态（详细）",
+    "enabled": true,
+    "pattern": "^查状态\\s+详细$",
+    "flags": "u",
+    "reply": "详细状态：{ruleId} 规则命中；会话 {convId}；发送者 {userId}；本地时间 {time}。",
+    "priority": 100,
+    "scope": {
+      "kinds": ["group", "private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": false
+    },
+    "cooldownMs": 0
+  },
+  {
+    "id": "group-notice",
+    "name": "本群专用说明",
+    "enabled": true,
+    "pattern": "^(?:本群规则|群规)$",
+    "flags": "u",
+    "reply": "本群规则：只聊学习，不刷屏。此条规则只在此群生效。",
+    "priority": 40,
+    "scope": {
+      "kinds": ["group"],
+      "ids": ["123456789"],
+      "excludeIds": ["987654321"],
+      "adminOnly": false
+    },
+    "cooldownMs": 30000
+  },
+  {
+    "id": "private-ping",
+    "name": "私聊应答",
+    "enabled": true,
+    "pattern": "^(?:在吗|在不在)$",
+    "flags": "u",
+    "reply": "在的，{user}。私聊里我会尽快回。",
+    "priority": 30,
+    "scope": {
+      "kinds": ["private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": false
+    },
+    "cooldownMs": 0
+  },
+  {
+    "id": "admin-reload",
+    "name": "管理指令：重载规则",
+    "enabled": true,
+    "pattern": "^重载规则$",
+    "flags": "u",
+    "reply": "规则重载请求已记录（当前仅管理员可触发）。",
+    "priority": 90,
+    "scope": {
+      "kinds": ["group", "private"],
+      "ids": [],
+      "excludeIds": [],
+      "adminOnly": true
+    },
+    "cooldownMs": 10000
+  }
+]

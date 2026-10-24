@@ -26,16 +26,23 @@ thinking/
 
 # 插件目录（F21：已从 %APPDATA% 移到程序目录下，即仓库根的 plugins/）
 #
-# 这个目录**既是**出厂源（随包分发的 dsh-bridge / echo），
+# 这个目录**既是**出厂源（随包分发的 dsh-bridge / echo / regex-reply），
 # **又是**用户放自己插件的运行位置。两者混在一起，所以：
 #   · 默认忽略整个目录，避免用户的自定义插件被误提交
-#   · 再显式放行随包的那两个 —— 它们是仓库内容，必须入库
+#   · 再显式放行随包的这几个 —— 它们是仓库内容，必须入库
 #
 # 代价：新增一个随包插件时，必须在这里补一行放行，
 # 否则它不会进仓库，而症状是"我这能跑、别人 clone 下来没有"。
+# （这条不是假设：regex-reply 落地时正是这样漏掉的 —— 文件在磁盘上、
+#   单测全绿、git status 里却一个文件都看不到。）
 plugins/*
 !plugins/dsh-bridge/
 !plugins/echo/
+!plugins/regex-reply/
+!plugins/web-search/
+!plugins/image-generation/
+!plugins/course-schedule/
+!plugins/stickers/
 # 插件运行期产生的临时目录（安装/升级时的暂存与备份），任何插件都不入库
 plugins/*/.staging-*/
 plugins/*/.backup/
@@ -94,6 +101,8 @@ secret.vault
 .tmp-start.*
 .tmp-*/
 .tmp-*
+# 一次性验证脚本（如 scripts/run-all-tests.tmp.mjs）：验证完就作废，不入库
+*.tmp.mjs
 
 # 图标生成的中间产物（脚本可随时重跑，只保留 assets/ 下的成品）
 assets/*-report.txt
@@ -118,3 +127,7 @@ commit-msg.tmp
 coverage/
 .nyc_output/
 *.dmp
+
+# 本轮集成验证的临时证据（逐文件测试输出、运行日志、只读探针）。
+# 结论已写进报告，这些中间产物不该进仓库。
+.verify/

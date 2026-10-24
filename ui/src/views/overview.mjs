@@ -1,8 +1,14 @@
 /**
  * 数据总览
  *
- * 文档要求：链接状态 / 视觉与生图启用状态 / 当前 AI 模型及提供商 /
+ * 文档要求：链接状态 / 视觉（读图）启用状态 / 当前 AI 模型及提供商 /
  * 当前启用账号 / 今日 token 消耗。
+ *
+ * ## 生图不在这一页
+ *
+ * 生图能力归独立插件 `plugins/image-generation`（插件页名「独立文生图」），
+ * 聊天模型只管读图。总览里说"生图"只能照抄插件页的状态，那必然和插件页
+ * 对不上 —— 所以这里只显示视觉三态，另起一行指向插件页。
  *
  * ## 三态分离，绝不合并成一个绿点
  *
@@ -86,6 +92,25 @@ export function renderOverview(snap, ctx = {}) {
       h.lastMessageAt
         ? el('div', { class: 'field-hint', text: `最近一条消息：${clock(h.lastMessageAt)}` })
         : null,
+      /*
+       * 生图必须给出口，不能只在别处悄悄消失。
+       *
+       * 用户在这里找不到生图状态，会以为功能没了；所以明说"由独立插件负责"
+       * 并给一个直达按钮。这里**不显示插件加载状态** —— 总览不该替插件页
+       * 复述一份可能过时的状态，点进去以插件页为准。
+       */
+      el('div', { class: 'field-hint row wrap' }, [
+        el('span', {
+          class: 'muted',
+          text: '生图由独立插件负责：模型、API 地址与 Key 在「插件设置 → 独立文生图」里配置。',
+        }),
+        el('button', {
+          class: 'btn btn-ghost',
+          type: 'button',
+          text: '去插件设置',
+          onclick: () => ctx.gotoPage?.('plugins'),
+        }),
+      ]),
     ]),
   );
 
@@ -194,7 +219,15 @@ function metric(label, value, sub, tone) {
 }
 
 /**
- * 「视觉与生图启用状态」——两件事放一张卡，因为它们总是一起被问。
+ * 「视觉（读图）启用状态」。
+ *
+ * ## 为什么这里只有视觉
+ *
+ * 生图已经整体归独立插件 `plugins/image-generation`：聊天模型不探测、
+ * 也不保存生图能力。总览再去读旧的 `image` 结论只会读到一个永不过期的
+ * 遗留字段 —— 界面显示的"生图 ✓"和插件页实际配置能对不上。
+ *
+ * 所以这里只显示聊天模型自己的视觉三态；生图由下面那行引导文案负责。
  *
  * @param {any} caps
  */
@@ -206,13 +239,13 @@ function metric(label, value, sub, tone) {
  * 能力表是按模型名分层的：
  *
  *   {
- *     "deepseek-v4.1-flash": { vision: true, image: false, channel: "multimodal" },
- *     "deepseek-chat":       { vision: false, image: false }
+ *     "deepseek-v4.1-flash": { vision: true, channel: "multimodal" },
+ *     "deepseek-chat":       { vision: false }
  *   }
  *
  * 但总览直接把整张表当成能力对象传进去，于是 `caps.vision` 永远是
- * undefined —— 界面永远显示「识图 ?」「当前模型未启用这两项能力」，
- * 哪怕当前模型明明测出了 vision: true。
+ * undefined —— 界面永远显示「识图 ?」「当前模型未启用」，哪怕当前模型
+ * 明明测出了 vision: true。
  *
  * 这就是"数据不同步"的来源：真实结论在表里，界面没按模型名去取。
  *
@@ -228,24 +261,22 @@ function currentCaps(table, model) {
 
 function visionMetric(caps) {
   /*
-   * 字段名以探测结果为准：`vision` 和 `image`。
+   * 三态必须分开显示：能读图 / 不能读图 / 还没测。
    *
-   * 这里原来读的是 imageGen —— 那是**另一个东西**（上游的图片生成接口），
-   * 而探测结果写的是 image。名字差一个词，界面就永远显示"生图 ?"。
-   * 写代码时容易把两者混在一起，所以这里以真实数据结构为准。
+   * 把"没测过"说成"不支持"会让用户以为模型坏了；
+   * 反过来把"没测过"说成"能用"则是凭空承诺。两种都不做。
    */
   const v = capText(caps.vision, '识图');
-  const g = capText(caps.image, '生图');
-  const any = caps.vision === true || caps.image === true;
+  const sub =
+    caps.vision === true
+      ? { text: '可读图（已实测）', tone: 'pill-ok' }
+      : caps.vision === false
+        ? { text: '已实测：不支持读图', tone: 'pill-warn' }
+        : { text: '未探测', tone: 'pill-dim' };
   return el('div', { class: 'metric' }, [
-    el('div', { class: 'label', text: '视觉与生图' }),
-    el('div', { class: 'row wrap' }, [v, g]),
-    el('div', { class: 'sub' }, [
-      el('span', {
-        class: `pill ${any ? 'pill-ok' : 'pill-dim'}`,
-        text: any ? '可用于图片理解 / 生成' : '当前模型未启用这两项能力',
-      }),
-    ]),
+    el('div', { class: 'label', text: '视觉（读图）' }),
+    el('div', { class: 'row wrap' }, [v]),
+    el('div', { class: 'sub' }, [el('span', { class: `pill ${sub.tone}`, text: sub.text })]),
   ]);
 }
 

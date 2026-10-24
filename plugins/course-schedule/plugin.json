@@ -1,0 +1,260 @@
+{
+  "id": "course-schedule",
+  "name": "课程表",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "用自然语言整理课程表：先预览待保存内容并等用户确认，再保存；之后可按日期/星期/周次查询、修改与删除。数据按会话与用户隔离，存在插件私有目录。",
+  "author": "ling-bot",
+  "runtime": "in-process",
+  "trusted": true,
+  "entry": "index.mjs",
+  "permissions": ["qq.read"],
+  "config": [
+    {
+      "key": "timezone",
+      "label": "时区",
+      "type": "enum",
+      "default": "Asia/Shanghai",
+      "required": false,
+      "options": [
+        { "value": "Asia/Shanghai", "label": "中国标准时间（UTC+8）" },
+        { "value": "UTC", "label": "UTC" },
+        { "value": "Asia/Tokyo", "label": "日本（UTC+9）" },
+        { "value": "Europe/London", "label": "伦敦" },
+        { "value": "America/New_York", "label": "纽约" }
+      ],
+      "help": "判断「今天」和「现在第几周」使用的时区。课程日期本身是纯日历日，不受这里影响；只有「不指定日期时按今天算」走这个设置。"
+    },
+    {
+      "key": "defaultTermStartDate",
+      "label": "学期开始日期（建议值）",
+      "type": "text",
+      "default": "",
+      "required": false,
+      "maxLength": 10,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "placeholder": "2026-09-07",
+      "help": "可选。用户说「这学期的课」却没给开学日期时，它只会作为**建议值**出现在预览里，仍会要求用户确认，不会自动当成事实。留空则每次都要求用户明确给出。"
+    },
+    {
+      "key": "maxCourses",
+      "label": "每个用户最多课程数",
+      "type": "number",
+      "default": 60,
+      "required": false,
+      "min": 1,
+      "max": 200,
+      "integer": true,
+      "help": "按「会话 + 用户」分别计算。超过后保存会被拒绝，提示用户先删除或归档。"
+    },
+    {
+      "key": "draftTtlMs",
+      "label": "待确认草案有效期（毫秒）",
+      "type": "number",
+      "default": 900000,
+      "required": false,
+      "min": 60000,
+      "max": 3600000,
+      "integer": true,
+      "help": "预览生成的草案多久失效。过期后保存会失败并要求重新预览——这是有意的：隔了很久再点「确认」，用户看到的表格可能已经忘了。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "course_preview",
+      "description": "整理课程表并生成待确认预览：把用户口述的课程归一化、校验日期/周次/时间、检查与已存课程的冲突和重复，返回文本表格与草案 id。有缺项时返回 missing（必须向用户追问，不要编造地点或时间）。用户确认后再调用 course_save 保存。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 15000,
+      "params": {
+        "courses": {
+          "type": "array",
+          "required": true,
+          "maxItems": 20,
+          "description": "课程数组。每条至少要有 name、weekday、以及 periods 或 startTime+endTime、termStartDate、weekStart、weekEnd。不确定的字段留空，不要编造。",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "maxLength": 60, "description": "课程名，如「高等数学」" },
+              "weekday": { "type": "number", "description": "星期，1=周一 … 7=周日" },
+              "periods": {
+                "type": "array",
+                "maxItems": 12,
+                "description": "节次数组，如 [1,2]",
+                "items": { "type": "number" }
+              },
+              "startTime": { "type": "string", "maxLength": 5, "description": "开始时间 HH:MM，与 endTime 成对" },
+              "endTime": { "type": "string", "maxLength": 5, "description": "结束时间 HH:MM" },
+              "location": { "type": "string", "maxLength": 80, "description": "地点，如「教三楼 301」。用户没给就留空" },
+              "teacher": { "type": "string", "maxLength": 40, "description": "教师。用户没给就留空" },
+              "termStartDate": { "type": "string", "maxLength": 10, "description": "学期开始日期 YYYY-MM-DD（会自动归一到那一周的周一）" },
+              "weekStart": { "type": "number", "description": "起始周，从 1 开始" },
+              "weekEnd": { "type": "number", "description": "结束周，含" },
+              "parity": { "type": "string", "enum": ["all", "odd", "even"], "description": "all=每周，odd=单周，even=双周" },
+              "note": { "type": "string", "maxLength": 200, "description": "备注" }
+            }
+          }
+        },
+        "termStartDate": {
+          "type": "string",
+          "maxLength": 10,
+          "description": "整批课程共用的学期开始日期 YYYY-MM-DD。给了它就不用每条都写"
+        },
+        "timezone": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "可选时区覆盖，一般不用传"
+        }
+      }
+    },
+    {
+      "name": "course_save",
+      "description": "保存一份已经展示给用户、并得到用户明确同意的课程草案。只能保存 course_preview 生成的那份（凭 draftId），不能直接传课程内容——这样「保存的」和「用户看到的」一定是同一份。有冲突/重复/缺项时会被拒绝，需要按返回的提示处理。",
+      "needs": "qq",
+      "risk": "R1",
+      "effects": ["data.session"],
+      "timeoutMs": 15000,
+      "params": {
+        "draftId": { "type": "string", "required": true, "maxLength": 40, "description": "course_preview 返回的草案 id" },
+        "overwriteConflicts": {
+          "type": "boolean",
+          "description": "用户明知有冲突仍要保存时传 true"
+        },
+        "acknowledgeOptionalMissing": {
+          "type": "boolean",
+          "description": "地点或教师缺失、但用户已明确说「就空着」时传 true"
+        },
+        "allowDuplicate": {
+          "type": "boolean",
+          "description": "重复课程仍要保存时传 true"
+        }
+      }
+    },
+    {
+      "name": "course_cancel",
+      "description": "丢弃待确认的课程草案（用户说「算了」「先不存」时调用）。不传 draftId 则丢弃当前会话里该用户的全部草案。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 10000,
+      "params": {
+        "draftId": { "type": "string", "maxLength": 40, "description": "要丢弃的草案 id，可省略" }
+      }
+    },
+    {
+      "name": "course_day",
+      "description": "查询某一天的课程：返回星期、第几周、单双周，以及当天的课程列表与文本表格。不传日期则查今天。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 10000,
+      "params": {
+        "date": { "type": "string", "maxLength": 10, "description": "日期 YYYY-MM-DD，省略则用今天" },
+        "timezone": { "type": "string", "maxLength": 40, "description": "可选时区覆盖" }
+      }
+    },
+    {
+      "name": "course_week",
+      "description": "查询某一周的课程表（周一到周日）。不传日期则查本周。返回该周是第几周、单双周，以及整周表格。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 10000,
+      "params": {
+        "date": { "type": "string", "maxLength": 10, "description": "该周内任意一天 YYYY-MM-DD，省略则用今天" },
+        "timezone": { "type": "string", "maxLength": 40, "description": "可选时区覆盖" }
+      }
+    },
+    {
+      "name": "course_list",
+      "description": "列出已保存的全部课程（按学期分组），可选按星期或学期开始日期过滤。每条带 courseId，修改或删除时要用它。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 10000,
+      "params": {
+        "weekday": { "type": "number", "description": "只看某个星期（1–7）" },
+        "termStartDate": { "type": "string", "maxLength": 10, "description": "只看某个学期（学期开始日期 YYYY-MM-DD）" }
+      }
+    },
+    {
+      "name": "course_update",
+      "description": "修改一条已保存的课程：只传要改的字段（patch），其余保持不变。改完会重新做日期/周次/冲突校验；有冲突时会被拒绝，需要按提示确认。",
+      "needs": "qq",
+      "risk": "R1",
+      "effects": ["data.session"],
+      "timeoutMs": 15000,
+      "params": {
+        "courseId": { "type": "string", "required": true, "maxLength": 20, "description": "course_list 返回的 courseId" },
+        "patch": {
+          "type": "object",
+          "required": true,
+          "description": "要改的字段，未出现的字段保持不变",
+          "properties": {
+            "name": { "type": "string", "maxLength": 60 },
+            "weekday": { "type": "number" },
+            "periods": { "type": "array", "maxItems": 12, "items": { "type": "number" } },
+            "startTime": { "type": "string", "maxLength": 5 },
+            "endTime": { "type": "string", "maxLength": 5 },
+            "location": { "type": "string", "maxLength": 80 },
+            "teacher": { "type": "string", "maxLength": 40 },
+            "termStartDate": { "type": "string", "maxLength": 10 },
+            "weekStart": { "type": "number" },
+            "weekEnd": { "type": "number" },
+            "parity": { "type": "string", "enum": ["all", "odd", "even"] },
+            "note": { "type": "string", "maxLength": 200 }
+          }
+        },
+        "overwriteConflicts": { "type": "boolean", "description": "明知冲突仍要修改时传 true" }
+      }
+    },
+    {
+      "name": "course_delete",
+      "description": "删除一条课程（传 courseId），或清空当前用户的全部课程（all=true）。数据文件损坏时，只有 all=true 且 forceCorrupt=true 才会把坏文件改名备份后重置。",
+      "needs": "qq",
+      "risk": "R1",
+      "effects": ["data.session"],
+      "timeoutMs": 15000,
+      "params": {
+        "courseId": { "type": "string", "maxLength": 20, "description": "要删除的课程 id" },
+        "all": { "type": "boolean", "description": "删除当前用户的全部课程" },
+        "forceCorrupt": { "type": "boolean", "description": "数据文件损坏时强制备份并重置，仅在 all=true 时有效" }
+      }
+    }
+  ],
+  "notes": [
+    {
+      "title": "数据存在哪、归谁",
+      "lines": [
+        "运行数据在 plugin-data/course-schedule/courses/ 下，一个「会话 + 用户」一个文件（文件名是归属的哈希，不是群号本身）。",
+        "归属来自宿主注入的 ctx.caller，工具参数里没有「用户/会话」这一项——模型无法指定读别人的课程表。",
+        "群聊里每个人有自己的课程表；群友私聊与群里发言也是两份独立数据。"
+      ]
+    },
+    {
+      "title": "为什么要先预览再确认",
+      "lines": [
+        "course_preview 生成草案并返回文本表格；course_save 只接受 draftId，不接受课程内容。",
+        "这样「保存的那份」与「用户看到的那份」是同一个对象，模型无法在两次调用之间改时间或地点。",
+        "草案 15 分钟（可配置）过期，重启即失效。"
+      ]
+    },
+    {
+      "title": "时区与学期",
+      "lines": [
+        "日期按纯日历日计算，周次公式是 (日期 - 学期开始日)/7 + 1，不受运行机器时区影响。",
+        "「今天」按配置项 timezone 判定，默认 Asia/Shanghai。",
+        "每条课程自带学期开始日期，所以一个用户可以同时保存多个学期。"
+      ]
+    },
+    {
+      "title": "数据损坏时不会静默清空",
+      "lines": [
+        "数据文件解析失败或归属不符时，读写都会返回 E_COURSE_STORE_CORRUPT 并给出路径，绝不把它当成空库。",
+        "确认要重置时调用 course_delete（all=true、forceCorrupt=true）：原文件会改名成 .corrupt-<时间戳>.bak 留底，再写空库。"
+      ]
+    }
+  ],
+  "ui": null
+}

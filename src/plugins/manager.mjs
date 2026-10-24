@@ -46,6 +46,16 @@ import {
 import { PluginConfigStore, resolveConfig } from './store.mjs';
 import { InProcessRuntime } from './runtime-inprocess.mjs';
 import { ProcessRuntime } from './runtime-process.mjs';
+import { createChatFactory, forgetPluginMedia } from './host-chat.mjs';
+import { createMediaDelivery } from './delivery.mjs';
+import { normalizeChatTools } from './chat-tools.mjs';
+
+// 搜索 Key 只绑定在宿主联网闭包中；其余插件仍保留既有 secrets 契约。
+export function runtimeSecretsFor(pluginId, secrets) {
+  const out = { ...(secrets ?? {}) };
+  if (pluginId === 'web-search') delete out.apiKey;
+  return out;
+}
 
 /** 每个插件保留多少条日志给界面看 */
 const LOG_RING = 50;
@@ -78,6 +88,30 @@ export class PluginManager {
    * @param {(level: string, message: string, fields?: object) => void} opts.log 宿主日志
    * @param {(convKey: string, text: string) => Promise<any>} opts.sendText 宿主发送闸门
    * @param {string} [opts.nodePath] 子进程用的 node 可执行文件
+   * @param {(input: {convKey: string, limit: number}) => any} [opts.readMessages]
+   *   读会话最近消息（`ctx.chat.recent` 的来源）
+   * @param {(input: {convKey: string, messageId: unknown}) => any} [opts.lookupMessage]
+   *   按 id 在指定会话里找消息（`ctx.chat.message` / 引用的来源）
+   * @param {(input: {convKey: string, segments: any[], auditText: string, signal?: AbortSignal}) => Promise<any>} [opts.sendSegments]
+   *   任意消息段的发送通路（`ctx.chat.sendMedia` 的来源）。
+   *   缺省时退回 sendText（只支持纯文本，媒体发送返回 E4072）
+   * @param {{run: <T>(key: string, fn: () => Promise<T>) => Promise<T>}} [opts.sequencer]
+   *   按会话串行器，`ctx.deliverMedia` 与 AI 回复、表情发送共用同一个，
+   *   保证后台投递不会插进一次分条回复中间。
+   * @param {(input: {convKey: string, messageId: any, text: string, segments: any[]}) => void} [opts.onSent]
+   *   `ctx.chat.send` / `sendMedia` 成功后的上下文记账回调。
+   *   宿主把它接到 `pushRecent(convKey, {role:'assistant', text})` 上，
+   *   这样模型下一轮知道"我刚才用工具发过这句话/这张图"，不会重复发送。
+   *   与 `ctx.gateway.sendFace` 的 `onFaceSent` 是同一类钩子。
+   * @param {(input: {pluginId: string, config: Record<string, any>, secrets: Record<string, string>}) => ((call: {invocation?: object | null, signal?: AbortSignal}) => object)} [opts.makeNet]
+   *   联网能力工厂（`ctx.net` 的来源，见 src/net/host-net.mjs）。
+   *
+   *   形状与其他工厂不同：它要**先绑插件身份**（配置与密钥是每个插件
+   *   自己的），再按调用生成。所以宿主传进来的是
+   *   `({pluginId, config, secrets}) => (call) => ctxNet`。
+   *
+   *   缺省（null）时，`ctx.net` 会是一个"宿主未提供"的占位对象 ——
+   *   联网工具会明确报 E4071，而不是悄悄少一个能力。
    */
   constructor(opts) {
     this.pluginsDir = opts.pluginsDir;
@@ -87,6 +121,109 @@ export class PluginManager {
     this.log = opts.log;
     this.sendText = opts.sendText;
     this.nodePath = opts.nodePath;
+    this.readMessages = opts.readMessages ?? null;
+    this.lookupMessage = opts.lookupMessage ?? null;
+    this.sendSegments = opts.sendSegments ?? null;
+    /**
+     * 按会话串行器。
+     *
+     * **同一个实例**同时用于：AI 分条回复（宿主侧 deliverReply）、
+     * `ctx.gateway.sendFace`、`ctx.deliverMedia`、`ctx.chat.send` /
+     * `ctx.chat.sendMedia`、以及插件的 `ctx.sendText`。
+     *
+     * 为什么必须共享：这些都是"往同一个会话发消息"。共享一个 key 的队列
+     * 才能保证"先说一句再补一张图"不会变成"图先到、话后到"。
+     *
+     * 为什么不能再包一层：`delivery.mjs` 与 `gateway-bridge.mjs` 已经把自己
+     * **整段**放进 `sequencer.run(convKey, ...)` 了，`sendViaHost` 只是它们
+     * 内部的发送步骤。在 sendViaHost 上再包同一个 key 会重入同一个队列 ——
+     * 表现是该会话此后再也发不出消息（永久挂起）。所以这里只把它往下传。
+     */
+    this.sequencer = opts.sequencer ?? null;
+    /*
+     * 联网能力工厂。
+     *
+     * 注意它**不是**"一个已构造好的能力对象"，而是"给一个插件造能力"的
+     * 工厂：同一个宿主里不同插件各有各的 baseUrl / Key，共用一个对象就
+     * 必然在调用时往里写"当前是谁"，并发时串插件。
+     */
+    this.makeNet = opts.makeNet ?? null;
+    /**
+     * 网关受控能力工厂（表情包这类"账号级"动作）。
+     *
+     * 与 sendSegments 不同，它不是一条通路而是一组**语义化动作**：
+     * 拉收藏表情 / 取表情字节 / 收藏当前会话的图 / 发一个表情。
+     * 详见 `plugins/gateway-bridge.mjs` 的文件头。
+     */
+    this.makeGateway = opts.makeGateway ?? null;
+    this.requestOneBot = opts.requestOneBot ?? null;
+
+    /*
+     * 聊天能力工厂。
+     *
+     * 所有插件共用一份（= 一份媒体句柄表）。为什么共享：
+     * 句柄本来就绑定 pluginId，分开各存一份反而要维护 N 张表；
+     * 而"停用插件顺手清掉它的句柄"在一张表上也更好做。
+     *
+     * ## 为什么要给它 sequencer 与 onSent
+     *
+     * `ctx.chat.send` / `sendMedia` 发出的东西和 AI 自己发的在用户眼里没有区别，
+     * 所以两者必须受同一套约束：
+     *   · **同一个 per-会话队列**（否则插件的图会插进分条回复的 burst 中间，
+     *     用户看到"第一句 → 图 → 第三句"）；
+     *   · **同一份上下文记账**（否则模型下一轮不知道自己刚才用工具发过，
+     *     很容易把同一件事再做一遍）。
+     *
+     * 这两样都和 `ctx.gateway.sendFace`、`ctx.deliverMedia` 用同一个实例，
+     * 三种通路的行为因此一致 —— 不是靠"记得改三处"来保证的。
+     */
+    this.chat = createChatFactory({
+      readMessages: (input) => this.readMessages?.(input) ?? { ok: false, code: 'E4072', message: '宿主未提供会话读取能力' },
+      lookupMessage: (input) => this.lookupMessage?.(input) ?? { ok: false, code: 'E4072', message: '宿主未提供消息查询能力' },
+      sendSegments: (input) => this.sendViaHost(input),
+      sequencer: this.sequencer,
+      onSent: typeof opts.onSent === 'function' ? opts.onSent : null,
+      log: (message) => this.log('debug', message),
+    });
+
+    /*
+     * 后台媒体投递（`ctx.deliverMedia`）。
+     *
+     * 与 ctx.chat 的区别只有一个：它**不绑定本次调用**，因此可以在工具返回
+     * 之后由插件的后台任务继续使用（生图要几十秒，调用早就结束了）。
+     * 目标会话由插件持久化的"来源会话"给出 —— 而来源会话本身来自
+     * ctx.caller，模型改不动。文件被限制在该插件自己的 dataDir 内。
+     *
+     * 只有 in-process + trusted 插件会被注入这个能力（见 startOne）：
+     * 它需要一个可长期保存的目标 convKey，而 process 插件既没有可信调用上下文，
+     * 也无法保证不会把 convKey 交给别的代码。
+     */
+    this.deliverMedia = createMediaDelivery({
+      sendSegments: (input) => this.sendViaHost(input),
+      sequencer: this.sequencer,
+      media: this.chat.media,
+      log: (level, message, fields) => this.log(level, message, fields),
+    });
+
+    /**
+     * 网关受控能力（`ctx.gateway`）。
+     *
+     * 所有插件共用一份：
+     *   · 能力探测结论（哪些扩展动作可用）是**账号级事实**，每个插件各探一遍
+     *     既浪费往返，也会出现"A 插件说支持、B 插件说不支持"的分裂；
+     *   · 表情缓存目录在插件自己的 dataDir 下，归属校验在调用时按 pluginId 走。
+     *
+     * 没注入 requestOneBot 时 makeGateway 仍会被调用，只是每次动作都返回
+     * `E_GATEWAY_UNAVAILABLE` —— 明确报"宿主没提供"，而不是给一个半残对象。
+     */
+    this.gateway = this.makeGateway
+      ? this.makeGateway({
+          lookupMessage: (input) =>
+            this.lookupMessage?.(input) ?? { ok: false, code: 'E4072', message: '宿主未提供消息查询能力' },
+          sendSegments: (input) => this.sendViaHost(input),
+          log: (level, message, fields) => this.log(level, message, fields),
+        })
+      : null;
 
     this.store = new PluginConfigStore({
       secretsPath: opts.secretsPath,
@@ -102,6 +239,133 @@ export class PluginManager {
     this.records = new Map();
     /** 是否已经完成一次加载（供 snapshot 判断 starting） */
     this.ready = false;
+  }
+
+  /**
+   * 插件发送消息段时的统一通路。
+   *
+   * ## 为什么不直接调 sendText
+   *
+   * `ctx.chat.sendMedia` 要发图片段，而 `sendText` 只认字符串。
+   * 但两条路**必须经过同一道闸门**（白名单 / 出站审计 / 限流）：
+   * 若给媒体单开一条捷径，那条路径就没有审计覆盖 ——
+   * "换个消息类型就能绕过检查"是最典型的授权漏洞。
+   *
+   * 所以：宿主提供了 sendSegments 就用它；没提供就退回 sendText，
+   * 但**只允许纯文本段**（媒体一律 E4072，明确报"宿主没提供"，不静默失败）。
+   *
+   * @param {{convKey: string, segments: any[], auditText: string, signal?: AbortSignal}} input
+   * @returns {Promise<{ok: boolean, messageId?: any, code?: string, message?: string}>}
+   */
+  async sendViaHost(input) {
+    const segments = Array.isArray(input?.segments) ? input.segments : [];
+    if (this.sendSegments) return this.sendSegments({ ...input, segments });
+
+    const textOnly = segments.every((s) => s?.type === 'text');
+    if (!textOnly) {
+      return { ok: false, code: 'E4072', message: '宿主未提供媒体发送能力' };
+    }
+    const text = segments.map((s) => String(s?.data?.text ?? '')).join('');
+    const r = await this.sendText(input.convKey, text);
+    return { ok: r?.ok === true, messageId: r?.messageId, code: r?.code, message: r?.message };
+  }
+
+  /**
+   * 插件 `ctx.sendText(convKey, text)` 的宿主实现 —— 仍然走统一闸门，**并排队**。
+   *
+   * ## 为什么要排队
+   *
+   * `ctx.sendText` 是给渠道插件（DSH 桥、审批卡）用的旧接口：它自己指定会话，
+   * 不经过工具调用。它发出去的和 AI 自己发的在用户眼里没有区别，所以必须
+   * 排进同一个 per-会话队列 —— 否则审批卡/提示会插进一次分条回复中间。
+   *
+   * ## 为什么只包这一层
+   *
+   * 这个函数是**插件发起**的入口，不在任何已有队列里，包一层不会重入。
+   * 反例是 `sendViaHost`：`delivery.mjs` / `gateway-bridge.mjs` 已经把
+   * 自己整段放进 `sequencer.run(convKey, ...)`，在那里再包同一个 key
+   * 就会重入同一个队列、永久挂起（该会话之后再也发不出消息）。
+   *
+   * @param {string} convKey
+   * @param {string} text
+   * @returns {Promise<any>}
+   */
+  sendTextQueued(convKey, text) {
+    const key = String(convKey ?? '');
+    const send = () => this.sendText(key, text);
+    return this.sequencer ? this.sequencer.run(key, send) : send();
+  }
+
+  /**
+   * 把宿主的联网工厂适配成运行时需要的形状。
+   *
+   * ## 为什么分两步（先绑插件身份，再按调用生成）
+   *
+   * 配置与密钥是**每个插件**自己的：`baseUrl`、`apiKey`、条数、超时全在
+   * 那个插件的 `plugins.config.<id>` 与它的凭据信封里。运行时那边只知道
+   * "每次调用造一份 ctx"，所以身份必须先在这里绑死。
+   *
+   * ## 为什么用 `resolved` 而不是"启动后重新读配置"
+   *
+   * `startOne` 里的 `resolved.config` / `resolved.secrets` 是**同一时刻**
+   * 解析出来的。启动后重新读配置会让地址与密钥来自两个时间点
+   * （用户刚改了 baseUrl、Key 还是旧的），而那种组合我们从未校验过。
+   *
+   * ## 装配失败不能让插件整个起不来
+   *
+   * 联网只是这个插件的一个能力。工厂抛错时返回 undefined → `ctx.net`
+   * 退回"宿主未提供"占位对象，插件的其它工具照常可用。
+   * 但必须记 error：它意味着所有联网工具都会失败，用户需要看到。
+   *
+   * @param {string} pluginId
+   * @param {Record<string, any>} config 已解析的普通配置
+   * @param {Record<string, string>} secrets 已解密的敏感值
+   * @returns {((input: {invocation?: object | null, signal?: AbortSignal}) => object) | undefined}
+   */
+  netFactoryFor(pluginId, config, secrets) {
+    // 联网能力只属于这个受审计的 host/R1 工具插件，不能借给普通 qq/R0 插件。
+    if (pluginId !== 'web-search' || !this.makeNet) return undefined;
+
+    let makeForCall;
+    try {
+      makeForCall = this.makeNet({
+        pluginId,
+        config: config ?? {},
+        secrets: secrets ?? {},
+      });
+    } catch (err) {
+      this.log('error', `联网能力装配失败（插件 ${pluginId} 的 ctx.net 将不可用）`, {
+        message: String(/** @type {any} */ (err)?.message ?? err),
+      });
+      return undefined;
+    }
+    if (typeof makeForCall !== 'function') return undefined;
+
+    return (input) => makeForCall({
+      invocation: input?.invocation ?? null,
+      signal: input?.signal,
+      /*
+       * init / 测试连接阶段会传 false：那两个阶段不允许发请求。
+       * 与 process 运行时的"只有事实"保持同一口径 —— 否则同一个插件
+       * 在两种 runtime 下语义不同，作者会写出只在一种运行时能跑的代码。
+       */
+      allowRequests: input?.allowRequests,
+    });
+  }
+
+  /**
+   * 当前生效的聊天工具授权（已归一化）。
+   *
+   * 每次现读而不是缓存：管理员改配置之后必须立刻生效，
+   * 缓存会带来"改完还是老样子、重启才好"的体验。
+   *
+   * @returns {object}
+   */
+  chatToolsConfig() {
+    const raw = this.getConfig()?.plugins?.chatTools;
+    const r = normalizeChatTools(raw);
+    // 归一化失败（配置被手改坏了）→ 退回默认全关，而不是让所有权失效
+    return r.ok ? r.value : normalizeChatTools(undefined).value;
   }
 
   /* ---------------------------------------------------------------- 扫描 */
@@ -405,7 +669,7 @@ export class PluginManager {
 
     // ---- 2. 风险检查 ----
     for (const t of manifest.tools) {
-      const r = checkRiskAllowed(t.risk, opts.allowDangerous);
+      const r = checkRiskAllowed(t.effectiveRisk ?? t.risk, opts.allowDangerous);
       if (!r.ok) {
         return this.fail(record, { code: r.code, message: r.message, status: 'error' });
       }
@@ -437,9 +701,32 @@ export class PluginManager {
       dir: record.dir,
       dataDir,
       config: resolved.config,
-      secrets: resolved.secrets,
+      secrets: runtimeSecretsFor(record.id, resolved.secrets),
       log: (level, message, fields) => this.note(record, level, message, fields),
-      sendText: this.sendText,
+      // 插件发起的 sendText 也排进同一个 per-会话队列（见 sendTextQueued）
+      sendText: (convKey, text) => this.sendTextQueued(convKey, text),
+      // 聊天能力：两种运行时注入同一个工厂，因此 ctx.chat 语义必然一致
+      makeChat: (input) => this.chat.makeChat(input),
+      // 网关能力：同上。子进程侧只是一组代理，真正的判定都在父进程。
+      makeGateway: this.gateway ? (input) => this.gateway.makeGateway(input) : undefined,
+      // 联网能力：同样是宿主侧判定，子进程只拿代理（见 runtime-process.mjs）
+      makeNet: this.netFactoryFor(record.id, resolved.config, resolved.secrets),
+      /*
+       * 后台媒体投递：只给 in-process + trusted 的第一方插件。
+       *
+       * 对一个已经跑在宿主进程里的插件来说，"它能不能发文件到某个会话"
+       * 本来就不存在技术隔离；给一个受控入口的价值在于**约束**：
+       * 文件必须在它自己的 dataDir、发送必须过闸门与串行器、停用后立刻拒绝。
+       * process 插件不注入 —— 它没有可信调用上下文，给它等于开放任意目标会话。
+       */
+      deliverMedia: manifest.runtime === 'in-process' && manifest.trusted === true
+        ? (input) => this.deliverMedia({
+            ...input,
+            pluginId: record.id,
+            dataDir,
+            isActive: () => runtime.disposed !== true,
+          })
+        : undefined,
       nodePath: this.nodePath,
     });
 
@@ -454,6 +741,12 @@ export class PluginManager {
     }
 
     if (!initResult.ok) {
+      // init可能已保存后台投递ctx；失败/超时同样必须结束生命周期，拒绝迟到发送。
+      try {
+        await runtime.dispose();
+      } catch {
+        /* 运行时释放失败不覆盖原始初始化错误 */
+      }
       record.runtime = null;
       return this.fail(record, {
         code: initResult.code ?? 'E4064',
@@ -473,7 +766,16 @@ export class PluginManager {
           kind: policy.kind,
           origins: policy.origins,
           risk: policy.risk,
+          /**
+           * 生效风险高于声明时，插件页要能看到差距。
+           *
+           * 不展示的话会出现"我明明写的是 R0，为什么每次都要确认"——
+           * 而答案（effects 抬高了风险下限）在界面上完全不可见。
+           */
+          declaredRisk: t.risk,
+          effects: t.effects,
           confirm: policy.confirm,
+          approval: policy.approval,
           description: `${t.description}（来自插件 ${manifest.name}）`,
           params: t.params,
           limits: {},
@@ -484,12 +786,27 @@ export class PluginManager {
            * 否则重载后工具还指着旧 runtime，出现"插件页显示已重载、
            * 调用却打到旧实例"的鬼问题。
            */
-          run: async ({ args, signal }) => {
+          run: async ({ args, signal, invocation }) => {
             const rt = record.runtime;
             if (!rt) {
               return { ok: false, code: 'E4067', message: `插件 ${manifest.name} 当前未运行` };
             }
-            const r = await rt.callTool({ tool: t.name, args: args ?? {}, timeoutMs: t.timeoutMs, signal });
+            const r = await rt.callTool({
+              tool: t.name,
+              args: args ?? {},
+              timeoutMs: t.timeoutMs,
+              /*
+               * 两样都必须传：
+               *   signal     —— 回合取消 / 宿主超时 / 插件停用
+               *   invocation —— 可信调用上下文（caller / chat 的来源）
+               *
+               * 漏传 signal 的症状是"点了停止，插件还在跑"；
+               * 漏传 invocation 的症状是 ctx.caller 恒为 null，
+               * 插件只能自己去猜会话 —— 而它不该有这个能力。
+               */
+              signal,
+              invocation,
+            });
             if (!r.ok) {
               /*
                * 运行期失败也要反映到插件状态上。
@@ -504,6 +821,9 @@ export class PluginManager {
                * 超时/崩溃意味着运行时已经不可用（process 运行时会被 kill）。
                * 这里把状态标成 crashed 并撤掉工具：让模型立刻看不到它，
                * 而不是继续调一个必然失败的工具。用户点「重载」即可恢复。
+               *
+               * **取消（E4070）不在此列**：用户点一次停止不该把插件标成崩溃、
+               * 把工具从列表里撤掉 —— 那会让人觉得"点停止把插件点坏了"。
                */
               if (r.code === 'E4065' || r.code === 'E4066') {
                 record.status = 'crashed';
@@ -513,7 +833,21 @@ export class PluginManager {
               }
               return { ok: false, code: r.code ?? 'E4066', message: r.message ?? '插件执行失败' };
             }
-            return r.value;
+            /*
+             * 插件把"取消"作为业务结果返回（`{ok:false, code:'E4070'}`）时，
+             * 必须提升成**外层失败**。
+             *
+             * 否则 executor/agent-loop 会把它记成一次成功调用：trace 显示
+             * 成功、统计不记取消，而用户在界面上看到的是"点了停止但工具还在
+             * 跑"。E4070 是宿主保留的取消码，插件用它表达"这次不算数"。
+             * 其它业务错误码保持原样（多数插件用 `{ok:false}` 作为合法结果）。
+             */
+            const value = r.value;
+            if (value && typeof value === 'object' && !Array.isArray(value)
+              && value.ok === false && value.code === 'E4070') {
+              return { ok: false, code: 'E4070', message: String(value.message ?? '调用已取消') };
+            }
+            return value;
           },
         });
         registeredNames.push(t.fullName);
@@ -624,6 +958,64 @@ export class PluginManager {
   }
 
   /**
+   * 用插件自己的 `validateConfig` 校验一份**候选配置**。
+   *
+   * ## 两种路径
+   *
+   * - 插件已启用：直接问正在跑的运行时。它已经 load 过入口，
+   *   零额外开销，而且校验的就是"将来真正跑起来的那份代码"。
+   * - 插件未启用：临时起一个运行时（只 load，不 init —— init 的副作用
+   *   不该为了校验一次配置而发生），问完立刻释放。
+   *
+   * 临时运行时也是 in-process 分支：清单校验已经保证 `validateConfig`
+   * 只可能出现在 in-process 插件上（见 manifest.mjs），所以这里不会
+   * 走到 ProcessRuntime。
+   *
+   * @param {any} record
+   * @param {Record<string, any>} values 已按声明归一的候选配置
+   * @returns {Promise<{ok: boolean, message?: string}>}
+   */
+  async #validateConfigFor(record, values) {
+    if (record.runtime && typeof record.runtime.validateConfig === 'function') {
+      return record.runtime.validateConfig(values);
+    }
+
+    const runtime = new InProcessRuntime({
+      manifest: record.manifest,
+      dir: record.dir,
+      dataDir: pluginDataDirOf(this.userDataRoot, record.id),
+      // 校验只看配置本身，密钥/发送能力都用不到：给空值即可
+      config: values,
+      secrets: {},
+      log: (level, message) => this.note(record, level, message),
+      sendText: async () => ({ ok: false, message: '配置校验期间不发送消息' }),
+      makeChat: null,
+      // 校验只看配置本身：网关能力此刻不可用，与"没接线"同义
+      makeGateway: null,
+      /*
+       * 联网工厂同样不给：配置校验是**纯计算**（这条约定写在 manifest 的
+       * validateConfig 说明里），不应该在保存时去读密钥、更不应该联网。
+       * 给了工厂反而会诱导插件在 validateConfig 里发一次真实搜索。
+       */
+      makeNet: null,
+    });
+
+    try {
+      const loaded = await runtime.load();
+      if (!loaded.ok) {
+        return { ok: false, message: `插件入口加载失败，无法校验配置：${loaded.message}` };
+      }
+      return await runtime.validateConfig(values);
+    } finally {
+      try {
+        await runtime.dispose();
+      } catch {
+        /* 临时实例释放失败不影响这次校验的结论 */
+      }
+    }
+  }
+
+  /**
    * 停用插件。
    *
    * 顺序很重要：**先注销工具，再释放运行时**。
@@ -640,6 +1032,14 @@ export class PluginManager {
 
     // 1) 立刻注销工具：新的调用马上就不存在了
     const cancelled = removeToolsOfPlugin(id);
+
+    /*
+     * 1.5) 清掉这个插件的媒体句柄。
+     *
+     * 停用之后它不会再被调用，留下的句柄永远没人用；而若之后重新启用
+     * （尤其是重载），新实例也不该继承旧句柄（那等于跨实例复用引用）。
+     */
+    forgetPluginMedia(this.chat.media, id);
 
     // 2) 释放运行时（在途调用由运行时中断/杀死）
     if (record?.runtime) {
@@ -679,7 +1079,23 @@ export class PluginManager {
       return { ok: false, code: 'E4044', message: `磁盘上没有可配置的插件 ${id}` };
     }
 
-    const saved = await this.store.save(id, record.manifest.config, input ?? {});
+    /*
+     * ---- 落盘前先问插件一句"这套配置能用吗" ----
+     *
+     * 只有清单声明了 `validateConfig: true` 的插件才会被问。问的时机
+     * 是**写盘之前**：失败就整次保存作废，用户改之前那份好配置还在。
+     *
+     * 注意这里传的是**候选值**（`input` 里那套），不是 `record` 上的旧配置。
+     * 校验的是"如果我把它存下来会怎样"，而旧值已经被证明能跑了。
+     *
+     * 未启用的插件也要校验：用户先填配置再启用是常见顺序，
+     * 那个阶段更需要立刻知道他写的规则是坏的（而不是等启用那一刻才炸）。
+     */
+    const validate = record.manifest.validateConfig
+      ? async (values) => this.#validateConfigFor(record, values)
+      : undefined;
+
+    const saved = await this.store.save(id, record.manifest.config, input ?? {}, { validate });
     if (!saved.ok) {
       return { ok: false, code: saved.code ?? 'E4062', message: saved.message ?? '配置保存失败', invalid: saved.invalid };
     }
@@ -700,6 +1116,7 @@ export class PluginManager {
     const wasReady = record.status === 'ready';
     if (record.runtime) {
       removeToolsOfPlugin(id);
+      forgetPluginMedia(this.chat.media, id);
       const rt = record.runtime;
       record.runtime = null;
       try {
@@ -714,21 +1131,38 @@ export class PluginManager {
 
     if (r.ok) {
       /*
-       * 同进程插件重载后，入口里 import 的 ./lib/* 仍是旧模块（ESM 缓存）。
-       * 所以对 in-process 插件，改了配置后"大部分能立即生效"，
-       * 但改了 lib 代码必须重启后端。这里如实告诉用户，不假装热更新。
+       * 保存配置**不需要**重启后端。
+       *
+       * ## 这里原来无条件对 in-process 插件返回 restartRequired: true
+       *
+       * 那个写法的出发点是好的（同进程插件的 `./lib/*` 子模块有 ESM 缓存，
+       * 改了代码得重启），但它把"改了代码"和"改了配置"混成了一件事：
+       *
+       *   · 保存配置只改 `config.json`，一个代码文件都没动；
+       *   · 紧接着的 `startOne()` 已经 dispose → init 跑过一遍，
+       *     入口也用新的 `?v=` 时间戳重新 import 了 —— 配置确实生效了。
+       *
+       * 于是用户改一条正则规则、点保存，看到的是「配置已保存，但需要重启
+       * 后端才能彻底生效」。他要么真的去重启一次（白折腾），要么以为
+       * 规则没生效而反复保存。两种都很难受，而这个提示**本身是错的**。
+       *
+       * 契约 §5.6 的原话也是"保存配置后……重新初始化并立即生效；
+       * **确实需要**重启才能生效的，返回 restartRequired: true"。
+       * 无条件 true 不符合那条契约。
+       *
+       * ## 那"改了 lib 代码要重启"怎么告诉用户
+       *
+       * 走另一条路：插件包被替换时 `hasUpdate` 会亮起，插件页给出「更新」
+       * 按钮（`plugin.reload`），那条路径的消息里会说明代码更新的生效范围。
+       * 代码更新和配置保存本来就是两个动作，不该共用一句提示。
        */
-      const restartRequired = record.manifest.runtime === 'in-process';
+      const restartRequired = false;
       record.restartRequired = restartRequired;
       return {
         ok: true,
         applied: true,
         restartRequired,
-        message: wasReady
-          ? restartRequired
-            ? '配置已保存并重新初始化；同进程插件的内部模块改动需重启后端才彻底生效'
-            : '配置已保存并生效'
-          : '配置已保存并已启动',
+        message: wasReady ? '配置已保存并已生效' : '配置已保存并已启动',
         status: record.status,
       };
     }
@@ -796,9 +1230,13 @@ export class PluginManager {
       dir: record.dir,
       dataDir,
       config: resolved.config,
-      secrets: resolved.secrets,
+      secrets: runtimeSecretsFor(record.id, resolved.secrets),
       log: (level, message, fields) => this.note(record, level, message, fields),
-      sendText: this.sendText,
+      // 插件发起的 sendText 也排进同一个 per-会话队列（见 sendTextQueued）
+      sendText: (convKey, text) => this.sendTextQueued(convKey, text),
+      makeChat: (input) => this.chat.makeChat(input),
+      makeGateway: this.gateway ? (input) => this.gateway.makeGateway(input) : undefined,
+      makeNet: this.netFactoryFor(record.id, resolved.config, resolved.secrets),
       nodePath: this.nodePath,
     });
 
@@ -838,6 +1276,7 @@ export class PluginManager {
     this.records.set(id, fresh);
 
     removeToolsOfPlugin(id);
+    forgetPluginMedia(this.chat.media, id);
     if (record.runtime) {
       try {
         await record.runtime.dispose();
@@ -900,6 +1339,7 @@ export class PluginManager {
       if (!found.has(id)) {
         const record = this.records.get(id);
         removeToolsOfPlugin(id);
+        forgetPluginMedia(this.chat.media, id);
         if (record?.runtime) {
           try {
             await record.runtime.dispose();
@@ -920,20 +1360,79 @@ export class PluginManager {
   /**
    * 把一条 QQ 消息交给所有「已就绪的 in-process 插件」尝试接管。
    *
-   * 只有 in-process 运行时能接管：子进程拿不到宿主的发送闸门与事件流。
+   * ## 为什么要分两轮（normal → low）
+   *
+   * 原来这里是单轮遍历，顺序等于 `records` 的插入顺序，而插入顺序来自
+   * 磁盘目录扫描 —— 也就是**文件名排序**。于是"谁先拿到这条消息"取决于
+   * 目录名，那不是一条能推理的规则：装一个 `a-xxx` 插件就可能把
+   * dsh-bridge 的审批回复抢走，症状是"审批有时候没反应"，换台机器还不复现。
+   *
+   * 现在把"我该排后面"变成清单里写下来的决定（`messagePriority: "low"`）：
+   *
+   *   normal  归属明确的接管者 —— 审批、确认、指令。先跑。
+   *   low     兜底类接管者 —— 正则自动回复、关键词、签到。后跑。
+   *
+   * 两轮之间是**硬边界**：normal 里任何一个返回 true，low 根本不会被调用。
+   * 这不是"建议顺序"，是"低优先级拿不到已被认领的消息"。
+   *
+   * ## `gate` 为什么要由宿主算
+   *
+   * 白名单、静音、有没有待确认，这三件事的状态都在宿主手里：插件看不到
+   * 白黑名单配置，也读不到确认表。让插件自己判断等于让它猜 —— 而猜错的
+   * 两个方向都很糟：多回一条会抢走审批，少回一条则明明该回却不回。
+   * 所以宿主先算出结构性事实，原样传下去。
    *
    * @param {object} evt
+   * @param {{whitelisted?: boolean, silenced?: boolean, confirmPending?: boolean, selfId?: string}} [gate]
    * @returns {Promise<boolean>} true = 已处理，宿主不再走 AI 回合
    */
-  async dispatchMessage(evt) {
+  async dispatchMessage(evt, gate) {
+    /** @type {any[]} */
+    const normal = [];
+    /** @type {any[]} */
+    const low = [];
+
     for (const record of this.records.values()) {
       if (!record.enabled || record.status !== 'ready') continue;
       if (!record.manifest?.handleMessage) continue;
       if (record.manifest.runtime !== 'in-process') continue;
       const rt = record.runtime;
       if (!rt || typeof rt.handleMessage !== 'function') continue;
+      // 清单校验保证了 low 只可能出现在 in-process 插件上，这里只是分组
+      if (record.manifest.messagePriority === 'low') low.push(record);
+      else normal.push(record);
+    }
+
+    // ---- 第一轮：normal（归属明确的接管者）----
+    if (await this.#tryDispatch(normal, evt, gate)) return true;
+
+    // ---- 第二轮：low（兜底类接管者）----
+    // 走到这里说明没有 normal 插件认领这条消息。这才是 low 的生效条件。
+    if (low.length > 0) {
+      this.log('debug', '低优先级插件尝试接管消息', {
+        convKey: evt?.convKey,
+        plugins: low.map((r) => r.id),
+      });
+    }
+    return this.#tryDispatch(low, evt, gate);
+  }
+
+  /**
+   * 按给定顺序尝试让一组插件接管同一条消息。
+   *
+   * 抽出来是为了让"两轮"这个结构在 `dispatchMessage` 里一眼可见：
+   * 如果写成一个大循环，将来有人往中间插一个 `for` 就会悄悄改变顺序，
+   * 而那个顺序恰恰是审批不被抢走的唯一保证。
+   *
+   * @param {any[]} records
+   * @param {object} evt
+   * @param {object|null} gate
+   * @returns {Promise<boolean>}
+   */
+  async #tryDispatch(records, evt, gate) {
+    for (const record of records) {
       try {
-        const handled = await rt.handleMessage({ evt });
+        const handled = await record.runtime.handleMessage({ evt, gate });
         if (handled === true) return true;
       } catch (err) {
         this.note(record, 'error', `消息接管异常：${String(/** @type {any} */ (err)?.message ?? err)}`);
@@ -1008,8 +1507,25 @@ export class PluginManager {
           fullName: t.fullName ?? PLUGIN_TOOL_PREFIX + t.name,
           description: t.description,
           needs: t.needs,
-          risk: t.risk,
-          confirm: t.risk === 'R0' ? 'never' : 'always',
+          /*
+           * `risk` 是**生效风险**（effects 推导后），`declaredRisk` 是作者写的。
+           * 两个都给：界面才能显示"声明 R0，实际按 R1 要求确认"，
+           * 否则用户永远想不通为什么要确认一个"只读"工具。
+           */
+          risk: deriveToolPolicy(t).risk,
+          declaredRisk: t.risk,
+          effects: t.effects ?? [],
+          /*
+           * `confirm` 是**未授权来源**下的确认要求（也就是管理员私聊、桌面端）。
+           *
+           * 为什么不在这里算"已授权聊天来源"的值：确认策略现在**按调用**决定
+           * （见 tool-gate.needsConfirmFor），同一个工具在群里被授权后免确认、
+           * 在管理员私聊里仍按 risk 走。快照没有"来源"这个维度，硬塞一个值
+           * 必然在某处与实际行为不一致 —— 那正是"界面说自动、实际弹确认"的来源。
+           *
+           * 所以界面文案要写成"按来源"，而不是承诺一个全局值。
+           */
+          confirm: deriveToolPolicy(t).confirm,
           timeoutMs: t.timeoutMs,
           params: t.params ?? {},
           enabled: record.status === 'ready' && t.registered !== false,
@@ -1048,6 +1564,14 @@ export class PluginManager {
     return {
       enabled,
       allowDangerous,
+      /**
+       * 聊天来源的工具授权（界面回显用）。
+       *
+       * 与配置项 `plugins.chatTools` 同形状。给快照是因为界面要能
+       * 显示"哪个来源现在能用哪些插件工具" —— 让用户去翻配置文件
+       * 才算"能看到授权"，等于没有界面。
+       */
+      chatTools: this.chatToolsConfig(),
       // 兼容旧字段（脚本与旧界面还在用）
       loaded: items
         .filter((i) => i.status === 'ready')

@@ -1,0 +1,356 @@
+{
+  "id": "stickers",
+  "name": "表情包",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "让机器人用得懂 QQ 收藏表情：列出/搜索表情库、把一张表情的图片交给视觉通道看一眼、记录它的含义、把当前会话里的图收藏进账号、往当前会话发一张表情。表情库是整个账号一份、跨会话共享；图片 URL 不落盘，缓存按 sha256 复用。",
+  "author": "ling-bot",
+  "runtime": "process",
+  "entry": "index.mjs",
+  "permissions": ["qq.read", "qq.send", "host.fs"],
+  "config": [
+    {
+      "key": "listEnabled",
+      "label": "启用列表与搜索",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "关掉后 sticker_list / sticker_search 直接返回 E_STICKER_DISABLED。其它工具不受影响。"
+    },
+    {
+      "key": "imageEnabled",
+      "label": "启用看图",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "关掉后 sticker_image 不再取图。图片只会进视觉通道，不会以别的形式泄露。"
+    },
+    {
+      "key": "collectEnabled",
+      "label": "启用收藏",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "收藏是往 QQ 账号里加一张图，独立于发送。关掉后 sticker_collect 返回 E_STICKER_DISABLED。"
+    },
+    {
+      "key": "sendEnabled",
+      "label": "启用发送",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "独立于收藏。关掉后 sticker_send 返回 E_STICKER_DISABLED。"
+    },
+    {
+      "key": "noteEnabled",
+      "label": "启用记录含义",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "关掉后 sticker_note 不再写本地库。已记录的备注仍然保留、仍然参与选图。"
+    },
+    {
+      "key": "maxListCount",
+      "label": "单次列表条数",
+      "type": "number",
+      "default": 60,
+      "required": false,
+      "min": 1,
+      "max": 200,
+      "integer": true,
+      "help": "sticker_list / sticker_search 默认返回多少条。模型可以按次传 count 覆盖（1–200 / 1–100）。"
+    },
+    {
+      "key": "syncTtlMs",
+      "label": "同步缓存时长（毫秒）",
+      "type": "number",
+      "default": 60000,
+      "required": false,
+      "min": 0,
+      "max": 3600000,
+      "integer": true,
+      "help": "多久之内不重复拉取账号收藏列表。0 = 每次工具调用都拉一次（会明显变慢）。"
+    },
+    {
+      "key": "maxImageBytes",
+      "label": "识别用图片字节上限",
+      "type": "number",
+      "default": 98304,
+      "required": false,
+      "min": 4096,
+      "max": 131072,
+      "integer": true,
+      "help": "超过这个大小的图仍然会缓存、可以发送，但不会提交给模型看（工具返回值总上限是 256KB，base64 会膨胀 4/3）。默认 96KB。"
+    },
+    {
+      "key": "collectPerHour",
+      "label": "每小时收藏上限",
+      "type": "number",
+      "default": 6,
+      "required": false,
+      "min": 0,
+      "max": 60,
+      "integer": true,
+      "help": "0 = 禁止收藏。这是插件层的节流（在子进程内存里，重启清零），不是安全边界；它防的是脚本化的重复收藏。"
+    },
+    {
+      "key": "sendPerHour",
+      "label": "每小时发送上限",
+      "type": "number",
+      "default": 20,
+      "required": false,
+      "min": 0,
+      "max": 120,
+      "integer": true,
+      "help": "0 = 禁止发表情。同样只是插件层节流；真正的发送上限在宿主的发送闸门里，那一层不受插件重启影响。"
+    },
+    {
+      "key": "sendMinIntervalMs",
+      "label": "两次表情最小间隔（毫秒）",
+      "type": "number",
+      "default": 8000,
+      "required": false,
+      "min": 0,
+      "max": 600000,
+      "integer": true,
+      "help": "比每小时上限更早触发的那道闸：防止连着几条都是表情。0 = 不限间隔。"
+    },
+    {
+      "key": "maxRemarkChars",
+      "label": "QQ 备注字数上限",
+      "type": "number",
+      "default": 20,
+      "required": false,
+      "min": 0,
+      "max": 50,
+      "integer": true,
+      "help": "收藏时写进 QQ 账号的表情备注会被截到这个长度（QQ 侧实际约 20 字）。0 = 不写 QQ 备注。更长的含义写进本地 localNote。"
+    },
+    {
+      "key": "syncOnInit",
+      "label": "启动时预热同步",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "插件初始化时先拉一次收藏列表，让第一次选图就有内容。子进程重启会重新走这一步（受同步缓存时长约束，不会每次都打网关）。"
+    },
+    {
+      "key": "fallbackToTagsWhenVisionOff",
+      "label": "视觉关闭时按标签选图",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "视觉关着时，仍然允许按已有的备注/标签选一张发出去。关掉它之后 sticker_image 会直接返回 E_STICKER_VISION_OFF。"
+    },
+    {
+      "key": "overridePersona",
+      "label": "覆盖人格里「不用表情包」的表态",
+      "type": "boolean",
+      "default": false,
+      "required": false,
+      "help": "默认人格里写着「不用表情包」，那会让表情工具对这个会话不可见。打开它是管理员的显式决定：仍然注入表情策略，并声明优先于人格里那句话。不会改写你的人格文本——宿主读这个开关。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "sticker_list",
+      "description": "列出本地表情库（可按关键词过滤），给每一张一个稳定的 id 引用。返回文本清单与结构化条目。用 id 去调用 sticker_image / sticker_send / sticker_note。表情库是整个 QQ 账号一份、跨会话共享的；它只读本地索引，不读 QQ、也不看图——要看某一张长什么样请用 sticker_image。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 15000,
+      "params": {
+        "query": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "可选关键词，在备注/本地含义/标签/用法/id 里找。留空就是列全部"
+        },
+        "count": {
+          "type": "number",
+          "description": "最多返回多少条（1–200），默认用配置里的 maxListCount"
+        },
+        "refresh": {
+          "type": "boolean",
+          "description": "true = 忽略同步缓存，先跟 QQ 账号对一次列表（会慢一点，但能立刻看到账号侧的变化）"
+        }
+      }
+    },
+    {
+      "name": "sticker_search",
+      "description": "按关键词搜索表情库，匹配备注（QQ 侧）、本地含义、标签、用法、id、md5。用于「找一张能表达无语的表情」这类需求。没有命中会返回 matched=0（不是错误）——这时换个词再搜，或者让用户先记一张。这里只匹配文字，没有看图。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.read"],
+      "timeoutMs": 15000,
+      "params": {
+        "query": {
+          "type": "string",
+          "required": true,
+          "maxLength": 60,
+          "description": "要找什么样的表情，比如「无语」「笑」「晚安」。不要传 id——要按 id 取图请直接用 sticker_image"
+        },
+        "count": {
+          "type": "number",
+          "description": "最多返回多少条（1–100），默认用配置里的 maxListCount"
+        }
+      }
+    },
+    {
+      "name": "sticker_image",
+      "description": "取一张表情的图片交给视觉通道，让你真的看到它。这是六个工具里唯一会返回图片的：图片会作为一条独立消息跟在工具结果后面。视觉识别关着时不会返回图，只给已有的备注/标签——返回文本会明确说明「视觉识别已关闭」或「当前无法确认读图是否可用」，此时不要描述画面。动图只能看到静态第一帧，不要据此推断它在完整播放时的动作。图片超过识别预算时只缓存不返回图（tooLarge=true），不影响发送。",
+      "needs": "qq",
+      "risk": "R1",
+      "effects": ["data.read", "qq.account.read"],
+      "timeoutMs": 30000,
+      "params": {
+        "ref": {
+          "type": "string",
+          "required": true,
+          "maxLength": 120,
+          "description": "表情的标识符：id / resId / sha256 / md5，按这个顺序精确匹配。不接受自然语言描述——先用 sticker_list 或 sticker_search 拿到 id"
+        }
+      }
+    },
+    {
+      "name": "sticker_note",
+      "description": "记录一张表情是什么意思（只写本地库，不会改 QQ 账号里的备注）。三个内容参数 note / tags / usage 至少给一个，全空会被拒绝（E_STICKER_EMPTY_PATCH）——那会静默清掉已有的认知。看清一张图之后记下它的含义，下次就能更准地选。注意：这个工具写的是整个账号共享的表情库，属于 R2，在群聊里不可用（只能在管理员私聊或桌面端调用）。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["data.write"],
+      "timeoutMs": 15000,
+      "params": {
+        "ref": {
+          "type": "string",
+          "required": true,
+          "maxLength": 120,
+          "description": "表情的标识符：id / resId / sha256 / md5（精确匹配，不支持自然语言）"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "这张图的含义，比如「无语时用」。动图只写第一帧能确认的内容 + 印象性描述，不要写「它会左右横跳」这种只有看动图才知道的结论"
+        },
+        "tags": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "type": "string" },
+          "description": "标签，每个不超过 24 字，最多 20 个。传空数组表示清空标签"
+        },
+        "usage": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "什么时候用它，比如「接梗时」「别人发了表情就回这张」"
+        }
+      }
+    },
+    {
+      "name": "sticker_collect",
+      "description": "把当前会话里某条消息中的图片收藏进 QQ 账号（这是对账号的写操作，QQ 客户端里也看得见）。desc 写进 QQ 侧备注，note 只写进本地库——两个都给时都写，只给 desc 时本地含义留空。消息必须属于当前会话，否则返回 E4074；不能收藏自己发的消息。同一张图（同 sha256/md5）已经在库里会返回 E_STICKER_DUPLICATE 并带上已有 id。网关不支持收藏时原样返回 E_GATEWAY_UNSUPPORTED，不会假装收藏成功。注意：这是 R2 且不可撤销（删了要在 QQ 里手动找回来），在群聊里不可用。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["qq.account.write", "data.write"],
+      "timeoutMs": 30000,
+      "params": {
+        "messageId": {
+          "type": "string",
+          "required": true,
+          "maxLength": 64,
+          "description": "当前会话里那条带图的消息 id。必须属于当前会话"
+        },
+        "index": {
+          "type": "number",
+          "description": "一条消息里有多张图时，收第几张（0 起，0–3）。默认 0"
+        },
+        "desc": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "写进 QQ 账号的表情备注（会被配置里的 maxRemarkChars 再截一次，默认 20 字）。会出现在 QQ 客户端里"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "写进本地库的含义，只有这个机器人看得到。不要用它重复 desc"
+        },
+        "tags": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "type": "string" },
+          "description": "本地标签，最多 20 个"
+        }
+      }
+    },
+    {
+      "name": "sticker_send",
+      "description": "往当前会话发一张表情。只发一张图，一个气泡里只有表情、没有文字——想说话请另外发一条文本。发送走宿主的统一闸门与发送队列，被限流/审计拦下时会把错误码原样返回（E2020/E2030/E20XX）。调用成功就够了：宿主已经记下「刚发过一张表情」，不要在本轮回答里再复述「我发了个表情」，表情本身就看得见。replyToMessageId 必须是当前会话里的消息；atUserId 只在群聊有效。",
+      "needs": "qq",
+      "risk": "R0",
+      "effects": ["chat.send.media"],
+      "timeoutMs": 30000,
+      "params": {
+        "ref": {
+          "type": "string",
+          "required": true,
+          "maxLength": 120,
+          "description": "表情的标识符：id / resId / sha256 / md5（精确匹配）。先用 sticker_list / sticker_search 拿到 id"
+        },
+        "replyToMessageId": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "可选：引用当前会话里的某条消息。必须属于当前会话"
+        },
+        "atUserId": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "可选：@ 一个群成员（只填 QQ 号）。仅群聊可用，私聊传它会返回 E_STICKER_TARGET_NOT_GROUP"
+        }
+      }
+    }
+  ],
+  "notes": [
+    {
+      "title": "默认不启用，也不会自己冒出来",
+      "lines": [
+        "装好之后插件状态是「已安装未启用」，需要你在插件页填配置并点启用，工具才会出现。",
+        "启用之后，工具在聊天来源里仍然默认不可见：群聊 / 陌生人私聊 / 主动回合三档全关。要让群里能用，必须把完整工具名（如 plugin_sticker_send）写进 plugins.chatTools.group.tools 再打开该档。",
+        "「启用插件」和「点名进群」是两次独立的管理员动作，缺一步都不会有效果。"
+      ]
+    },
+    {
+      "title": "为什么「收藏」和「记录含义」在群里用不了",
+      "lines": [
+        "收藏（sticker_collect）是往 QQ 账号里加一张图：它跨会话可见、在 QQ 客户端里也看得见，而且不可撤销——删掉得回 QQ 里手动找回来。生效风险是 R2，而聊天来源的上限是 R1。",
+        "记录含义（sticker_note）写的是整个账号共享的表情库（data.write，也是 R2）——不是按会话隔离的那一份。群里任何人都能往这份全账号共用的备注里写字，等于把提示词入口交出去。",
+        "所以这两个工具只在管理员私聊 / 桌面端可用。把名字写进 chatTools 也不生效，这是刻意的取舍，不是漏配。",
+        "能进群的四个：list / search / image / send。群里主要的用法就是「按标签挑一张、看一眼、发出去」。"
+      ]
+    },
+    {
+      "title": "表情库坏了会变成只读，不会静默清空",
+      "lines": [
+        "库文件在 plugin-data/stickers/library.json。解析失败、读不动、顶层形状不对时，插件会切到只读并打一条 warning 日志：所有写工具返回 E_STICKER_STORE_READONLY，读取类工具照常可用。",
+        "它绝不会把坏文件当空库回写——那样一次「看起来正常」的写就能把你攒下的备注和标签全部清零。",
+        "「文件不存在」不算损坏，那是首次使用。修好或删掉文件后重载插件即可恢复写入。",
+        "图片缓存 faces/ 由宿主的取图链路写入；条目被同步删除时插件会回收它独占的文件，启动时还会清掉没人引用的孤儿文件。"
+      ]
+    },
+    {
+      "title": "看图、标签、动图：什么时候它「真的看到了」",
+      "lines": [
+        "视觉识别开着时，sticker_image 会把图片真的提交给模型；关着或状态未知时，它不返回图片，只按已有的备注/标签选，并在文本里写明「视觉识别已关闭」或「当前无法确认读图是否可用」。",
+        "这是有意的：模型看不到图却说「看到了」，会开始编造画面。文字里那句声明就是它说实话的依据。",
+        "GIF / APNG / 动画 WebP 只能看到静态第一帧，返回文本会写明这一点；发送时原样发原始文件，不转码、不抽帧，QQ 客户端负责播放。",
+        "图片超过识别预算（默认 96KB）时只缓存不提交（tooLarge），不影响发送——预算是给「看」的，不是给「发」的。"
+      ]
+    },
+    {
+      "title": "缓存、URL 与限额",
+      "lines": [
+        "QQ 的图片 URL 带临时鉴权参数，插件不把它写进任何文件：只在内存里活到下次同步。代价是进程重启后「看一张很久以前收的表情」需要先同步一次。",
+        "图片按 sha256 缓存成 faces/<sha256>.<ext>，同一张图只存一份。插件不做按时间或体积的自动淘汰：删掉可能还在用的缓存会让下一次发送失败一次，比占点磁盘更难解释。",
+        "收藏默认每小时 6 次、发送默认每小时 20 次且两次之间至少 8 秒。这是插件层的节流（跑在插件子进程内存里，重启清零），不是安全边界；真正的发送上限在宿主的发送闸门里。",
+        "默认人格里那句「不用表情包」会让表情工具对该会话不出现。想用可以改人格，或在插件配置里打开 overridePersona（它不会改写你的人格文本）。"
+      ]
+    }
+  ],
+  "ui": null
+}

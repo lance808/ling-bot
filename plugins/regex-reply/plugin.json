@@ -1,0 +1,136 @@
+{
+  "id": "regex-reply",
+  "name": "正则回复",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "消息先过一遍正则规则：命中就直接回复并结束该条消息的处理（不调用 AI），未命中继续走原来的 AI 流程。",
+  "author": "ling-bot",
+  "runtime": "in-process",
+  "trusted": true,
+  "entry": "index.mjs",
+  "handleMessage": true,
+  "messagePriority": "low",
+  "validateConfig": true,
+  "permissions": ["qq.read", "qq.send"],
+  "config": [
+    {
+      "key": "rules",
+      "label": "规则（JSON 数组）",
+      "type": "textarea",
+      "default": "[]",
+      "required": false,
+      "maxLength": 60000,
+      "placeholder": "[\n  { \"id\": \"hi\", \"pattern\": \"^你好[啊呀]?$\", \"reply\": \"你好呀，{user}！\" },\n  { \"id\": \"help\", \"pattern\": \"^/help$\", \"reply\": \"可用指令见群公告\", \"priority\": 10 }\n]",
+      "help": "JSON 规则数组，最多 64 条。每条至少要有 id、pattern、reply；可选 name、enabled、flags、priority、scope、cooldownMs。最小示例：[{\"id\":\"hi\",\"pattern\":\"^你好$\",\"reply\":\"你好，{user}\"}]。pattern 最长 500 字、reply 最长 1000 字；保存前整体校验，出错会指出是第几条规则。"
+    },
+    {
+      "key": "enabled",
+      "label": "启用自动回复",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "总开关。插件在插件页启用之后，还可以用这一项临时静默：关掉后所有规则都不生效，消息全部交给 AI，不必停用插件。"
+    },
+    {
+      "key": "defaultCooldownMs",
+      "label": "默认冷却（毫秒）",
+      "type": "number",
+      "default": 0,
+      "required": false,
+      "min": 0,
+      "max": 86400000,
+      "integer": true,
+      "help": "规则自己没写 cooldownMs 时用这个值。同一规则在同一会话里刚回过一条，冷却期内再来一次就跳过（交给 AI）。0 = 不冷却。"
+    },
+    {
+      "key": "maxRepliesPerMinute",
+      "label": "每分钟回复上限",
+      "type": "number",
+      "default": 6,
+      "required": false,
+      "min": 1,
+      "max": 60,
+      "integer": true,
+      "help": "所有会话合计，每分钟最多自动回复几条。用满后新的命中会被跳过并继续走 AI，不是排队。要彻底关掉请用「启用自动回复」。"
+    },
+    {
+      "key": "maxRepliesPerHour",
+      "label": "每小时回复上限",
+      "type": "number",
+      "default": 60,
+      "required": false,
+      "min": 1,
+      "max": 600,
+      "integer": true,
+      "help": "所有会话合计，每小时最多自动回复几条。与分钟上限同时生效，任一用满就不回。用于兜住「规则写得太宽 + 群里刷屏」这种事故。"
+    },
+    {
+      "key": "maxInputLength",
+      "label": "参与匹配的最大字数",
+      "type": "number",
+      "default": 500,
+      "required": false,
+      "min": 1,
+      "max": 4000,
+      "integer": true,
+      "help": "消息文本超过这个长度就整条不匹配，直接交给 AI。正则的代价随文本长度增长，长文本配上一条写坏的规则就能把 CPU 拖住，所以先设一道长度闸门。"
+    },
+    {
+      "key": "matchTimeoutMs",
+      "label": "匹配超时（毫秒）",
+      "type": "number",
+      "default": 50,
+      "required": false,
+      "min": 5,
+      "max": 500,
+      "integer": true,
+      "help": "单条消息跑完全部规则的总预算。超时立刻终止 worker 线程、把这条消息当成「没命中」（继续走 AI），并把超时的那条规则跳过 5 分钟，避免每条消息都卡一次。"
+    },
+    {
+      "key": "multiMatch",
+      "label": "同时命中多条时",
+      "type": "enum",
+      "default": "priority",
+      "required": false,
+      "options": [
+        { "value": "priority", "label": "只回优先级最高的一条" },
+        { "value": "all", "label": "按优先级各回一条（最多 3 条）" }
+      ],
+      "help": "priority = 只回一条（推荐，避免刷屏）；all = 命中几条就回几条，按 priority 从高到低，最多 3 条，其余只记日志。"
+    },
+    {
+      "key": "replyOnSendFail",
+      "label": "发送失败时补一条提示",
+      "type": "boolean",
+      "default": false,
+      "required": false,
+      "help": "自动回复被发送闸门拒绝（限流/白名单）或发送异常时，是否在原会话再补一句「这条规则没发出去」。默认不补：失败提示自己也可能被同一道闸门拒绝，而且多数用户不需要这种噪音。无论开不开，都不会重试、也不会回退给 AI。"
+    }
+  ],
+  "tools": [],
+  "notes": [
+    {
+      "title": "怎么用",
+      "lines": [
+        "在「规则（JSON 数组）」里填规则并保存，然后到插件页启用本插件。规则本身还有 enabled 字段，可以单条临时关掉。",
+        "命中的消息由本插件直接回复，这条消息到此结束，不会再调用 AI；没命中的消息原样交给原来的 AI 流程，两者不冲突。",
+        "必填字段：id（唯一、稳定）、pattern（正则，自动带 u）、reply（回复模板）。可选：name、enabled、flags（i/m/s）、priority（-1000..1000，越大越先）、scope、cooldownMs。",
+        "模板变量：{0} 整条匹配、{1}…{20} 捕获组、{name} 命名组、{user} 昵称、{userId}、{convKey}、{group}、{rule}/{ruleId}、{time}。写在模板里的 {{ 与 }} 表示字面量大括号。",
+        "同一条消息命中多条规则时，默认只回优先级最高的一条；把「同时命中多条时」改成 all，会按优先级各回一条、最多 3 条。",
+        "可直接导入的示例规则见插件包内 examples/rules.sample.json。"
+      ]
+    },
+    {
+      "title": "安全边界",
+      "lines": [
+        "四道前置闸门：会话不在白名单、宿主处于静音、消息是机器人自己发的、宿主还有待确认的审批 —— 这四种情况下本插件一律不接管，交给宿主。",
+        "清单里声明了 messagePriority: low，所以永远排在 dsh-bridge 这类归属明确的接管者之后；审批回复会先被它认领，正则规则拿不到。",
+        "正则跑在独立的 worker 线程里，并且有总预算超时；超时就杀掉 worker、把这条消息降级成「没命中」，同时把那条规则跳过 5 分钟。宁可漏回一句，也不让一条写坏的规则卡住整个后端。",
+        "发送失败（闸门拒绝或异常）不回退给 AI、也不重试：回退会让 AI 再回一遍，用户可能收到两条；而闸门拒绝本来就不该由 AI 补发。宁可少一条，不可重复。",
+        "全局每分钟/每小时两道限频加规则级冷却，都是防刷屏用的。它们拒绝时消息会继续走 AI，而不是静默丢弃。",
+        "scope.adminOnly 由宿主判定（gate.isAdmin，口径是核心管理员 config.admin.qqIds）：管理员命中，其他人不命中。宿主没给这个字段时按「非管理员」处理（fail-closed），宁可这条规则不生效，也不要对所有人放开。"
+      ]
+    }
+  ],
+  "ui": null
+}

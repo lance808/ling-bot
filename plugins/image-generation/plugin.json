@@ -1,0 +1,45 @@
+{
+  "id": "image-generation",
+  "name": "独立文生图",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "AI提交持久化文生图任务，管理员私聊引用请求回复1同意或2拒绝；同意后才请求收费API，后台生成并通过统一媒体闸门投递原会话。不进行生成后第二次审批。",
+  "author": "ling-bot",
+  "runtime": "in-process",
+  "trusted": true,
+  "entry": "index.mjs",
+  "handleMessage": true,
+  "validateConfig": true,
+  "permissions": ["qq.send", "host.fs", "net", "paid"],
+  "config": [
+    {"key":"apiUrl","label":"独立生图API基址","type":"text","default":"","required":true,"maxLength":500,"help":"OpenAI兼容基址或完整images/generations端点。可显式使用本地HTTP服务，禁止URL内凭据、查询和片段。"},
+    {"key":"apiKey","label":"独立生图API Key","type":"password","required":true,"help":"仅入宿主凭据保险箱，与聊天模型Key无关。"},
+    {"key":"model","label":"生图模型","type":"text","default":"","required":true,"maxLength":120,"help":"管理员固定模型，不依赖聊天模型能力。"},
+    {"key":"admins","label":"审核管理员QQ","type":"text","default":"","required":true,"maxLength":300,"help":"显式配置，逗号或空白分隔。向各管理员私聊发卡，先到的一次有效引用决定生效。建议只配置一位。"},
+    {"key":"size","label":"固定尺寸","type":"text","default":"1024x1024","required":true,"maxLength":32},
+    {"key":"count","label":"默认张数及单任务张数上限","type":"number","default":1,"min":1,"max":8,"integer":true},
+    {"key":"timeoutMs","label":"生成总超时（毫秒）","type":"number","default":180000,"min":100,"max":600000,"integer":true},
+    {"key":"approvalTtlMs","label":"审批有效期（毫秒）","type":"number","default":600000,"min":1000,"max":86400000,"integer":true},
+    {"key":"concurrency","label":"后台并发上限","type":"number","default":1,"min":1,"max":4,"integer":true},
+    {"key":"maxPending","label":"全局未完成任务上限","type":"number","default":20,"min":1,"max":100,"integer":true},
+    {"key":"maxPerRequester","label":"每请求者未完成上限","type":"number","default":3,"min":1,"max":20,"integer":true},
+    {"key":"requestsPerHour","label":"每小时提交上限","type":"number","default":10,"min":1,"max":100,"integer":true},
+    {"key":"imagesPerDay","label":"24小时提交张数上限","type":"number","default":30,"min":1,"max":1000,"integer":true,"help":"滑动窗口按提交快照计数，拒绝与取消也占用额度，防审批刷屏。"},
+    {"key":"maxImageBytes","label":"单张图片字节上限","type":"number","default":10485760,"min":1024,"max":10485760,"integer":true},
+    {"key":"maxStorageBytes","label":"图片存储及预留字节上限","type":"number","default":524288000,"min":1048576,"max":2147483648,"integer":true},
+    {"key":"retentionDays","label":"完成任务保留天数","type":"number","default":7,"min":1,"max":90,"integer":true,"help":"终态按期清理；收费结果不明记录保留待人工核实。投递失败图片在保留期后清理，不重新计费生成。"},
+    {"key":"maxTasks","label":"任务记录上限","type":"number","default":1000,"min":20,"max":10000,"integer":true},
+    {"key":"deliveryAttempts","label":"自动投递尝试上限","type":"number","default":3,"min":1,"max":10,"integer":true},
+    {"key":"deliveryRetryMs","label":"投递重试间隔（毫秒）","type":"number","default":30000,"min":100,"max":3600000,"integer":true}
+  ],
+  "tools": [
+    {"name":"image_generate","description":"提交文生图请求，立即返回taskId与pending。仅显式管理员私聊引用审批后才会收费生成，生成后异步投递原会话；不要把pending说成生成成功，不要反复提交。","needs":"qq","risk":"R2","effects":["paid","net","data.write","chat.send","chat.send.media"],"approval":"plugin","timeoutMs":5000,"params":{"prompt":{"type":"string","required":true,"maxLength":4000,"description":"完整文生图提示词"},"count":{"type":"number","required":false,"min":1,"max":8,"integer":true,"description":"张数，不得超过管理员配置上限"}}},
+    {"name":"image_task","description":"按taskId查询当前请求者的生图任务，区分审批、生成、收费结果不明与投递失败；返回媒体句柄，不返回base64。","needs":"qq","risk":"R0","effects":["data.read"],"params":{"taskId":{"type":"string","required":true,"maxLength":64}}},
+    {"name":"image_cancel","description":"取消当前请求者的任务。收费请求开始后取消不能保证退款或未计费，不会自动重发；已发送图片无法撤回。","needs":"qq","risk":"R1","effects":["data.session"],"params":{"taskId":{"type":"string","required":true,"maxLength":64}}},
+    {"name":"image_retry_delivery","description":"仅重试已生成但投递失败的保存图片，跳过已发送图片，绝不重新生成或计费；中断发送可能已送达，请先核实。","needs":"qq","risk":"R1","effects":["data.session","chat.send.media"],"params":{"taskId":{"type":"string","required":true,"maxLength":64}}}
+  ],
+  "notes": [
+    {"title":"授权与一次审批","lines":["默认不启用。需允许插件高风险工具；群聊/普通私聊还须点名plugin_image_generate并打开allowPaid，不接受通配符，主动回合始终禁止。","生成工具保留R2及paid副作用，approval=plugin只替代通用工具确认。管理员必须引用本次卡片回复1或2；不会进行第二次看图审批。","查询/取消只允许原会话原请求者；配置审核管理员可在本人私聊管理任务。"]},
+    {"title":"恢复与计费","lines":["pending和未开始收费的queued可在异常重启后恢复；generating转为outcome_unknown，禁止自动重放收费POST。","生成后投递失败只重试图片文件。重启或停用中断投递后需显式重试，可能存在QQ已收到而本地未记录的窗口。","测试连接只做本地说明，不发请求；完整验证使用本地模拟接口。"]}
+  ]
+}

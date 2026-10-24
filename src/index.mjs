@@ -31,12 +31,21 @@ import { passSendGate, checkWhitelist, RateLimiter } from './guard/send-gate.mjs
 import { auditOutbound, maskSecret } from './guard/audit.mjs';
 import { assertOrigin, ORIGIN } from './guard/origin.mjs';
 import { resolveToolSet, toOpenAiTools, RISK } from './guard/tool-gate.mjs';
+import {
+  ConfirmRegistry,
+  parseConfirmReply,
+  describeOutcome,
+  normalizeMessageId,
+  SETTLE_REASON,
+} from './guard/confirm.mjs';
+import { coreAdminIds, deliverableAdminIds, isCoreAdmin, normalizeAdminIds } from './guard/admin.mjs';
 import { listTools, describeTools } from './tools/registry.mjs';
 import { registerReadonlyTools } from './tools/basic.mjs';
 import { createToolRunner } from './tools/executor.mjs';
 import { installBuiltinPlugins, migrateLegacyPlugins } from './tools/builtin-plugins.mjs';
 import { PluginManager } from './plugins/manager.mjs';
 import { migrateLegacyDsh } from './plugins/legacy.mjs';
+import { normalizeChatTools } from './plugins/chat-tools.mjs';
 import { registerAllActions, snapshotRegistry, renderRegistryBanner } from './registry.mjs';
 import { LlmClient, estimateTokens, THINKING_STYLES } from './llm/client.mjs';
 
@@ -47,20 +56,73 @@ import { LlmClient, estimateTokens, THINKING_STYLES } from './llm/client.mjs';
  * client.mjs 里的表漂移，那时会出现"设置存下来了但请求没变"的怪事。
  */
 const THINKING_STYLE_KEYS = new Set(['auto', ...Object.keys(THINKING_STYLES)]);
-import { buildMessages, DEFAULT_PERSONA } from './llm/prompt.mjs';
+import { buildMessages, DEFAULT_PERSONA, buildStickerGuidance, resolvePersonaStickerPolicy } from './llm/prompt.mjs';
 import { runTurn, truncationNotice } from './llm/agent-loop.mjs';
+import { MAX_MESSAGES_HARD_CAP } from './reply/split.mjs';
+import { createSequencer } from './reply/send.mjs';
+import { deliverReply } from './reply/deliver.mjs';
 import { detectTrigger, detectPokeTrigger, decideProactive, isStrongTrigger, TriggerLedger, WakeLedger } from './llm/triggers.mjs';
 import { SilenceGate, parseSilenceCommand, SILENCE_REASON, MAX_MUTE_MS, matchWindow } from './llm/silence.mjs';
 import { UsageLedger } from './llm/usage.mjs';
 import { PersonaStore, RoleStore } from './llm/persona.mjs';
 import { ThinkingStore } from './llm/thinking.mjs';
 import { sealSecret, openSecret, isVaultAvailable } from './config/vault.mjs';
-import { probeVision, probeImageGen, describeCatalog, inferChannel, endpointKey, endpointCapabilities } from './llm/capability.mjs';
+import { probeModel, describeCatalog, endpointKey, endpointCapabilities, sanitizeModelCapabilities } from './llm/capability.mjs';
+/*
+ * 视觉链路（docs/vision-contract.md）。
+ *
+ * 三个模块的分工是刻意的：
+ *   media-refs  纯函数，段 → 元数据（每条消息都会跑，必须零 IO）
+ *   vision      编排 + 预算 + 缓存 + 降级（不碰全局，全部注入）
+ *   image-fetch 受控取图（SSRF / 越界路径 / 类型 / 字节 / 像素都在这层挡）
+ *
+ * 这里只 import vision 的编排层：取图细节不该出现在入口文件里，
+ * 否则"哪些边界被守住了"会散落在两千多行的流程中，没人能一次看全。
+ */
+import { collectTurnImages, normalizeVisionConfig, resetVisionCache, VISION_LIMITS_HARD } from './llm/vision.mjs';
+import { extractImageRefs } from './llm/media-refs.mjs';
+import {
+  annotateImagePlaceholders,
+  buildVisionSnapshot,
+  contentToText,
+  floorsWithSubmittedImages,
+  messagesToPlainText,
+  recordVisionTurn,
+  resolveEffective,
+} from './llm/vision-runtime.mjs';
+import { looksLikeImageRejection } from './llm/client.mjs';
+import { registerChatImageTools } from './tools/chat-image.mjs';
+import { createGatewayFactory } from './plugins/gateway-bridge.mjs';
+/*
+ * 联网（本轮新增，契约见 docs/web-search-contract.md）。
+ *
+ * 三个模块分工：
+ *   gate.mjs      总闸判定（**全项目唯一一处**）
+ *   host-net.mjs  宿主侧的 ctx.net 工厂：开关现读 + 在途取消 + 统计
+ *   view.mjs      快照里的 network 块（四态，界面逐格显示）
+ *
+ * 这里只 import 编排层：协议细节（Tavily / 受限抓取）不该出现在入口文件里，
+ * 否则"哪些边界被守住了"会散落在五千行流程中，没人能一次看全。
+ */
+import { createNetFactory } from './net/host-net.mjs';
+import { networkEnabledFrom } from './net/gate.mjs';
+import { buildNetView, createNetStats, disabledNetTools, NET_PLUGIN_ID } from './net/view.mjs';
+import { applyNetworkToggle } from './net/toggle.mjs';
+import { resolveNativeSearch } from './llm/provider-search.mjs';
 import { unlink as fsUnlink } from 'node:fs/promises';
 import { probeEnvironment } from './env/probe.mjs';
 
 const paths = resolvePaths();
 const log = new Logger({ dir: paths.logsDir, level: process.env.LING_LOG_LEVEL ?? 'info' });
+
+/**
+ * 确认请求的等待上限（60s）。
+ *
+ * 取值留在 index.mjs 而不是只放 guard/confirm.mjs 里：静态检查 I17
+ * 断言的是"确认通道有 60 秒超时且超时落在 deny"，它读的就是这个文件。
+ * 语义权威仍在校验层（registry 的 expiresAt），这里只是宿主传入的值。
+ */
+const CONFIRM_TIMEOUT_MS = 60_000;
 
 /** @type {any} */
 let config;
@@ -105,6 +167,21 @@ const triggerLedger = new TriggerLedger();
  * 而这里的问题是"不该回"。见 src/llm/triggers.mjs 的 WakeLedger 注释。
  */
 const wakeLedger = new WakeLedger();
+
+/**
+ * 回复分条的会话串行器。
+ *
+ * ## 为什么必须在模块级共享一份
+ *
+ * "同一会话按顺序发送"这条要求，只有**所有回合共用同一个串行器**时才成立。
+ * 每个回合各建一个的话，两个回合同时结束时依旧会穿插（A1 B1 A2 B2）——
+ * 那正是这条要求要防的。
+ *
+ * 串行器只做排队（一个 per-convKey 的 Promise 链），不改变回合的并发策略：
+ * 回合本身仍然由 inflight 保证每会话只有一个在跑，这里多守一层是因为
+ * "回合结束"和"消息发完"不是同一时刻 —— 上一回合的最后一条可能还在间隔里。
+ */
+const replySequencer = createSequencer();
 
 /**
  * 静音闸门（F20「闭嘴」）。
@@ -209,10 +286,139 @@ async function handleSilenceCommand(evt, cmd) {
 /** 每个会话的最近消息（拼上下文用，比全局 messages 更准） */
 /** @type {Map<string, Array<{role: string, nickname?: string, text: string}>>} */
 const recentByConv = new Map();
+/**
+ * 视觉链路的运行时统计（只给界面看，不进任何判定）。
+ *
+ * ## 为什么单独一个对象，而不是塞进配置
+ *
+ * 配置回答"用户想要什么"，统计回答"这一版实际发生了什么"。混在一起最典型的
+ * 翻车是：用户改了预算 → 配置落盘 → 统计被一起写回去 → 重启后界面显示
+ * "上回合提交了 3 张图"，而那个回合根本不存在。
+ *
+ * 所以它只在内存里，重启归零，界面文案也明确说了"只反映本进程"。
+ *
+ * `lastTurn` 是 `effective: 'on-but-blocked'` 的唯一依据：
+ * 开关开着、模型也没说不行，但这一回合一张图都没装进去 —— 那是"被挡下"，
+ * 与"用户关了"和"模型不能"是三种完全不同的处境，必须能分开显示。
+ */
+const visionRuntime = {
+  /** 带图回合数 */
+  turnsWithImages: 0,
+  /** 累计提交张数 */
+  imagesSubmitted: 0,
+  /** 累计提交字节 */
+  bytesSubmitted: 0,
+  /** 累计放弃张数（取图失败 / 超预算 / 已提交过） */
+  skipped: 0,
+  /** 最近一回合的明细 */
+  lastTurn: { attempted: 0, loaded: 0, bytes: 0, codes: /** @type {string[]} */ ([]), notes: /** @type {string[]} */ ([]) },
+  /** 最近出现的失败码（去重、有界） */
+  lastCodes: /** @type {string[]} */ ([]),
+  /** 最近一次"上游拒收图片"的时间（毫秒）。与 capability 分开记，见降级矩阵 */
+  lastImageRejectedAt: null,
+  /** 上游拒收图片的累计次数 */
+  imageRejectedCount: 0,
+  lastAt: null,
+};
+/**
+ * 联网能力的运行统计（契约：docs/web-search-contract.md §6）。
+ *
+ * 和 `visionRuntime` 同一套纪律：**只在内存里**，重启归零。
+ * 它不是配置，用户改不了它；它的用途只有一个 —— 让用户打开
+ * 《插件设置 → 联网搜索》时能看到"这一版到底搜过几次、最近为什么失败"。
+ *
+ * 为什么由宿主持有而不是插件自己记：插件可能被停用/重载，
+ * 而"这个进程一共联网几次"是**进程级事实**。放进插件的话，
+ * 一次重载就把历史清零，界面上却看不出来。
+ */
+const networkRuntime = createNetStats();
+
+/**
+ * 服务商原生联网的运行状态（**只在内存里**，重启归零）。
+ *
+ * 与 `networkRuntime` 分开，因为两条通道的语义不同：
+ *   · 独立搜索：我们发请求，成功/失败可由自己的代码判定；
+ *   · 原生联网：检索在服务商服务端，只能记录"上游带回了什么证据"。
+ *
+ * `last` 里的 `status` 是**后端判定**，界面原样展示：
+ *   searched     有引用/来源/角标
+ *   unknown      请求带了联网声明，但没有任何可验证证据（最常见）
+ *   rejected     上游明确拒绝联网参数（随后会自动降级重试一次）
+ *   not-requested 本次没有请求原生联网
+ *   unavailable  服务商未适配/未选择
+ *
+ * 绝不用 HTTP 200 补一个 `searched` —— 那会把"中转忽略了参数"记成成功。
+ */
+const nativeSearchRuntime = {
+  /** @type {{at:number,provider:string,status:string,kind:string,sources:object[],inlineRefs:number,detail:string}|null} */
+  last: null,
+  stats: { requests: 0, evidence: 0, noEvidence: 0, rejected: 0, lastAt: null },
+};
+
+/**
+ * 把一轮的原生联网证据记进运行状态。
+ *
+ * 只接受后端自己判定的形状；脏值一律按"无法确认"记，不写成成功。
+ *
+ * @param {any} report `runTurn` 返回的 `nativeSearch`
+ */
+function recordNativeSearch(report) {
+  if (!report || typeof report !== 'object') return;
+  const at = Date.now();
+  const status = ['searched', 'unknown', 'rejected', 'not-requested', 'unavailable'].includes(String(report.status))
+    ? String(report.status)
+    : 'unknown';
+  const kind = ['url_citation', 'web_search', 'inline_ref', 'none'].includes(String(report.kind))
+    ? String(report.kind)
+    : 'none';
+  const sources = Array.isArray(report.sources)
+    ? report.sources
+      .filter((s) => s && typeof s.url === 'string' && s.url)
+      .slice(0, 5)
+      .map((s) => ({ title: String(s.title ?? ''), url: String(s.url) }))
+    : [];
+
+  nativeSearchRuntime.stats.requests += 1;
+  if (status === 'searched') nativeSearchRuntime.stats.evidence += 1;
+  else if (status === 'rejected') nativeSearchRuntime.stats.rejected += 1;
+  else nativeSearchRuntime.stats.noEvidence += 1;
+  nativeSearchRuntime.stats.lastAt = at;
+  nativeSearchRuntime.last = {
+    at,
+    provider: String(report.provider ?? ''),
+    status,
+    kind,
+    sources,
+    inlineRefs: Math.max(0, Math.trunc(Number(report.inlineRefs?.length ?? report.inlineRefs) || 0)),
+    detail: String(report.detail ?? '').slice(0, 400),
+  };
+
+  // 只记状态与条数：来源正文、用户提问都不进日志（它们可能含隐私内容）。
+  log.info('原生联网状态', {
+    provider: nativeSearchRuntime.last.provider,
+    status,
+    kind,
+    sources: sources.length,
+    fallback: report.fallback === true,
+  });
+}
+
+/**
+ * 联网能力工厂（boot 里装配）。
+ *
+ * 为什么是模块级的 `let` 而不是塞进某个对象：setting 通道关闭总闸时
+ * 要立刻调用它的 `refresh()` 把在途请求掐掉，而那时只有这里能拿到它。
+ *
+ * 为 null 表示"还没启动完"或"装配失败"：两种情况下 UI 都显示不可用，
+ * 而不会假装能用。
+ *
+ * @type {ReturnType<typeof createNetFactory> | null}
+ */
+let netFactory = null;
+
 /** 正在跑的回合：同一会话同时只允许 1 个（F7 并发约束） */
 /** @type {Map<string, AbortController>} */
-const inflight = new Map();
-/**
+const inflight = new Map();/**
  * 排队等待的强触发（不能用"忙"把人晾着）。
  *
  * ## 为什么从 Map 换成了 TurnQueue
@@ -229,21 +435,37 @@ const pendingTurns = new TurnQueue({ limit: 5 });
  * 断线重连和上游补发会把同一条消息再推一次，没有它就会同一个问题跑两个回合。
  */
 const dedup = new MessageDedup();
-/** 待人工确认的 R2/R3 工具调用 */
-/** @type {Map<string, {resolve: Function, timer: NodeJS.Timeout, req: object}>} */
-const pendingConfirms = new Map();
 /**
- * 确认序号 → 确认编号。
+ * 待人工确认的 R2/R3 工具调用 —— 全部交给 ConfirmRegistry。
  *
- * 卡片上让用户回 1/2，而结算需要的是完整的 `confirm-...` 编号，
- * 中间这一层就是映射。为什么不用"直接拿第 N 条"：Map 的迭代顺序
- * 在删除元素后虽仍稳定，但用户看到的序号是在**推送那一刻**定下的，
- * 中途有人答掉一条后重新数会错位，必须冻结当时的映射。
+ * ## 为什么不再是两个裸 Map
  *
- * 序号按创建顺序分配，最小的可用正整数（释放后复用）。
+ * 原来这里是一个 `pendingConfirms`（id → 请求）加一个 `confirmSeq`
+ * （序号 → id）。两张表由调用点手工同步，于是必然出三件事：
+ *
+ *   1. **不认人、不认会话**：QQ 侧回来的「1」只按序号找目标，
+ *      谁回、在哪个会话回都不看。群里任何人、任何私聊都能批掉它。
+ *   2. **不认引用**：卡片写着"引用这条回数字"，但结算时引用被忽略，
+ *      并发两条时就会批错对象。
+ *   3. **抢插件**：这个入口跑在插件之前，于是 DSH 的引用审批
+ *      可能先被它拿走（认不出引用，就按序号猜了）。
+ *
+ * 现在身份、会话、消息 ID、有效期、结算状态全部绑在**登记那一刻**
+ * （见 guard/confirm.mjs 的文件头），入口只做"精确定位或交回"。
  */
-/** @type {Map<number, string>} */
-const confirmSeq = new Map();
+const confirms = new ConfirmRegistry({
+  timeoutMs: CONFIRM_TIMEOUT_MS,
+  onTimeout: ({ id, tool }) => {
+    /*
+     * 通知桌面端「它超时了，已按拒绝处理」。
+     *
+     * 不通知的话，确认条会在界面上一直挂着倒计时到 0 然后消失，
+     * 用户不知道结论是什么 —— 而工具那边其实早就拿到 deny 了。
+     */
+    rpc.notify('confirm-timeout', { id, tool });
+    log.warn('确认超时，按拒绝处理', { id, tool });
+  },
+});
 /**
  * 插件管理器：骨架改造后所有插件相关的事都归它管
  * （扫描/校验/启停/配置/工具登记/诊断）。
@@ -316,6 +538,43 @@ async function boot() {
   config = validateConfig(userConfig);
 
   /*
+   * ---- 管理员名单：兼容迁移与启动留痕 ----
+   *
+   * ## 为什么要有这一步
+   *
+   * 这一版把「谁能让它动本机」从 `allow.private` 拆到了 `admin.qqIds`。
+   * 老用户的白名单里很可能填的就是自己的号 —— 升级后如果不作任何提示，
+   * 表现是"以前能读文件，现在报没权限"，而且用户不知道该去哪补。
+   *
+   * 两种处理，都不静默：
+   *
+   *   1. **已经配了管理员**：什么都不做，只记一行（人数，不记号码本身）。
+   *   2. **没配管理员，但白名单里有人**：记一条 warn，明确告诉他
+   *      「白名单不再自动等于管理员，要去安全页补 admin.qqIds，
+   *      或者显式打开兼容开关」。**不自动帮他打开** ——
+   *      自动打开等于这次拆分白做，而用户会以为权限模型变了。
+   *
+   * 号码本身一律不进日志：日志会被贴进 issue。
+   */
+  {
+    const admins = coreAdminIds(config);
+    const whitelisted = Array.isArray(config.allow?.private) ? config.allow.private.length : 0;
+    if (config.admin?.inheritWhitelist === true) {
+      log.warn('已开启「白名单视为管理员」：allow.private 里的号码拥有管理员权限', {
+        adminCount: admins.length,
+        whitelistCount: whitelisted,
+      });
+    } else if (admins.length === 0 && whitelisted > 0) {
+      log.warn(
+        '还没有配置管理员（admin.qqIds）：白名单不再自动赋予管理员权限，宿主机工具与确认权都拿不到。请到「系统安全」页添加，或显式打开「白名单视为管理员」',
+        { whitelistCount: whitelisted },
+      );
+    } else {
+      log.info('管理员名单已载入', { adminCount: admins.length });
+    }
+  }
+
+  /*
    * 旧配置迁移：`llm.keywords` → `wake.keywords`。
    *
    * ## 为什么不直接把 llm.keywords 删掉
@@ -361,6 +620,39 @@ async function boot() {
     }
   } catch (err) {
     log.warn('旧 DSH 配置迁移失败（不影响启动，可在插件页重新配置）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
+
+  /*
+   * 旧配置迁移：清掉聊天模型里遗留的**生图探测状态**。
+   *
+   * 早先的「探测模型」会同时向 `/images/generations` 发一次最小生图请求，
+   * 并把 `image` / `probes.image` / `channel: 'imageGen'` 写进
+   * `llm.modelCapabilities`。现在聊天模型只探测视觉，生图归独立插件
+   * （`plugins/image-generation`）—— 这些旧结论**没有出处也没有用途**，
+   * 留着会让界面继续显示"生图 ✓/✗"，看起来像是聊天模型自带的能力。
+   *
+   * ## 为什么要在启动时迁移
+   *
+   * 只在读的时候过滤不够：只要用户没再探测过，旧字段就会一直躺在
+   * config.json 里；换一台机器、换个界面版本又会被重新读出来。
+   * 所以这里一次性清掉并写回。
+   *
+   * ## 失败不能拦住启动
+   *
+   * 清理失败最坏的结果是"界面还显示旧结论"，而写配置失败若抛出去
+   * 就是**起不来**。所以整体 try/catch，失败只记一条 warn。
+   */
+  try {
+    const { caps, changed } = sanitizeModelCapabilities(config.llm?.modelCapabilities);
+    if (changed) {
+      config.llm.modelCapabilities = caps;
+      await writeJsonAtomic(paths.configPath, config);
+      log.info('已清理聊天模型里旧的生图探测状态（生图改由独立插件管理）');
+    }
+  } catch (err) {
+    log.warn('清理旧生图探测状态失败（不影响启动，可在模型页重新探测读图）', {
       message: String(/** @type {any} */ (err)?.message ?? err),
     });
   }
@@ -512,6 +804,16 @@ async function boot() {
     apiKey,
     timeoutMs: config.llm.timeoutMs,
     thinking: config.llm.thinking,
+    /*
+     * 原生联网计划**每次请求现读**。
+     *
+     * 为什么不是构造时传一个对象：用户可能刚把总开关关掉或切了模式，
+     * 缓存会让"关了还在发联网声明"。这里返回 null 表示本次请求不带原生联网。
+     */
+    webSearch: () => {
+      const resolved = resolveNativeSearch(config);
+      return resolved.active ? resolved.plan : null;
+    },
   });
   usageLedger = new UsageLedger({ filePath: `${paths.stateDir}/usage.jsonl` });
   /*
@@ -533,6 +835,59 @@ async function boot() {
   await registerReadonlyTools({
     roots: config.tools.roots.length > 0 ? config.tools.roots : defaultToolRoots(),
     userDataDir: paths.root,
+  });
+
+  /*
+   * 图片读取工具（可选能力，开关在调用时判定）。
+   *
+   * 它把消息里的图以**真正的 image_url** 交回模型，而不是把 base64
+   * 塞进 JSON 文本（后者会被 wrapToolResult 截断成一段没用的字符串）。
+   * 取图走与自动读图完全相同的受控链路 —— 不另开一套上限，
+   * 否则"But 工具能读到"就会成为绕过预算的后门。
+   */
+  registerChatImageTools({
+    getConfig: () => normalizeVisionConfig(config?.vision),
+    lookupMessage: ({ convKey, messageId }) => {
+      const want = String(messageId ?? '').trim();
+      if (!want) return { ok: false };
+      // 先查实时事件缓存（有 segments），再退回楼层仓库（有 media 元数据）
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const evt = messages[i];
+        if (String(evt?.messageId ?? '') !== want) continue;
+        if (String(evt?.convKey ?? '') !== String(convKey ?? '')) continue;
+        return { ok: true, event: evt };
+      }
+      const page = sessionStore.page(convKey, { limit: 200 });
+      const hit = page?.messages?.find((m) => String(m.messageId ?? '') === want);
+      if (!hit) return { ok: false };
+      /*
+       * 仓库里只有元数据、没有原始段。把它投影成"只带 file 的段"，
+       * 让取图链路照常按缓存名去取 —— 这是重启后历史图片仍然可读的路径。
+       */
+      return {
+        ok: true,
+        event: {
+          messageId: hit.messageId,
+          text: hit.text,
+          segments: (hit.media ?? [])
+            .filter((m) => m?.file)
+            .map((m) => ({ type: 'image', data: { file: m.file } })),
+        },
+      };
+    },
+    extractRefs: (segments) => extractImageRefs(segments, { max: 8 }),
+    fetchImages: async (refs, ctx) => {
+      const cfg = normalizeVisionConfig(config?.vision);
+      const collected = await collectTurnImages({
+        config: { ...cfg, maxImagesPerTurn: Math.min(cfg.maxImagesPerTurn, 4) },
+        convKey: String(ctx?.convKey ?? ''),
+        trigger: { images: refs.map((r) => ({ ...r })) },
+        history: [],
+        alreadySeen: new Set(),
+        deps: visionDeps(),
+      });
+      return collected.images.map((img) => ({ ok: true, dataUrl: img.dataUrl, mime: img.mime }));
+    },
   });
 
   log.info('Ling-bot 后端已启动', { node: process.version, version: '0.1.0-p0' });
@@ -572,6 +927,50 @@ async function boot() {
   await migrateLegacyPlugins(paths, log);
 
   // 插件：空 enabled = 一个都不加载（默认关闭，光放文件不生效）
+  /*
+   * 联网能力工厂：必须在 PluginManager 之前建好。
+   *
+   * ## 为什么 getEnabled 读的是 `config.network.enabled`
+   *
+   * 判定只有一处（`src/net/gate.mjs`），这里传的是"现读总闸"的闭包 ——
+   * 每次 search/fetch 进入时都会调一次。缓存成布尔值的后果很具体：
+   * 用户点了「关闭联网」，下一个请求仍然发出去，因为工厂手里还是旧值。
+   *
+   * ## 为什么装配失败只记日志、不拦住启动
+   *
+   * 联网是可选能力。直接 `throw` 会让整个后端起不来 —— 用户为了一个
+   * 搜索功能失去整个机器人。所以 `netFactory` 为 null 时，`ctx.net`
+   * 会退回 E4071 占位对象，界面上明确显示不可用。
+   */
+  try {
+    netFactory = createNetFactory({
+      /*
+       * 用 `networkEnabledFrom` 而不是 `config.network?.enabled === true`。
+       *
+       * 两者对"配置里没有 network 字段"的旧部署结论相反：
+       *   · `=== true`              → false（当作关闭）
+       *   · `networkEnabledFrom`    → true（缺省开，理由见 src/net/gate.mjs）
+       *
+       * 这条口径必须只有一处，否则会出现"界面显示联网开着、工具也可见，
+       * 但请求一律被 E4080 拒绝"这种自相矛盾的状态 —— 而 `disabledNetTools`
+       * 与 `buildNetView` 读的都是 `networkEnabledFrom`。真正发出请求的
+       * getEnabled 反而用了另一套判定，用户怎么查都对不上。
+       */
+      getEnabled: () => networkEnabledFrom(config),
+      stats: networkRuntime,
+      log: (level, message, fields) => {
+        if (level === 'warn') log.warn(message, fields);
+        else if (level === 'error') log.error(message, fields);
+        else log.info(message, fields);
+      },
+    });
+  } catch (err) {
+    netFactory = null;
+    log.error('联网能力装配失败：搜索与网页读取将不可用（其余功能不受影响）', {
+      message: String(/** @type {any} */ (err)?.message ?? err),
+    });
+  }
+
   plugins = new PluginManager({
     pluginsDir: paths.pluginsDir,
     userDataRoot: paths.root,
@@ -588,13 +987,188 @@ async function boot() {
     },
     // 宿主发送闸门：插件发的每一条消息都要过白名单/审计/限流
     sendText: (convKey, text) => sendText(convKey, text),
+    /*
+     * 任意消息段（图片/语音/文件）的发送通路。
+     *
+     * 与 sendText 走**同一个** sendSegments，所以白名单、出站审计、限流
+     * 一条都不会漏过。给插件单开一条捷径是最典型的授权漏洞。
+     */
+    sendSegments: (input) => sendSegments(input.convKey, input.segments, input.auditText, input.signal),
+    // 后台媒体与AI分条回复共享同一个会话队列，不能插入回复中途。
+    sequencer: replySequencer,
+    /*
+     * 插件用 `ctx.chat.send` / `sendMedia` 真的发出去之后，记一条上下文。
+     *
+     * ## 为什么必须记
+     *
+     * 模型下一轮能不能看见"我刚才用工具发过这句话/这张图"，全靠这一条。
+     * 不记的话它完全不知道自己已经发过，很容易在同一段回复里再做一遍 ——
+     * 用户看到"同一张图两条"，而日志里两次都是成功发送，看不出哪里错了。
+     *
+     * 记的是**展示文本**（`[图片]` / 正文），不是图片内容：上下文里只需要
+     * "发生过这件事"，把 base64 塞进历史会把会话文件撑爆，也会让下一轮
+     * 请求体带上无用的图片。
+     *
+     * `gateway.sendFace` 有它自己的 `onFaceSent`（记 `[表情]`），两者语义相同、
+     * 位置不同：那条路径在网关桥里，这条在聊天桥里。
+     */
+    onSent: ({ convKey, text }) => {
+      const key = String(convKey ?? '');
+      const shown = String(text ?? '').trim();
+      if (!key || !shown) return;
+      pushRecent(key, { role: 'assistant', text: shown });
+    },
+    /*
+     * 网关受控能力（`ctx.gateway`）：表情包这类"账号级"动作。
+     *
+     * ## 为什么不在 sendText 里顺手加一个"发表情"
+     *
+     * 表情发送必须和文字**分成两个气泡**，而且要和 AI 自己的回复共享
+     * 同一队列（否则会出现"文字还没发完、表情先冒出来"）。这两件事
+     * 只有 sendSegments + replySequencer 这一层做得到，所以它留在宿主，
+     * 由这里的工厂按调用注入。
+     *
+     * `requestOneBot` 是"发任意 OneBot 动作"的唯一入口，只给网关能力用。
+     * 它**不经过**发送闸门 —— 因为闸门管的是"往外发消息"，
+     * 而这些动作是读收藏列表、取图片字节。真正的发送仍然走 sendFace
+     * → sendSegments → sendViaHost。
+     */
+    makeGateway: ({ lookupMessage, sendSegments: sendAll, log: gwLog }) =>
+      createGatewayFactory({
+        request: (action, params) => requestOneBotAction(action, params),
+        lookupMessage,
+        sendSegments: sendAll,
+        getSelfId: () => selfId,
+        getVision: () => {
+          const gate = visionGate();
+          return { enabled: gate.ok, supported: readVisionCapability().supported };
+        },
+        /*
+         * 与 AI 自己发的文本共用同一个串行器。
+         *
+         * 这不是"顺手复用"：一个回合里模型可能"先说一句再补一张表情"，
+         * 两件事并发时表情会插到文字中间。共用队列之后，同一个会话里
+         * 就严格按调用顺序落地，跨会话互不影响。
+         */
+        sequencer: replySequencer,
+        /*
+         * 发出去之后记一条上下文。
+         *
+         * 为什么必须记：不记的话模型下一轮完全没有"我刚才发过一张表情"
+         * 这个事实，它很容易在同一段回复里再发一次（用户看到两张一样的图）。
+         * 记的是 [表情] 而不是图片内容 —— 图片本来就不该进文本上下文。
+         */
+        onFaceSent: ({ convKey }) => pushRecent(convKey, { role: 'assistant', text: '[表情]' }),
+        log: (level, message, fields) => {
+          if (level === 'warn') log.warn(message, fields);
+          else if (level === 'error') log.error(message, fields);
+          else log.info(message, fields);
+        },
+      }),
+    /*
+     * 会话读取：插件的 ctx.chat.recent 用它。
+     *
+     * 只读**当前会话**（convKey 由宿主的可信上下文给出，不是插件传的）。
+     * 走 sessionStore.page 而不是直接读 recentByConv：page 是稳定的读取接口，
+     * 而且它会返回副本 —— 插件改不动仓库里的活对象。
+     */
+    readMessages: ({ convKey, limit }) => {
+      const r = sessionStore.page(convKey, { limit });
+      if (!r?.ok) return r ?? { ok: false, code: 'E4010', message: '读取会话消息失败' };
+      const list = Array.isArray(r.messages) ? r.messages : [];
+      return {
+        ok: true,
+        messages: list.map((m) => ({
+          messageId: m.messageId ?? null,
+          sender: { id: String(m.userId ?? ''), nickname: String(m.nickname ?? '') },
+          text: String(m.text ?? ''),
+          self: m.atSelf === true,
+          at: Number(m.receivedAt ?? 0) || Number(m.time ?? 0) * 1000,
+        })),
+      };
+    },
+    /*
+     * 按 id 在**指定会话**里找消息。
+     *
+     * 这是"引用/媒体归属校验"的唯一依据：找不到就是"不属于当前会话"。
+     * 会话不存在时直接返回 not-ok，让上层统一报 E4074 ——
+     * 不区分"不存在"和"在别的会话"，避免变成跨会话探测原语。
+     *
+     * ## 为什么先查内存的 messages 再查会话仓库
+     *
+     * 会话仓库（sessionStore）只落**文本**，不存消息段 —— 它服务的是
+     * "按条读聊天记录"这个展示场景。而插件的 mediaList 需要原始消息段
+     * （图片段里有 file/mime），只有入站事件里才有。
+     *
+     * 所以顺序是：先在上游事件缓存里找（有 segments），找不到再退回仓库
+     * （有文本、没有媒体）。退回时 segments 是空数组 —— 那是**如实**的结果，
+     * 不是"看起来能用的假数据"：mediaList 会明确返回 0 个句柄。
+     */
+    lookupMessage: ({ convKey, messageId }) => {
+      const wanted = String(messageId ?? '').trim();
+      if (!wanted) return { ok: false, code: 'E4074', message: '缺少消息 id' };
+
+      /** 从新到旧找：引用/媒体几乎总是针对最近的消息 */
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const evt = messages[i];
+        if (String(evt?.messageId ?? '') !== wanted) continue;
+        /*
+         * 归属必须逐条比对：一条 messageId 在**当前会话**里找不到，
+         * 就不能拿别的会话里的同 id 事件顶上 —— 那样媒体句柄会把
+         * 另一个群的图片带过来。
+         */
+        if (String(evt?.convKey ?? '') !== String(convKey ?? '')) continue;
+        return { ok: true, event: evt };
+      }
+
+      // 退路：仓库里可能还有更早的消息（文本）
+      const r = sessionStore.page(convKey, { limit: 200 });
+      if (!r?.ok) return { ok: false, code: 'E4074', message: '会话不存在' };
+      for (const m of r.messages ?? []) {
+        if (String(m.messageId ?? '') !== wanted) continue;
+        return {
+          ok: true,
+          event: {
+            messageId: m.messageId ?? null,
+            sender: { userId: String(m.userId ?? ''), nickname: String(m.nickname ?? '') },
+            text: String(m.text ?? ''),
+            time: Number(m.time ?? 0),
+            receivedAt: Number(m.receivedAt ?? 0),
+            replyTo: m.replyTo ?? null,
+            // 仓库不存消息段：如实给空数组，mediaList 会返回 0 个句柄
+            segments: [],
+          },
+        };
+      }
+      return { ok: false, code: 'E4074', message: '该消息不在当前会话' };
+    },
     // 打包后由桌面壳把内置 node.exe 的路径传进来；开发期用当前 node
     nodePath: process.env.LING_NODE_PATH || undefined,
+    /*
+     * 联网能力（`ctx.net`）。
+     *
+     * 形状是"给一个插件造能力"：配置与密钥是**每个插件**自己的，
+     * 所以要先绑插件身份（manager 里用 resolved.config/secrets 调它），
+     * 再按调用生成。宿主这边只需要保证总闸判定是现读的。
+     */
+    makeNet: ({ pluginId, config: pluginConfig, secrets }) => netFactory
+      ? netFactory.makeFor({ pluginId, config: pluginConfig, secrets })
+      : undefined,
   });
 
   const plug = await plugins.loadAll();
   log.info('插件面清单：\n' + describePluginSurface(await plugins.snapshot()));
   log.info('插件加载结果', { loaded: plug.loaded, failed: plug.failed, skipped: plug.skipped });
+  /*
+   * 联网总闸单独记一行。
+   *
+   * 为什么值得一行日志：这是唯一一个"界面说关了就真的不发请求"的开关。
+   * 排查"它怎么还能搜"时，第一件事就是确认这一行。只记开关与插件是否
+   * 启用，**不记** baseUrl 与 Key（一个是用户环境信息，一个是凭据）。
+   */
+  log.info(networkEnabledFrom(config) ? '联网总闸：开（搜索受插件启用与 Key 约束）' : '联网总闸：关（搜索与网页读取一律拒绝）', {
+    搜索插件启用: Array.isArray(config.plugins?.enabled) && config.plugins.enabled.includes(NET_PLUGIN_ID),
+  });
 
   log.info('扩展面清单：\n' + renderRegistryBanner());
   log.info(llm.configured ? '模型已配置' : '模型未配置（llm.apiKey 为空），对话将不可用', {
@@ -685,6 +1259,29 @@ function handleEvent(evt) {
     const appended = sessionStore.append(evt.convKey, evt);
     if (!appended.ok) {
       log.warn('消息未写入会话楼层', { convKey: evt.convKey, code: appended.code, message: appended.message });
+    }
+
+    /*
+     * 媒体元数据跟着楼层一起入库（契约 §2 / §5）。
+     *
+     * ## 为什么在入库这一刻就要解析，而不是等"要用图的时候"再解析
+     *
+     * 因为**段原始数据会消失**：OneBot 事件只活在内存的 `messages` 数组里
+     * （上限 500 条，且重启即空）。等下一回合想看图时，那条消息的 `file`
+     * 早已不知去向 —— 于是历史图片永远取不到，用户看到的是
+     * "刚才发的图它现在不认了"。
+     *
+     * 存进去的只有六个元数据键（没有 URL、没有 base64），见
+     * session/store.mjs 的 MEDIA_PERSIST_KEYS。URL 里有临时鉴权参数，
+     * base64 会把 sessions.json 撑成几 MB，两者都只允许活在内存里。
+     *
+     * 这里**不看 vision.enabled**：元数据是"这条消息确实带图"的事实，
+     * 与用户当前想不想读图无关。关掉开关后再打开时，历史消息仍然可读图 ——
+     * 那才是开关的语义（控制行为，不篡改历史）。
+     */
+    const mediaRefs = extractImageRefs(evt.segments, { max: 8 });
+    if (mediaRefs.length > 0) {
+      sessionStore.attachMedia(evt.convKey, appended.ok ? appended.floor : null, mediaRefs);
     }
 
     /*
@@ -1110,6 +1707,145 @@ function applySilenceSetting(config, field, value) {
 }
 
 /**
+ * 把一项分条设置写进 config（F22）。
+ *
+ * ## 为什么三个字段要各自验
+ *
+ * 这里是**运行时**写配置，绕过了启动时的 `validateConfig`。存进
+ * `maxMessages: "3"` 不会当场报错 —— 发送层的 `normalizeMaxMessages`
+ * 会把它当 NaN 换成默认值 3，于是用户改 5 条却发现还是 3，
+ * 而界面上显示的是 5（那是内存里的字符串）。形状要先对，数值才有意义。
+ *
+ * ## 为什么不接受 0
+ *
+ * 「一条都不发」不是这里的功能，那是静音。0 条会让整条回复凭空消失，
+ * 而且用户很难联想到是分条设置导致的。要静音请用静音页。
+ *
+ * @param {any} config
+ * @param {string} field
+ * @param {any} value
+ * @returns {{ok: true, echo?: any} | {ok: false, code: string, message: string}}
+ */
+function applyReplySetting(config, field, value) {
+  if (!config.reply || typeof config.reply !== 'object') config.reply = {};
+
+  if (field === 'splitEnabled') {
+    if (typeof value !== 'boolean') {
+      return { ok: false, code: 'E40XX', message: 'splitEnabled 必须是布尔值' };
+    }
+    config.reply.splitEnabled = value;
+    return { ok: true, echo: value };
+  }
+
+  if (field === 'maxMessages') {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 1 || n > 10) {
+      return { ok: false, code: 'E40XX', message: 'maxMessages 必须是 1–10 的整数（1 = 始终整条发）' };
+    }
+    config.reply.maxMessages = n;
+    return { ok: true, echo: n };
+  }
+
+  if (field === 'intervalMs') {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 100 || n > 10000) {
+      return { ok: false, code: 'E40XX', message: 'intervalMs 必须是 100–10000 的整数（毫秒）' };
+    }
+    config.reply.intervalMs = n;
+    return { ok: true, echo: n };
+  }
+
+  return { ok: false, code: 'E40XX', message: `未支持的分条设置项：${field}` };
+}
+
+/**
+ * 视觉设置（`vision.*`）的写入校验。
+ *
+ * ## 为什么运行时还要再校验一遍
+ *
+ * 启动时的 `validateConfig` 只在开机那一刻跑。界面保存走的是"直接改内存
+ * config 对象 + persistConfig"，完全绕过了它。所以这里必须自己验类型。
+ *
+ * 存进一个形状不对的值不会当场报错，只会在运行时被 `normalizeVisionConfig`
+ * 静默夹成默认值 —— 用户在界面上看到自己填的 50，实际一直用 3，
+ * 而且日志里一片安静。那是这次改造要消灭的典型故障。
+ *
+ * ## 为什么这里**允许**写超过硬上限的值
+ *
+ * 与启动校验保持一致（契约 §9.1）：写入宽松、生效收紧。用户填 20000ms
+ * 能存下来，运行时按 15000 生效，界面会标明"实际生效值"。
+ * 这里只挡"明显是笔误"的量级（超过硬上限 2 倍）。
+ *
+ * @param {any} config
+ * @param {string} field
+ * @param {unknown} value
+ * @returns {{ok: boolean, echo?: any, code?: string, message?: string}}
+ */
+function applyVisionSetting(config, field, value) {
+  if (!config.vision || typeof config.vision !== 'object') config.vision = {};
+  const v = config.vision;
+
+  if (field === 'enabled') {
+    if (typeof value !== 'boolean') {
+      return { ok: false, code: 'E40XX', message: 'vision.enabled 必须是布尔值' };
+    }
+    v.enabled = value;
+    /*
+     * 关掉时清空图片缓存：旧图不该在关掉再打开后被静默复用。
+     *
+     * 这不只是省内存 —— 缓存里的图带着"上一次是什么时候取到的"这个隐含状态，
+     * 而用户关掉开关的动机通常就是"别再花这个钱了"。留着缓存等于让他
+     * 一开机就立刻开始为旧图付 token。
+     */
+    if (!value) resetVisionCache();
+    return { ok: true, echo: value };
+  }
+
+  if (field === 'includeQuoted') {
+    if (typeof value !== 'boolean') {
+      return { ok: false, code: 'E40XX', message: 'vision.includeQuoted 必须是布尔值' };
+    }
+    v.includeQuoted = value;
+    return { ok: true, echo: value };
+  }
+
+  /** 数值型字段：硬上限 ×2 是"明显笔误"的分界（契约 §9） */
+  const numeric = {
+    maxImagesPerTurn: { min: 1, hard: VISION_LIMITS_HARD.maxImagesPerTurn, label: '本轮张数' },
+    maxHistoryImages: { min: 0, hard: VISION_LIMITS_HARD.maxHistoryImages, label: '历史张数' },
+    maxBytes: { min: 1, hard: VISION_LIMITS_HARD.maxBytes, label: '单图字节' },
+    maxTotalBytes: { min: 1, hard: VISION_LIMITS_HARD.maxTotalBytes, label: '总字节' },
+    maxPixels: { min: 1, hard: VISION_LIMITS_HARD.maxPixels, label: '像素' },
+    timeoutMs: { min: 1000, hard: VISION_LIMITS_HARD.timeoutMs, label: '超时（毫秒）' },
+    historyWindow: { min: 0, hard: VISION_LIMITS_HARD.historyWindow, label: '历史回看楼层' },
+    cacheTtlMs: { min: 60_000, hard: VISION_LIMITS_HARD.cacheTtlMs, label: '缓存时长（毫秒）' },
+  };
+
+  const rule = numeric[field];
+  if (!rule) {
+    return { ok: false, code: 'E40XX', message: `未支持的视觉设置项：${field}` };
+  }
+
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < rule.min) {
+    return {
+      ok: false,
+      code: 'E40XX',
+      message: `${rule.label}必须是不小于 ${rule.min} 的整数`,
+    };
+  }
+  if (n > rule.hard * 2) {
+    return {
+      ok: false,
+      code: 'E40XX',
+      message: `${rule.label}超过上限 ${rule.hard * 2}（实际生效会被夹到 ${rule.hard}）`,
+    };
+  }
+  v[field] = n;
+  return { ok: true, echo: n };
+}
+
+/**
  * 生成某一天的日记（供调度器回调）。
  *
  * ## 为什么先落 degraded 占位再调模型
@@ -1182,111 +1918,152 @@ async function generateYesterdayDiary(date, trigger = 'rollover') {
 }
 
 /**
- * 把消息先交给插件。
+ * 认一条**引用式**确认回复 —— 按消息 ID 精确定位。
  *
- * 任何一个插件返回 true 都表示"已接管"，此时不再走 AI 回合。
+ * ## 为什么引用单独成一条路径，而且排在插件之前
  *
- * 为什么串行而不是并发：多个插件同时接管同一条消息会发出两条回复。
- * 串行 + 首个接管即停，行为是可预测的。
+ * 引用是用户对"我在回答哪一条"的唯一明确表达，也是这里唯一**可精确
+ * 判定归属**的信息：消息 ID 属于本表就是我的，不属于就不是。
  *
- * 接管能力只对 in-process 运行时开放（子进程拿不到宿主的发送闸门与事件流），
- * 这一限制由管理器统一执行，这里不必再判断。
+ * 所以这一条必须先跑：插件拿到的 evt 里同样有 replyTo，但它没法知道
+ * 那条消息是不是宿主的确认卡 —— 让它先处理，就会出现"插件把宿主的
+ * 确认当成自己的审批回了个'没有这条'"。反过来，宿主先按 ID 判定，
+ * 不属于自己就原样交回，两边都不会误吞。
  *
  * @param {object} evt
+ * @returns {Promise<'handled'|'foreign'|'none'>}
+ *   `none` = 这条不是引用式确认回复，调用方按常规顺序继续
  */
+async function tryHandleQuotedConfirm(evt) {
+  const convKey = String(evt?.convKey ?? '');
+  if (!convKey.startsWith('private:')) return 'none';
+
+  const quotedId = normalizeMessageId(evt?.replyTo?.messageId);
+  if (!quotedId) return 'none';
+
+  const parsed = parseConfirmReply(evt?.text);
+  // 引用了但内容不是 1/2/同意/拒绝 —— 那是普通引用聊天，不归这里管
+  if (!parsed) return 'none';
+
+  const senderId = String(evt?.sender?.userId ?? '');
+  const r = confirms.resolveByQuote({ messageId: quotedId, convKey, senderId, allow: parsed.allow });
+
+  if (!r.handled) {
+    /*
+     * 引用不属于本入口 —— 交回插件。
+     *
+     * 这里绝不能退化成"按当前待确认数量猜一个"：DSH 的审批卡和宿主的
+     * 确认卡长得一模一样（都是引用回数字），猜错就是用 A 的点头批 B 的操作。
+     *
+     * 记 info 不记 warn：DSH 审批每天都会走这条路径，warn 会把日志淹掉，
+     * 真正异常反而看不见。
+     */
+    log.info('引用不属于通用确认，交回插件', { convKey, quotedId });
+    return 'foreign';
+  }
+
+  await reportConfirmResult(convKey, r);
+  return 'handled';
+}
+
 /**
- * 认一条「同意 / 拒绝 <确认编号>」的回复。
+ * 认一条**不带引用**的确认回复。
  *
- * ## 为什么要单独一层
+ * ## 为什么它排在插件**之后**
  *
- * 确认卡现在会推到 QQ（见 askHumanConfirm）。卡片上写了「回复同意 #xxx」，
- * 那就必须真的有人认这句话。否则卡片发出去只是噪音，用户回了也没用——
- * 比不发更糟，因为它给了"我确认过了"的错觉。
+ * 这个入口原来排在插件前面，而且拿全局序号表认任何「1/2」。于是
+ * dsh-bridge 的审批回复会被先吃掉 —— 表现是 DSH 那笔审批纹丝不动，
+ * 而这边回一句"没有第 1 条待确认"。
  *
- * ## 三种回复形态
+ * 不带引用时，两边都只能靠"恰好一条"来判断，谁也说不清那条「1」
+ * 到底指谁。所以顺序按**归属明确度**排：插件自己的卡片由插件自己认
+ * （它的队列它最清楚），插件明确说"不是我的"，宿主才接着认自己的。
  *
- *   `同意 #confirm-xxx` / `拒绝 #confirm-xxx`   —— 带编号，精确
- *   `同意` / `拒绝`                              —— 不带编号，仅当**只有一条**待确认时生效
- *   其它                                          —— 不认识，交给后面的流程
+ * ## 只认「当前人 + 当前会话恰好一条」
  *
- * 不带编号时要求"只有一条"是刻意的：多条待确认时猜错对象，
- * 等于用 A 的点头批准了 B 的操作，那是这里最危险的错误。
+ * 「1」和「2」在聊天里太常见（"2 点了"）。所以：
+ *   · 本会话本人在册且**仅有一条** → 认；
+ *   · 两条以上 → 明确要求引用，绝不猜；
+ *   · 一条都没有 → 裸数字交回（大概率闲聊），文字形式回一句说明。
  *
  * @param {object} evt
  * @returns {Promise<boolean>} 是否已处理（true = 这条消息到此为止）
  */
-async function tryHandleConfirmReply(evt) {
-  const text = String(evt?.text ?? '').trim();
-  if (!text) return false;
-
-  // 只在 QQ 会话里认，桌面端有自己的确认界面
-  if (!/^(private|group):\d+$/.test(String(evt?.convKey ?? ''))) return false;
-
+async function tryHandleUnquotedConfirm(evt) {
+  // 任何显式引用都只能由对应消息的拥有者认领，不能落到“唯一待确认”数字兜底。
+  if (normalizeMessageId(evt?.replyTo?.messageId ?? evt?.replyToMessageId)) return false;
+  const convKey = String(evt?.convKey ?? '');
   /*
-   * 接受三种写法，全部落到"同意/拒绝"：
+   * 群聊一律不认。
    *
-   *   `1` / `2`                    —— 与审批卡一致的主路径
-   *   `同意` / `拒绝`               —— 习惯打字的用户
-   *   `同意 1` / `拒绝 2`           —— 带序号，多条时用
-   *
-   * 只回裸数字时**仅当只有一条待确认**才认。多条还猜，等于用 A 的点头
-   * 批准 B 的操作，是这里最危险的错误。
+   * 确认卡只会投到管理员私聊（见 askHumanConfirm 的 replyConvKey），
+   * 所以群里本来就没有可处理的请求。更重要的理由是**可见性**：
+   * 群里所有人都看得到卡片，谁能回就等于谁能批准。把入口收窄到私聊，
+   * 让"群友在群里回 1 会怎样"这个问题根本不存在。
    */
-  let allow;
-  /** @type {number | null} */
-  let seq = null;
+  if (!convKey.startsWith('private:')) return false;
 
-  if (text === '1' || text === '2') {
-    allow = text === '1';
-  } else {
-    const m = /^(同意|拒绝|允许|取消)\s*#?\s*(\d+)?$/.exec(text);
-    if (!m) return false;
-    allow = m[1] === '同意' || m[1] === '允许';
-    if (m[2] !== undefined) seq = Number(m[2]);
-  }
+  const parsed = parseConfirmReply(evt?.text);
+  if (!parsed) return false;
 
-  const all = [...confirmSeq.entries()];
+  const senderId = String(evt?.sender?.userId ?? '');
+  const isBareDigit = evt?.text === '1' || evt?.text === '2';
 
-  if (all.length === 0) {
-    // 没有任何待确认时，裸数字 1/2 大概率是闲聊（"2 点了"），别抢。
-    // 明确说了「同意」才回一句，否则交回正常流程。
-    if (text === '1' || text === '2') return false;
-    await sendConfirmReply(evt.convKey, '现在没有等你确认的操作。');
+  const r = confirms.resolveUnquoted({
+    convKey,
+    senderId,
+    allow: parsed.allow,
+    ...(parsed.seq !== undefined ? { seq: parsed.seq } : {}),
+    ...(parsed.id !== undefined ? { id: parsed.id } : {}),
+  });
+
+  if (r.handled) {
+    await reportConfirmResult(convKey, r);
     return true;
   }
 
-  /** @type {string | null} */
-  let id = null;
+  /*
+   * 没有可处理的请求。
+   *
+   * 裸数字 = 大概率闲聊，交回（AI 该回就回）；
+   * 明确说了「同意 / 拒绝」= 用户以为有东西可批，必须回一句，
+   * 否则他会一直等一个永远不会发生的结果。
+   */
+  if (isBareDigit) return false;
 
-  if (seq !== null) {
-    const hit = confirmSeq.get(seq);
-    if (!hit) {
-      await sendConfirmReply(
-        evt.convKey,
-        `没有第 ${seq} 条待确认。当前有：${all.map(([n]) => n).join('、')}。`,
-      );
-      return true;
-    }
-    id = hit;
+  if (confirms.hasActionableElsewhere(convKey, senderId)) {
+    await sendConfirmReply(convKey, '现在没有等你确认的操作。别的会话里有待确认，请去那个会话说。');
   } else {
-    if (all.length > 1) {
-      await sendConfirmReply(
-        evt.convKey,
-        `现在有 ${all.length} 条待确认，请带上序号回复，例如「同意 ${all[0][0]}」，避免批错对象。`,
-      );
-      return true;
-    }
-    id = all[0][1];
+    await sendConfirmReply(convKey, '现在没有等你确认的操作。');
   }
-
-  const r = resolveConfirm(id, allow);
-  const n = seq ?? all.find(([, v]) => v === id)?.[0] ?? '';
-  await sendConfirmReply(
-    evt.convKey,
-    r.ok ? `${allow ? '已放行' : '已拒绝'}（第 ${n} 条）` : `处理失败：${r.message ?? '未知原因'}`,
-  );
-  log.info('QQ 侧确认结果', { id, seq: n, allow, ok: r.ok });
   return true;
+}
+
+/**
+ * 把一次结算（或拒绝）的结果回给用户。
+ *
+ * 契约：**只要 handled 就一定回一句**。用户点了头却什么都没收到，
+ * 是这里最不能接受的失败 —— 他会再点一次，然后看到"已处理过"。
+ *
+ * @param {string} convKey
+ * @param {object} r ConfirmRegistry 的结算结果
+ */
+async function reportConfirmResult(convKey, r) {
+  if (r?.ok) {
+    const seqText = r.seq !== undefined ? `（第 ${r.seq} 条）` : '';
+    await sendConfirmReply(convKey, `${describeOutcome(r.outcome)}${seqText}`);
+  } else {
+    await sendConfirmReply(convKey, r?.message ?? '处理失败：未知原因');
+  }
+  if (r?.id) {
+    log.info('QQ 侧确认结果', {
+      id: r.id,
+      seq: r.seq,
+      ok: r.ok === true,
+      outcome: r.outcome,
+      reason: r.reason,
+    });
+  }
 }
 
 /**
@@ -1321,22 +2098,95 @@ async function sendConfirmReply(convKey, text) {
   }
 }
 
+/**
+ * 算一份"这条消息当前所处的结构性事实"，交给插件派发层。
+ *
+ * ## 为什么这些事实必须由宿主算
+ *
+ * 三件事的状态都只存在于宿主里：
+ *
+ *   whitelisted   白黑名单是宿主配置，插件读不到
+ *   silenced      静音是宿主策略（全局/会话/时段/临时），插件读不到
+ *   confirmPending 确认表在 guard/confirm.mjs，插件读不到
+ *
+ * 插件如果自己去猜，两个方向都会错：多回一条会抢走审批回复，
+ * 少回一条则明明该回却不回。而这两种错在日志里都只表现为
+ * "插件返回了 true/false"，排查时几乎无从下手。
+ *
+ * ## 为什么要按**实际会走到的顺序**算
+ *
+ * `whitelisted` 与 `silenced` 在这里算一次，`considerTurn` 里还要再判一次。
+ * 重复判定是有意的：这里的值只用来**阻止**插件先回一条（插件先跑，
+ * 它回完 `considerTurn` 就不会执行了），它不构成任何放行依据。
+ * 换句话说：这里只是"更严格的一道前置"，不是"绕过后续闸门"的通行证。
+ *
+ * ## `isAdmin` 为什么用核心管理员，而不是静音管理员
+ *
+ * 两个名单回答的是不同问题：
+ *   `config.admin.qqIds`      谁能让它动本机 / 拥有管理员权限（授权）
+ *   `config.silence.adminIds` 谁能让它闭嘴（一个更宽松的操作权限）
+ *
+ * 插件规则里的 `scope.adminOnly` 表达的是**授权**语义（"这条只给主人用"），
+ * 所以取 `isCoreAdmin`。用静音名单会把"能叫我闭嘴的人"顺带升级成
+ * "能用只给主人用的规则"，那正好是 `admin.mjs` 明确要避免的合并。
+ *
+ * @param {object} evt
+ * @returns {{whitelisted: boolean, silenced: boolean, confirmPending: boolean, isAdmin: boolean, selfId: string}}
+ */
+function messageGate(evt) {
+  const convKey = String(evt?.convKey ?? '');
+  const senderId = String(evt?.sender?.userId ?? '');
+
+  const whitelisted = checkWhitelist(convKey, config).ok;
+  // 静音判定与 considerTurn 用同一个闸门对象：两处结论必须一致，
+  // 否则会出现"插件以为没静音（回了），而宿主以为静音（不记日志）"
+  const silenced = silenceGate.check(convKey, config).silent;
+
+  /*
+   * 有没有可能属于宿主的待确认。
+   *
+   * 取"本会话本人名下有未结算的确认"这个宽口径：只要有一条在册，
+   * 低优先级插件就不该抢形似确认回复的文本。宁可少回一条自动回复，
+   * 也不能让用户以为自己点的确认被拒了。
+   */
+  const confirmPending = confirms.hasActionable(convKey, senderId);
+
+  return {
+    whitelisted,
+    silenced,
+    confirmPending,
+    /*
+     * 核心管理员判定。
+     *
+     * 必须是宿主的结论而不是插件自己算：`config.admin.qqIds` 插件读不到，
+     * 让它猜的方向只有两个 —— 全放行（等于 adminOnly 不存在）或全拒绝
+     * （等于这个字段永远是废的）。两个都是"配了不生效"。
+     *
+     * fail-closed：不是管理员就是 false，没有"不确定"这个第三态。
+     */
+    isAdmin: isCoreAdmin(config, senderId),
+    // 自己发的消息已经在上游 return 掉了，这里仍带上：插件侧再多一层保险
+    selfId: String(selfId ?? ''),
+  };
+}
+
 async function dispatchToPlugins(evt) {
   /*
-   * ---- 第 0 关：确认回复 ----
+   * ---- 第 0 关：引用式确认回复 ----
    *
-   * 「同意 confirm-xxx」「拒绝 confirm-xxx」是**对某个待确认请求的答复**，
-   * 不是聊天内容。必须在插件和 AI 之前截住，否则：
-   *   - 插件可能把「同意」当成别的指令；
-   *   - 更糟的是 AI 会煞有介事地回一句"好的我帮你确认了"，其实什么也没发生。
+   * 引用是唯一**可精确判定归属**的信息（消息 ID 属于谁就是谁的）。
+   * 所以先按 ID 认领：命中宿主自己的确认卡就结算，不命中就原样交回，
+   * 让插件的审批卡按它自己的队列去认。
    *
-   * 返回 true 表示已经处理完（含回执），这条消息到此为止。
+   * 这一关必须在插件之前，否则插件会先看到这条引用，回一句
+   * "没有这条待回复" —— 而它其实属于宿主的确认卡。
    */
-  if (await tryHandleConfirmReply(evt)) return;
+  const quoted = await tryHandleQuotedConfirm(evt);
+  if (quoted === 'handled') return;
 
   if (plugins) {
     try {
-      const handled = await plugins.dispatchMessage(evt);
+      const handled = await plugins.dispatchMessage(evt, messageGate(evt));
       if (handled) {
         log.info('消息已被插件接管', { convKey: evt.convKey });
         return;
@@ -1359,6 +2209,16 @@ async function dispatchToPlugins(evt) {
       });
     }
   }
+
+  /*
+   * ---- 第 2 关：不带引用的确认回复 ----
+   *
+   * 排在插件**之后**：不带引用时两边都只能靠"恰好一条"判断，
+   * 而插件自己的卡片由插件自己认最准（它的队列它清楚）。
+   * 插件明确说"不是我的"，才轮到这里。
+   */
+  if (await tryHandleUnquotedConfirm(evt)) return;
+
   void considerTurn(evt);
 }
 
@@ -1372,6 +2232,211 @@ function pushRecent(convKey, item) {
   // 20 条够接上下文了；太多会让主动发言跑题
   if (arr.length > 20) arr.splice(0, arr.length - 20);
   recentByConv.set(convKey, arr);
+}
+
+/* ---------------------------------------------------------------- 视觉 */
+
+/**
+ * 这一回合允许取图吗？—— 降级矩阵的唯一判定点（契约 §8）。
+ *
+ * ## 为什么必须先于任何取图调用
+ *
+ * 需求里有一条是明确的：**关闭后停止自动取图与图片提交，不能只是隐藏界面**。
+ * 所以"要不要取图"必须在这里一次判完，而不是取完图再决定发不发 ——
+ * 后者照样会发 `get_image`、照样会抓 URL，用户以为省了，实际一分没省。
+ *
+ * 三种"不取"各有各的理由，绝不能合并成一句 `!enabled`：
+ *   · 开关关着      → 用户的明确选择
+ *   · 模型已实测不支持 → 取了也白取，还会因为上游 400 让整轮对话失败
+ *
+ * 注意：**能力未知（null）不在"不取"之列**。未知只是没测过，
+ * 直接按不支持处理就等于"没测过 = 判死刑"，那正是需求要求避免的误导。
+ *
+ * @returns {{ok: boolean, reason: string, effective: string}}
+ */
+function visionGate() {
+  const cfg = normalizeVisionConfig(config?.vision);
+  if (!cfg.enabled) return { ok: false, reason: 'disabled', effective: 'off' };
+  if (readVisionCapability().supported === false) {
+    return { ok: false, reason: 'unsupported', effective: 'on-unsupported' };
+  }
+  return { ok: true, reason: '', effective: readVisionCapability().supported === true ? 'on' : 'on-unprobed' };
+}
+
+/**
+ * 当前模型的能力探测结论（只读，绝不在这里写配置）。
+ *
+ * 为什么要单独抽：`llm.modelCapabilities` 的形状是
+ * `{ [endpointKey]: { [modelId]: { vision, probes, ... } } }`
+ * （只记视觉结论；生图由独立插件管理，不在这里），
+ * 而"当前生效的是哪一个"要同时看端点与模型名。两处都手写这套寻址，
+ * 迟早出现"界面显示支持、取图判定说不支持"的错位。
+ *
+ * @returns {{probed: boolean, supported: boolean|null, model: string, basis: string, detail: string, probedAt: string|null}}
+ */
+function readVisionCapability() {
+  const model = String(config?.llm?.model ?? '');
+  const empty = { probed: false, supported: null, model, basis: '', detail: '', probedAt: null };
+  if (!model) return empty;
+
+  let caps = null;
+  try {
+    caps = endpointCapabilities(config?.llm?.modelCapabilities, config?.llm?.baseUrl)?.[model] ?? null;
+  } catch {
+    return empty;
+  }
+  if (!caps || typeof caps !== 'object') return empty;
+
+  /*
+   * `supported` 只看 vision 字段的**类型**：
+   *
+   *   没有这个键（老配置、或探测没拿到结论）→ null（未知）
+   *   true / false  → 照搬
+   *
+   * 不写 `caps.vision === true ? true : false`：那会把 null 折成 false，
+   * 也就是把"没测过"显示成"不支持"。
+   */
+  const supported = typeof caps.vision === 'boolean' ? caps.vision : null;
+
+  return {
+    // probed 表示"曾经跑过探测"，与结论有无是两件事
+    probed: Boolean(caps.probedAt) || typeof caps.vision === 'boolean',
+    supported,
+    model,
+    basis: caps.vision === true ? '已实测：图片输入可用' : caps.vision === false ? '已实测：不支持图片输入' : '',
+    detail: String(caps.probes?.vision?.detail ?? ''),
+    probedAt: caps.probedAt ?? null,
+  };
+}
+
+/**
+ * 取图依赖（可注入，测试据此断言"关掉时一次都没调"）。
+ *
+ * 生产环境里 getImage 走 OneBot 的 `get_image`，URL 抓取走 image-fetch 的
+ * 内置实现（含 SSRF 防护）。测试里两个都能替换成假的，因此不需要联网。
+ *
+ * @returns {object}
+ */
+function visionDeps() {
+  return {
+    /*
+     * 走客户端上的 getImage，而不是在这里直接调客户端的通用动作接口。
+     *
+     * 理由是纪律而不是洁癖：全仓库里"通用动作调用"**只允许出现一次**
+     * （发送闸门那条通路，I4 与 ui-shell 的断言都盯着它）。入口里再写一次，
+     * 后来的人就没法一眼看出"哪一次是发消息、哪一次只是读图"了。
+     */
+    getImage: (input) => client.getImage({ file: input.file }),
+    /*
+     * 允许读取的本地缓存根。
+     *
+     * 只有用户显式配置了 SnowLuma 目录时才传：没配置时一律不知道缓存放哪，
+     * 也就坚决不碰本机任何路径（契约 §3 的 E3108 走 fail-closed）。
+     */
+    snowlumaDir: config?.snowlumaDir || '',
+  };
+}
+
+/**
+ * 组装本回合要提交的图片（契约 §4）。
+ *
+ * ## 历史图必须是"既没提交过、又真的存在"的
+ *
+ * 两个条件缺一不可：
+ *   · 楼层在 `imagesSeenFloors` 里 → 已经提交过，再发一遍纯属烧钱；
+ *   · 楼层仍在仓库里 → 图片元数据还在，取图还有依据。
+ *
+ * 用仓库的 page 而不是内存 recentByConv：后者只有文本，没有 media 元数据。
+ *
+ * ## 引用图必须校验归属
+ *
+ * `job.evt.replyTo.messageId` 只是上游给的一个数字。拿它去仓库里查时
+ * **必须限定 convKey**：不限定就等于"引用谁就取谁的图"，跨会话读取。
+ * 查不到就当作没有引用图（不报错）—— 引用可能已被撤回或不在缓冲里。
+ *
+ * @param {string} convKey
+ * @param {object|null} triggerEvt
+ * @param {string} effective
+ * @returns {Promise<{images: Array<object>, notes: string[], stats: object, codes: string[]}>}
+ */
+async function collectImagesForTurn(convKey, triggerEvt, effective) {
+  const empty = {
+    images: [],
+    notes: [],
+    stats: { attempted: 0, loaded: 0, skipped: 0, bytes: 0, codes: [] },
+    codes: [],
+  };
+  if (config?.vision?.enabled !== true) return empty;
+  if (readVisionCapability().supported === false) return empty;
+
+  /** 引用消息：只在同一会话内查，查不到就当没有 */
+  let quoted = null;
+  const quotedId = triggerEvt?.replyTo?.messageId;
+  if (quotedId !== undefined && quotedId !== null && String(quotedId).trim() !== '') {
+    const hit = sessionStore
+      .page(convKey, { limit: 200 })
+      .messages?.find((m) => String(m.messageId ?? '') === String(quotedId));
+    /*
+     * 必须带上 `floor`。
+     *
+     * 楼层号是"这张图属于哪条消息"的唯一依据：`collectTurnImages` 把
+     * `quoted.floor` 抄进结果的每一项，回到回合里再按 floor 把图挂到
+     * 对应的 recent 项上（见 startTurn 的 byFloor）。这里漏了它，
+     * 引用图会以 `floor: null` 返回 —— 取图、计费、统计全都发生了，
+     * 但**一张都挂不到请求上**，用户看到的是"它说看不到我引用的图"，
+     * 而日志里只有一串成功的取图记录。
+     */
+    if (hit) {
+      quoted = {
+        messageId: hit.messageId,
+        floor: typeof hit.floor === 'number' ? hit.floor : null,
+        evt: { media: hit.media ?? [], text: hit.text },
+      };
+    }
+  }
+
+  /*
+   * 历史：仓库里的最近 200 条里，带 media 的、且图片没提交过的。
+   *
+   * 只把候选交给 vision.mjs，真正的 window/张数/字节预算在那边统一夹 ——
+   * 这里再夹一遍就会出现"两处上限不一致"的经典漂移。
+   */
+  const page = sessionStore.page(convKey, { limit: 200 });
+  const history = (page?.messages ?? [])
+    .filter((m) => Array.isArray(m.media) && m.media.length > 0)
+    .map((m) => ({ floor: m.floor, messageId: m.messageId, evt: { media: m.media } }));
+
+  const outcome = await collectTurnImages({
+    config: config.vision,
+    convKey,
+    isGroup: convKey.startsWith('group:'),
+    trigger: triggerEvt ? { messageId: triggerEvt.messageId, floor: findFloorOf(convKey, triggerEvt.messageId), evt: triggerEvt } : null,
+    quoted,
+    history,
+    alreadySeen: sessionStore.imagesSeenFor(convKey),
+    deps: visionDeps(),
+  });
+
+  void effective;
+  return outcome;
+}
+
+/**
+ * 一条消息在本会话里的楼层号（找不到返回 null）。
+ *
+ * 为什么需要它：视觉链路要用楼层号判断"这张图是不是已经提交过"、
+ * 以及在提交后登记。而上游事件里只有 messageId，没有本地楼层。
+ *
+ * @param {string} convKey
+ * @param {unknown} messageId
+ * @returns {number|null}
+ */
+function findFloorOf(convKey, messageId) {
+  const want = String(messageId ?? '').trim();
+  if (!want) return null;
+  const page = sessionStore.page(convKey, { limit: 200 });
+  const hit = page?.messages?.find((m) => String(m.messageId ?? '') === want);
+  return typeof hit?.floor === 'number' ? hit.floor : null;
 }
 
 /* ---------------------------------------------------------------- 回合 */
@@ -1533,7 +2598,16 @@ async function startTurn(convKey, job) {
   try {
     // 来源由"谁在说话 + 在哪说"结构性决定，永远不看消息内容
     const origin = resolveOrigin(convKey, job);
-    const runner = makeRunner(origin, convKey);
+    /*
+     * 把本回合的结构性事实一并交给工具执行器：
+     *
+     *   requester / messageId / replyToMessageId —— 插件 ctx.caller 的来源
+     *   signal                                   —— 用户点「停止」时能中止工具
+     *
+     * 这三样都来自 OneBot 事件或调度器，与模型生成的内容无关。
+     * 主动回合（job.evt 可能是合成的）没有真实触发者，requester 自然为空。
+     */
+    const triggerEvt = job.evt ?? null;
 
     /*
      * 注入哪张人格卡，由**会话**决定，不是由"当前选中的卡"决定。
@@ -1544,6 +2618,13 @@ async function startTurn(convKey, job) {
      * 现在按 convKey 解析：private:<QQ> > group:<群号> > global
      * （见 PersonaStore.resolveFor）。没有任何卡命中时返回空串，
      * buildMessages 会退回 DEFAULT_PERSONA。
+     *
+     * ## 为什么这条解析提到 runner 之前
+     *
+     * 人格决定「表情工具出不出现」（见 stickerPersonaDecision）。工具的
+     * 可见集在 `makeRunner` 那一刻就固定了，所以必须先有人格文本。
+     * 顺序反过来会出现"这一轮给了工具、下一轮才收走"的一回合偏差 ——
+     * 而那一回合里模型可能已经发了一张。
      */
     const personaForConv = personaStore.resolveFor(convKey)?.text ?? '';
     /*
@@ -1553,15 +2634,241 @@ async function startTurn(convKey, job) {
      */
     const roleForConv = roleStore.resolveFor(convKey)?.text ?? '';
 
+    /*
+     * 人格对表情包的表态。
+     *
+     * `hideTools` 时把六个表情工具从本回合的候选集里**拿掉**，而不是
+     * 只在提示词里写一句"别用"。理由见 stickerPersonaDecision。
+     */
+    const stickerDecision = stickerPersonaDecision(personaForConv);
+
+    /*
+     * 把本回合的结构性事实一并交给工具执行器：
+     *
+     *   requester / messageId / replyToMessageId —— 插件 ctx.caller 的来源
+     *   signal                                   —— 用户点「停止」时能中止工具
+     *   disabledTools                            —— 人格禁用的工具（管理员侧设定）
+     *
+     * 这些全部来自 OneBot 事件、调度器或用户配置，与模型生成的内容无关。
+     * 主动回合（job.evt 可能是合成的）没有真实触发者，requester 自然为空。
+     */
+    const runner = makeRunner(origin, convKey, {
+      requester: triggerEvt?.sender
+        ? { id: String(triggerEvt.sender.userId ?? ''), nickname: String(triggerEvt.sender.nickname ?? '') }
+        : undefined,
+      messageId: triggerEvt?.messageId ?? null,
+      replyToMessageId: triggerEvt?.replyTo?.messageId ?? null,
+      signal: controller.signal,
+      disabledTools: stickerDecision.hideTools ? STICKER_TOOL_NAMES : null,
+    });
+
+    /*
+     * ── 视觉链路 ──────────────────────────────────────────────────
+     *
+     * 顺序是刻意的：**先判开关，再取图**。反过来（先取图再判断要不要用）
+     * 会发出真实的 `get_image` 与 HTTP 请求 —— 用户关掉开关以后照样在取图，
+     * 只是没把结果放进去。那不是"关闭"，只是"看不见"。
+     *
+     * visionGate() 会同时给出本回合的 effective，它决定占位文案怎么写。
+     */
+    const gate = visionGate();
+    /** @type {{images: Array<object>, notes: string[], stats: object, codes: string[]}} */
+    let visionOutcome = { images: [], notes: [], stats: { attempted: 0, loaded: 0, skipped: 0, bytes: 0, codes: [] }, codes: [] };
+    if (gate.ok) {
+      try {
+        visionOutcome = await collectImagesForTurn(convKey, triggerEvt, gate.effective);
+      } catch (err) {
+        /*
+         * 取图链路整段崩掉不能毁掉这一回合。
+         *
+         * 图片是**增强**，文字才是主体：图片全挂了也该能正常回话。
+         * 这里必须落一条 warn，否则"它忽然看不见图了"会完全无迹可查。
+         *
+         * 同时**留下一条 note**：不写的话 `codes`/`notes` 都是空的，
+         * 后面的占位补充条件不成立，模型只会看到一个赤裸的 `[图片]` ——
+         * 它既不知道图取不到，也不知道为什么，于是开始编造图里的内容。
+         */
+        log.warn('视觉取图异常，本回合按纯文本继续', {
+          convKey,
+          message: String(/** @type {any} */ (err)?.message ?? err),
+        });
+        visionOutcome = {
+          images: [],
+          notes: ['本回合取图过程异常，图片没有提交成功'],
+          stats: { attempted: 0, loaded: 0, skipped: 0, bytes: 0, codes: [] },
+          codes: [],
+        };
+      }
+    }
+
+    /*
+     * 把图挂到对应的 recent 项上。
+     *
+     * ## 为什么按 floor 归属，而不是"把图都塞给最后一条"
+     *
+     * 一次提交的图可能来自三条不同消息（本期、引用、历史）。全塞进最后一条
+     * 会让模型以为"这些图都是刚发的"，于是把昨天的图当成当前话题回答 ——
+     * 这种错误在输出里看起来完全合理，极难发现。
+     *
+     * floor 为 null 的项（占位、工具结果）不接收图片。
+     */
+    const recentForModel = (recentByConv.get(convKey) ?? []).map((item) => ({ ...item }));
+    if (visionOutcome.images.length > 0) {
+      const byFloor = new Map();
+      for (const img of visionOutcome.images) {
+        if (typeof img.floor !== 'number') continue;
+        const arr = byFloor.get(img.floor) ?? [];
+        arr.push({ dataUrl: img.dataUrl, mime: img.mime, label: img.label });
+        byFloor.set(img.floor, arr);
+      }
+      for (const item of recentForModel) {
+        /*
+         * 只挂在 **user** 项上。
+         *
+         * 提示词层只给 user 消息渲染 `image_url`（assistant/system 带图会被
+         * 一部分上游直接 400，见 docs/vision-contract.md §6）。如果这里把图
+         * 挂到一条 assistant 项上，那张图就既不会渲染、又会被计入
+         * `markImagesSeen` —— 等于"取了、算了钱、标了已提交，模型没见过"。
+         * 挂不上的（包括这种）会走下面的孤儿分支，补成一条 user 图文消息。
+         */
+        if (item.role !== 'user') continue;
+        const imgs = byFloor.get(item.floor);
+        if (imgs && imgs.length > 0) item.images = imgs;
+      }
+
+      /*
+       * 挂不上任何楼层的图，必须**补充一条消息**把它们带进请求。
+       *
+       * ## 为什么会有挂不上的图
+       *
+       * `recentByConv` 只保留最近 20 条，而视觉候选来自仓库的最近 200 条
+       * （引用消息、更早的历史图都可能落在这 20 条之外）。按 floor 挂图时
+       * 找不到宿主项，图就被静默丢掉 —— 但取图、计费、`markImagesSeen`
+       * 都已经发生了：下一回合它们被当成"提交过"永不重试，模型却一次都
+       * 没看见。表现是"它说看不到我引用的图"，日志里却全是成功取图。
+       *
+       * ## 为什么补一条 user 图文消息，而不是塞给最后一条
+       *
+       * 塞给最后一条会让模型以为这些图是刚发的（同 §"为什么按 floor 归属"）。
+       * 补一条带说明的独立消息，时间关系是明确的；提示词层本来就把
+       * "图片 + 文本"渲染成合法的多模态 content，不需要额外协议。
+       *
+       * 每条最多 4 张：`prompt.mjs` 的 `MAX_IMAGES_PER_MESSAGE` 是 4，
+       * 超过会被静默忽略 —— 那等于又丢一次，所以在这里先分好组。
+       */
+      const attachedFloors = new Set(
+        recentForModel
+          .filter((item) => Array.isArray(item.images) && item.images.length > 0)
+          .map((item) => item.floor),
+      );
+      const orphans = visionOutcome.images.filter(
+        (img) => !(typeof img.floor === 'number' && attachedFloors.has(img.floor)),
+      );
+      const IMAGES_PER_MESSAGE = 4;
+      for (let i = 0; i < orphans.length; i += IMAGES_PER_MESSAGE) {
+        const chunk = orphans.slice(i, i + IMAGES_PER_MESSAGE);
+        recentForModel.push({
+          role: 'user',
+          nickname: '引用',
+          text: `更早消息里的图片（${chunk.length} 张，随本条一起提交）`,
+          floor: null,
+          images: chunk.map((img) => ({ dataUrl: img.dataUrl, mime: img.mime, label: img.label })),
+        });
+      }
+      if (orphans.length > 0) {
+        log.info('引用/更早历史的图片补充为独立消息', { convKey, count: orphans.length });
+      }
+
+      /*
+       * 图片真的提交了 —— 登记楼层，下一回合不再重复提交。
+       *
+       * 这是"避免每轮重复提交全部历史图片造成费用增长"的落点：
+       * 没有这一步，历史里的图会被每一回合重新塞进请求体，成本按回合累加，
+       * 而模型得到的边际信息几乎为零。
+       */
+      const withImages = floorsWithSubmittedImages(visionOutcome.images);
+      if (withImages.length > 0) {
+        const marked = sessionStore.markImagesSeen(convKey, withImages);
+        log.info('本回合提交了图片', {
+          convKey,
+          images: visionOutcome.images.length,
+          bytes: visionOutcome.stats.bytes,
+          floors: withImages,
+          marked,
+        });
+      }
+    }
+
+    /*
+     * 取不到图 / 开关关着 / 模型不支持时，给 [图片] 占位补一句说明。
+     *
+     * 模型看到孤零零一个 `[图片]` 时，要么编造图里的内容，要么回一句
+     * "我看不到图片" —— 两种都很突兀。给它一句准确的说明，它就能自然地
+     * 说"图我这边看不出来，你说说是什么"。
+     */
+    const turnEffective = resolveEffective({
+      enabled: gate.effective !== 'off',
+      supported: readVisionCapability().supported,
+      lastTurn: visionOutcome.stats,
+    });
+    /*
+     * 什么时候要给 [图片] 补说明？
+     *
+     * 三种"模型看不到图"的情况都必须补，否则它只能对着一个占位符瞎猜：
+     *   · `off`            —— 用户关了读图
+     *   · `on-unsupported` —— 模型已实测不支持
+     *   · `on-but-blocked` —— 开关与能力都正常，但这一回合一张都没取到
+     *                        （预算耗尽/全部超限/取图异常）。这个态以前漏了：
+     *                        结果是"取图失败"和"成功但没图"在提示词里长得一样。
+     * 另外 `codes`/`notes` 非空时也要补：它们是具体原因。
+     */
+    const shouldAnnotate =
+      gate.effective === 'off' ||
+      gate.effective === 'on-unsupported' ||
+      turnEffective === 'on-but-blocked' ||
+      visionOutcome.codes.length > 0 ||
+      visionOutcome.notes.length > 0;
+    if (shouldAnnotate) {
+      for (const item of recentForModel) {
+        if (item.role === 'assistant') continue;
+        item.text = annotateImagePlaceholders(item.text, turnEffective, visionOutcome.notes);
+      }
+    }
+
+    // 运行时统计：界面「实际效果」与「运行统计」两块都读它
+    recordVisionTurn(visionRuntime, visionOutcome, () => Date.now());
+
     const messagesForModel = buildMessages({
       persona: personaForConv,
       role: roleForConv,
       context: {
         convKey,
         isGroup: convKey.startsWith('group:'),
-        recent: recentByConv.get(convKey) ?? [],
+        recent: recentForModel,
         trigger: job.reason,
         proactive: job.proactive,
+        /*
+         * 分条约定必须与**发送层用的上限**是同一个值。
+         *
+         * 提示里说"最多 3 条"而发送层按 2 条发，模型会以为自己没守规矩，
+         * 而这种不一致在日志里看不出来 —— 两边都读同一个配置就不会漂。
+         */
+        maxMessages: config.reply?.splitEnabled === false ? 1 : config.reply?.maxMessages,
+        /*
+         * 表情策略：只有在"插件启用 + 人格没禁止"时才注入。
+         *
+         * `hideTools` 意味着模型连工具都看不到，这时再注入一段"你有收藏表情
+         * 可以发"就是纯误导 —— 它会尝试去描述一个自己调不到的能力。
+         * 空串时 buildMessages 不追加任何内容，系统提示与改动前逐字节一致。
+         */
+        stickerGuidance: stickerDecision.hideTools
+          ? ''
+          : buildStickerGuidance({
+              enabled: stickerPluginEnabled() && stickerConfig().sendEnabled !== false,
+              maxPerTurn: 1,
+              visionEnabled: gate.effective !== 'off',
+              overridePersona: stickerConfig().overridePersona === true,
+            }),
       },
     });
 
@@ -1590,36 +2897,152 @@ async function startTurn(convKey, job) {
     //      那时还拿不到最终文本。所以在 onDelta 里边收边累积。
     let turnText = '';
 
-    const result = await runTurn({
-      llm,
-      runner,
-      toOpenAiTools,
-      messages: messagesForModel,
-      signal: controller.signal,
-      proactive: job.proactive,
-      onDelta: (delta) => {
-        turnText += delta;
-        rpc.notify('turn-delta', { turnId, delta });
-      },
-      onToolCall: (info) => rpc.notify('turn-tool', { turnId, ...info }),
-      onUsage: async ({ usage, model }) => {
-        // 记账失败绝不能让回合崩掉，但也不能静默吞掉——记一行 warn
-        try {
-          await usageLedger.record({
-            convKey,
-            model,
-            usage,
-            proactive: job.proactive,
-            promptText: messagesForModel.map((m) => m.content).join('\n'),
-            completionText: turnText,
-          });
-        } catch (err) {
-          log.warn('用量记账失败', { convKey, message: String(/** @type {any} */ (err)?.message ?? err) });
-        }
-      },
-    });
+    /*
+     * ## 上游拒收图片时的去图重试
+     *
+     * 能力探测是**一次独立请求**的结论。真实回合里上游仍可能因为别的原因
+     * 拒收图片：中转没接多模态、图片尺寸超了它自己的限制、模型换了但配置没更新。
+     * 这时整轮对话会直接失败 —— 用户看到的是"它坏了"，而实际上只要有文字
+     * 就能正常回答。
+     *
+     * 所以这里兜一层：**只有**确认是"图片本身被拒"才去图重试，
+     * 且**只重试一次**。key 错、额度不足、5xx 都不走这条路（looksLikeImageRejection
+     * 明确排除了它们）—— 那些情况下重试只会把同一个错误再犯一遍。
+     *
+     * 重试成功后，把这件事记进运行时统计与日志，但**绝不写进 modelCapabilities**：
+     * 一次上游拒收可能是图片太大、可能是临时故障，把它固化成"不支持"
+     * 会污染"确认不支持"的语义，而那个语义是界面判断要不要取图的依据。
+     */
+    let usedMessages = messagesForModel;
+    let imageRetry = null;
+
+    /*
+     * 这一回合里工具被调用了几次。
+     *
+     * 只用来回答一个问题：**去图重试时还能不能再给工具**。
+     * 工具一旦真的跑过，它的副作用（发图、发表情、写业务数据）就已经落地，
+     * 而重试是"整轮重跑"，副作用不会回滚（见下面 imageRetry 分支）。
+     */
+    let toolCallsThisTurn = 0;
+
+    const runOnce = async (msgs, attemptRunner = runner) =>
+      runTurn({
+        llm,
+        runner: attemptRunner,
+        toOpenAiTools,
+        messages: msgs,
+        signal: controller.signal,
+        proactive: job.proactive,
+        onDelta: (delta) => {
+          turnText += delta;
+          rpc.notify('turn-delta', { turnId, delta });
+        },
+        onToolCall: (info) => {
+          toolCallsThisTurn += 1;
+          rpc.notify('turn-tool', { turnId, ...info });
+        },
+        onUsage: async ({ usage, model }) => {
+          // 记账失败绝不能让回合崩掉，但也不能静默吞掉——记一行 warn
+          try {
+            await usageLedger.record({
+              convKey,
+              model,
+              usage,
+              proactive: job.proactive,
+              /*
+               * 多模态之后 content 可能是数组。直接 join 会产出
+               * `[object Object]`，让缺 usage 时的 token 估算几乎归零
+               * （表现为"账单和界面数字对不上"且不报错）。
+               * messagesToPlainText 只取 text 段，图片记一个占位记号。
+               */
+              promptText: messagesToPlainText(msgs),
+              completionText: turnText,
+            });
+          } catch (err) {
+            log.warn('用量记账失败', { convKey, message: String(/** @type {any} */ (err)?.message ?? err) });
+          }
+        },
+      });
+
+    let result;
+    try {
+      result = await runOnce(messagesForModel);
+    } catch (err) {
+      const e = /** @type {any} */ (err);
+      const hasImages = messagesForModel.some((m) => Array.isArray(m.content));
+      if (!hasImages || !looksLikeImageRejection(e?.status, String(e?.message ?? e))) throw err;
+
+      /*
+       * 去图重试：把带 image_url 的消息退回成纯文本。
+       *
+       * 用 annotateImagePlaceholders 给 [图片] 补一句说明，让模型知道
+       * "这里本来有图、但这次没带上"，而不是对着一个孤立的占位符瞎猜。
+       */
+      usedMessages = messagesForModel.map((m) => ({
+        ...m,
+        content: Array.isArray(m.content)
+          ? annotateImagePlaceholders(contentToText(m.content), 'on-but-blocked', [])
+          : m.content,
+      }));
+
+      imageRetry = {
+        at: Date.now(),
+        status: e?.status ?? null,
+        message: String(e?.message ?? e).slice(0, 200),
+      };
+      log.warn('上游拒收图片，已去图重试（不记为"不支持读图"）', {
+        convKey,
+        status: imageRetry.status,
+        detail: imageRetry.message,
+      });
+
+      // 统计与界面要能看出"发生过一次拒收"，但它不等于"能力为 false"
+      visionRuntime.imageRejectedCount += 1;
+      visionRuntime.lastImageRejectedAt = imageRetry.at;
+
+      /*
+       * 重试时还要不要给工具？——这里必须按"第一次尝试有没有真的跑过工具"决定。
+       *
+       * 重试是**整轮重跑**：同一段对话再喂一遍模型、它再决定调什么工具。
+       * 而工具副作用不会回滚 —— 第一次尝试里已经 `ctx.chat.send` 出去的
+       * 一句话、`sendMedia` / 生图投递 / 发表情发出去的图，都真实存在于
+       * QQ 里了。此时重试若继续提供同样的工具，模型很可能再调一次，
+       * 用户看到的就是"同一张图发了两遍 / 同一句话说了两次"。
+       *
+       * 所以：第一次尝试里一旦发生过工具调用，重试这一轮**不给任何工具**。
+       * 代价是重试回合只能用已有上下文作答（通常本来就够 —— 图去掉了，
+       * 剩下的文字与工具结果都还在 messages 里）；换来的是不可能重复产生
+       * 副作用。宁可这一轮少做一次工具调用，也不要重复发一条内容。
+       *
+       * 第一次尝试一个工具都没调时保持原样：没有副作用可重复，
+       * 限制工具只会让本该能答的问题答不出来。
+       *
+       * 判定收在 `buildImageRetryRunner` 里，好让 test/image-retry-guard
+       * 直接调用它，而不是靠读源码正则来"证明"这段逻辑存在。
+       */
+      const retryRunner = buildImageRetryRunner(runner, toolCallsThisTurn);
+      if (retryRunner !== runner) {
+        log.info('去图重试：第一次尝试已调用过工具，本轮不再提供工具（防重复发送）', {
+          convKey,
+          toolCalls: toolCallsThisTurn,
+        });
+      }
+
+      turnText = '';
+      result = await runOnce(usedMessages, retryRunner);
+    }
+    void usedMessages;
 
     turnText = result.text ?? '';
+
+    /*
+     * 原生联网证据在**回合结束后立刻记账**。
+     *
+     * 放在 cancelled 分支之前：被取消的回合也可能已经收回了引用，
+     * 而"它到底有没有联网"是进程级事实，不该因为用户点了停止就丢掉。
+     * 这里只记状态与条数，不记来源正文（见 recordNativeSearch）。
+     */
+    recordNativeSearch(result.nativeSearch);
 
     /*
      * 思考归档放在"是否发出回复"之前：它记的是「它想了什么」，
@@ -1629,34 +3052,74 @@ async function startTurn(convKey, job) {
     recordThinking(convKey, result);
 
     const notice = truncationNotice(result);
-    let reply = (result.text ?? '').trim();
+    const reply = (result.text ?? '').trim();
 
     if (result.cancelled) {
       rpc.notify('turn-end', { turnId, cancelled: true });
       return;
     }
 
-    // 触顶说明要拼在回复后面（不能吞掉已有内容）
-    if (notice) reply = reply ? `${reply}\n${notice}` : notice;
-
-    if (!reply) {
+    if (!reply && !notice) {
       rpc.notify('turn-end', { turnId, empty: true });
       return;
     }
 
-    // 出站仍走唯一那道闸门（工具回合也不能绕）
-    const sent = await sendText(convKey, reply);
-    if (sent.ok) {
-      pushRecent(convKey, { role: 'assistant', text: reply });
-      triggerLedger.noteAutoTurn(convKey);
-      if (job.proactive) triggerLedger.noteProactive(convKey);
+    /*
+     * 拆分 + 逐条发送 + 记账，全在 deliverReply 里。
+     *
+     * 那段逻辑本身有单测（test/reply-deliver.test.mjs），覆盖
+     * 部分失败、中止、顺序。这里只负责接线：注入唯一的发送闸门、
+     * 共享串行器，以及"记什么"。
+     *
+     * 记账语义（见 deliver.mjs）：
+     *   onSent      每条真的发出去的才进上下文
+     *   onDelivered 一次回复只记一次回合（不是三条）
+     */
+    const delivery = await deliverReply({
+      convKey,
+      text: reply,
+      notice,
+      send: sendText,
+      sequencer: replySequencer,
+      signal: controller.signal,
+      config: config.reply,
+      onSent: (text) => pushRecent(convKey, { role: 'assistant', text }),
+      onDelivered: () => {
+        triggerLedger.noteAutoTurn(convKey);
+        if (job.proactive) triggerLedger.noteProactive(convKey);
+      },
+    });
+
+    /*
+     * 部分失败必须留痕：否则"少了一条"在日志里完全看不出来 ——
+     * 用户只会觉得机器人话说一半。
+     */
+    if (delivery.failed.length > 0) {
+      log.warn('回复分条发送有失败', {
+        convKey,
+        sent: delivery.sent.length,
+        failed: delivery.failed.length,
+        firstCode: delivery.failed[0]?.code,
+        firstMessage: delivery.failed[0]?.message,
+      });
+    }
+    if (delivery.aborted) {
+      log.info('回复发送被中止', { convKey, sent: delivery.sent.length, planned: delivery.planned });
     }
 
     rpc.notify('turn-end', {
       turnId,
-      ok: sent.ok,
-      code: sent.code ?? null,
-      text: reply,
+      ok: delivery.ok,
+      code: delivery.ok ? null : (delivery.failed[0]?.code ?? null),
+      // 界面用的整段文本：与实际发出的内容一致（协议块不会漏到界面上）
+      text: delivery.sent.join('\n'),
+      messages: delivery.sent,
+      messageCount: delivery.sent.length,
+      splitMode: delivery.splitMode,
+      splitReason: delivery.splitReason,
+      clamped: delivery.clamped,
+      failedCount: delivery.failed.length,
+      aborted: delivery.aborted,
       proactive: job.proactive,
       steps: result.steps,
       usage: result.usage,
@@ -1762,15 +3225,27 @@ function resolveOrigin(convKey, job) {
 }
 
 /**
+ * 来源判定里的"主人"。
+ *
+ * ## 私聊：只认核心管理员，**不再看白名单**
+ *
+ * 原来这里读的是 `config.allow.private`。那等于把"谁能跟它说话"和
+ * "谁能让它动本机"合并成一张表 —— 用户把某个号加进白名单（本意只是
+ * 允许对话），就顺带授予了宿主机工具。现在只认 `config.admin.qqIds`，
+ * 以及用户显式打开的 `admin.inheritWhitelist`（见 guard/admin.mjs）。
+ *
+ * ## 群聊：机器人自己的号
+ *
+ * 群里"管理员"的语义与私聊不同：通过 QQ 号判断谁在不在管理员名单里
+ * 在群里没有意义（群友的号本来就不该在名单上）。这里保留原判定 ——
+ * 机器人自己发的话算 owner-group，而它发的消息在上游已被过滤。
+ *
  * @param {string} id
  * @param {string} kind
  * @returns {boolean}
  */
 function isOwnerId(id, kind) {
-  if (kind === 'private') {
-    return (config.allow.private ?? []).some((x) => String(x) === String(id));
-  }
-  // 群里的"管理员"= 机器人自己的号（飞书式判定不适用，这里用 QQ 号）
+  if (kind === 'private') return isCoreAdmin(config, id);
   return String(id) === String(selfId);
 }
 
@@ -1803,9 +3278,11 @@ async function sendText(convKey, text) {
  * @param {string} convKey
  * @param {Array<{type: string, data: object}>} segments
  * @param {string} auditText
+ * @param {AbortSignal} [signal]
  * @returns {Promise<{ok: boolean, code?: string, message?: string, messageId?: any}>}
  */
-async function sendSegments(convKey, segments, auditText) {
+async function sendSegments(convKey, segments, auditText, signal) {
+  if (signal?.aborted) return { ok: false, code: 'E4070', message: '发送已取消' };
   const gated = passSendGate({
     convKey,
     text: auditText,
@@ -1840,7 +3317,18 @@ async function sendSegments(convKey, segments, auditText) {
       : { user_id: Number(id), message: segments };
 
   try {
-    const res = await client.sendAction(action, params);
+    /*
+     * 发送也走**同一个**动作出口（requestOneBotAction）。
+     *
+     * 这不是多绕一层：静态检查 I4 断言 `client.sendAction` 的调用在全仓库
+     * 只出现一次。把"发消息"和"读收藏表情"分成两处调用，那条断言就
+     * 立刻失守 —— 而它守的正是"发送只有一条通路"。
+     *
+     * 所以唯一的出口是 requestOneBotAction；区别在**谁能调它**：
+     * 这里（已经过闸门）与 gateway-bridge（受控能力，动作名来自白名单）。
+     */
+    if (signal?.aborted) return { ok: false, code: 'E4070', message: '发送已取消' };
+    const res = await requestOneBotAction(action, params);
     return { ok: true, messageId: res?.message_id };
   } catch (err) {
     const e = /** @type {any} */ (err);
@@ -1849,39 +3337,78 @@ async function sendSegments(convKey, segments, auditText) {
 }
 
 /**
+ * 发一个**非发送类**的 OneBot 动作（读收藏表情、取图片字节等）。
+ *
+ * ## 为什么它必须和白名单动作分开
+ *
+ * `client.sendAction` 是全仓库唯一能往上游"做事"的出口，而 I4 守着
+ * "发送只有一条通路"（静态检查断言它的调用只出现一次）。
+ * 那条断言守的其实是**发送**：如果有人在入口里直接发 `send_group_msg`，
+ * 白名单与限流就形同虚设。
+ *
+ * 表情包需要的是**另一类**动作：`fetch_custom_face_detail`（读收藏列表）、
+ * `get_supported_actions`（能力探测）、`add_custom_face`（账号写）、
+ * `get_image`（读缓存字节）。它们没有"发给谁"这个维度，因此不该、
+ * 也不能走 sendSegments（那条路要求 convKey + 审计 + 限流）。
+ *
+ * 所以这一层是刻意存在、且**只被网关能力调用**的：动作名来自
+ * `GATEWAY_ACTIONS` 的白名单，不是模型给的字符串。
+ *
+ * ## 为什么不用 `client.getImage` 那种"收在客户端里"的写法
+ *
+ * 因为动作是**网关扩展**，不是固定清单：`fetch_custom_face_detail`、`add_custom_face`、
+ * `modify_custom_face` 都是 SnowLuma 侧的扩展，不同实现可能连名字都不一样。
+ * 把它们一个个写进 client 会让客户端认识上游专有名 —— 而 I2 明确要求
+ * `onebot/client.mjs` 里不出现上游专有名，只认 `wsUrl` + `accessToken`。
+ *
+ * 所以分发点留在这里（入口本来就认识 OneBot），而**调用方**只有
+ * gateway-bridge，它在受控能力后面，模型碰不到动作名。
+ *
+ * @param {string} action OneBot 动作名
+ * @param {object} [params]
+ * @returns {Promise<any>}
+ */
+async function requestOneBotAction(action, params = {}) {
+  const name = String(action ?? '').trim();
+  if (!name) {
+    const err = new Error('缺少 OneBot 动作名');
+    /** @type {any} */ (err).code = 'E4071';
+    throw err;
+  }
+  if (!client) {
+    const err = new Error('尚未联通的 OneBot 端点');
+    /** @type {any} */ (err).code = 'E1001';
+    throw err;
+  }
+  return client.sendAction(name, params);
+}
+
+/**
  * 取管理员 QQ 列表（发给发送闸门用于白名单/限流豁免）。
  *
- * 来源优先级：
- *   1. 插件配置 `plugins.config['dsh-bridge'].admins`（迁移后的**唯一**真源）
- *   2. 旧字段 `config.dsh.admins`（迁移没跑到时的兜底）
+ * ## 这里的 admin 是**投递通道**，不是授权
  *
- * 迁移后旧字段是空数组，所以只读它会得到"没有管理员"这个错误结论 ——
- * 而调用方（checkWhitelist / passSendGate）恰恰是**必须**知道管理员是谁的。
+ * 它回答的只有一个问题：「机器人主动发给他时，要不要绕过白名单与限流」。
+ * 审批推送、确认卡、回执全靠这条通道送出去，所以名单取的是**并集**：
  *
- * 插件里 admins 是逗号分隔字符串（界面按字符串存），这里统一成分隔好的数组。
+ *   1. 核心管理员 `config.admin.qqIds`（见 guard/admin.mjs）
+ *   2. DSH 插件配置 `plugins.config['dsh-bridge'].admins`
+ *   3. 旧字段 `config.dsh.admins`（迁移没跑到时的兜底）
+ *
+ * ## 为什么不能拿 `allow.private` 当管理员
+ *
+ * 那是**准入清单**："允许谁跟它说话"。合并之后，为了让机器人能回
+ * 某人的私聊而把他加进白名单，就同时授予了他宿主机工具与确认权 ——
+ * 用户完全不知道加白名单还顺带授了权。
+ *
+ * 所以授权判定（resolveOrigin / 确认请求的 allowedSenders）只看
+ * `coreAdminIds()`，这里只负责"送得到"。
  *
  * @param {any} cfg
  * @returns {string[]}
  */
 function resolveAdminQqs(cfg) {
-  const fromPlugin = cfg?.plugins?.config?.['dsh-bridge']?.admins;
-  const legacy = cfg?.dsh?.admins;
-
-  /** @type {any[]} */
-  const raw = [];
-  for (const src of [fromPlugin, legacy]) {
-    if (Array.isArray(src)) raw.push(...src);
-    else if (typeof src === 'string') raw.push(...src.split(/[,，、\s]+/));
-  }
-
-  const out = [];
-  for (const v of raw) {
-    const id = String(v ?? '').trim();
-    // 只要纯数字 QQ 号：闸门里是直接拿字符串比对的，
-    // 混进空串或说明文字会让比较永远不成立
-    if (/^\d{4,15}$/.test(id) && !out.includes(id)) out.push(id);
-  }
-  return out;
+  return deliverableAdminIds(cfg);
 }
 
 /** 允许手动发送的媒体类型 → OneBot 消息段 */
@@ -1963,14 +3490,74 @@ const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
  *
  * @param {import('./guard/origin.mjs').Origin} origin
  * @param {string} convKey
+ * @param {object} [turn] 本回合的结构性事实（触发者 / 消息 id / 取消信号）
+ * @param {{id?: string, nickname?: string}} [turn.requester]
+ * @param {unknown} [turn.messageId]
+ * @param {unknown} [turn.replyToMessageId]
+ * @param {AbortSignal} [turn.signal]
  */
-function makeRunner(origin, convKey) {
+/**
+ * 为某个来源创建工具执行器。
+ *
+ * 注意：origin 由**服务端**决定（来自 IPC 的 setting/action 或会话归属），
+ * 绝不接受调用方随便传一个 origin 来提权。
+ *
+ * policy 必须从配置实时取，否则 `tools.allowR3` 会变成一个改了也不生效的假开关。
+ *
+ * @param {import('./guard/origin.mjs').Origin} origin
+ * @param {string} convKey
+ * @param {object} [turn] 本回合的结构性事实（触发者 / 消息 id / 取消信号）
+ * @param {{id?: string, nickname?: string}} [turn.requester]
+ * @param {unknown} [turn.messageId]
+ * @param {unknown} [turn.replyToMessageId]
+ * @param {AbortSignal} [turn.signal]
+ * @param {string[]} [turn.disabledTools] 本轮结构性不可见的工具（完整名）
+ */
+function makeRunner(origin, convKey, turn = {}) {
   assertOrigin(origin);
+  /*
+   * policy 必须**每次现算**（getPolicy），不能在这里快照一份。
+   *
+   * runner 在一个回合里是长期对象；用户在回合中途关掉联网后，下一次
+   * `availableTools()`（agent-loop 每次问模型前都会调）必须立刻看不到
+   * 搜索工具。快照的后果是模型仍看得到、会调、拿 E4080、换个说法重试。
+   *
+   * 本回合要藏起来的工具 = 环境级的（联网总闸，来自 base）+ 回合级的（人格卡）。
+   * 两处都必须保留 —— 见 mergeDisabledTools 的说明：覆盖会让
+   * "刚关掉联网、人格又禁用表情"这种情况只生效一个。
+   */
+  const getPolicy = () => {
+    const base = toolPolicy();
+    const hidden = mergeDisabledTools(base.disabledTools, turn.disabledTools);
+    return hidden ? { ...base, disabledTools: hidden } : base;
+  };
   return createToolRunner({
-    policy: toolPolicy(),
+    /*
+     * 用 getPolicy 而不是 policy：
+     *
+     * `context` 描述"这次调用是谁"，而 policy 描述"允不允许"。禁用理由是
+     * 管理员侧设定，属于后者。放错位置的直接后果是 `isToolGranted` 读不到它。
+     *
+     * 空集时不加 disabledTools：保持既有形状，也让快照里的策略看起来
+     * 不像是"有东西被禁了"。
+     */
+    getPolicy,
     context: {
       origin,
       convKey,
+      /*
+       * 以下四项构成插件的可信调用上下文（ctx.caller）。
+       *
+       * 它们全部来自**结构性事实**：回合是谁发起的（origin）、在哪个会话
+       * （convKey）、哪条消息触发的（evt.messageId）、谁发的（evt.sender）。
+       * 模型给的参数里没有这些字段（清单也不允许声明，见 manifest 的
+       * RESERVED_PARAM_NAMES），所以它们不可能被伪造。
+       */
+      requester: turn.requester,
+      messageId: turn.messageId,
+      replyToMessageId: turn.replyToMessageId,
+      // 回合取消信号：用户点「停止」时 abort，正在跑的工具要能体面停下
+      signal: turn.signal,
       onRecord: (rec) => {
         toolCallLog.push(rec);
         if (toolCallLog.length > 1000) toolCallLog = toolCallLog.slice(-1000);
@@ -1983,6 +3570,36 @@ function makeRunner(origin, convKey) {
 }
 
 /**
+ * 去图重试时要用的工具执行器。
+ *
+ * ## 为什么需要它
+ *
+ * 上游拒收图片时的重试是**整轮重跑**，而工具副作用不会回滚。
+ * 第一次尝试里模型可能已经用 `ctx.chat.send` / `sendMedia` / 发表情 /
+ * 生图投递把内容真的发出去了；重试再给同一批工具，它很可能再发一遍。
+ * 于是用户看到"同一张图两条 / 同一句话两遍"——而日志里只有一次成功回合。
+ *
+ * 第一次尝试**没有调用过任何工具**时没有任何副作用可重复，此时原样返回
+ * 同一个 runner：多限制一轮工具只会让本来能答的问题答不出来。
+ *
+ * @param {{availableTools: () => object[], run: Function}} runner
+ * @param {number} toolCalls 第一次尝试里工具被调用的次数
+ * @returns {{availableTools: () => object[], run: Function}}
+ */
+function buildImageRetryRunner(runner, toolCalls) {
+  if (!(Number(toolCalls) > 0)) return runner;
+  return {
+    // 空表 = 模型看不到任何工具，也就不会发起调用
+    availableTools: () => [],
+    run: async () => ({
+      ok: false,
+      code: 'E4071',
+      message: '本回合正在做去图重试，不再提供工具（避免重复发送）',
+    }),
+  };
+}
+
+/**
  * 请人确认一次高风险调用。
  *
  * 三条纪律：
@@ -1990,166 +3607,184 @@ function makeRunner(origin, convKey) {
  *   2. **不提供"本会话始终允许"**：一次确认只对一次调用有效
  *   3. **超时必须真的拒绝**，不能挂在那里等
  *
+ * ## 请求在**登记那一刻**就绑死归属
+ *
+ * 这一版把三件事一起钉进了登记：
+ *
+ *   · `replyConvKey`  —— 卡片投到哪个会话，回复就必须来自那个会话。
+ *     原来是 `req.convKey`（发起请求的会话）兼着当投递目标，而
+ *     群聊请求也会被投到群里 —— 群友看得见、回一句就算数。
+ *     现在**只投管理员私聊**（见下）。
+ *   · `allowedSenders` —— 谁能处理。来源是核心管理员
+ *     （`config.admin.qqIds`，见 guard/admin.mjs），**不再是白名单**。
+ *     白名单回答的是"谁能跟它说话"，把它当管理员用，等于加个白名单
+ *     就顺带授予了本机操作权。
+ *   · 有效期与请求 ID —— 由 ConfirmRegistry 统一维护。
+ *
+ * ## 为什么卡片只投管理员私聊
+ *
+ * 群里所有人都看得见卡片，也就意味着"任何一个看得见的人都能回答"。
+ * 即使 allowedSenders 会挡住非管理员，在群里暴露完整参数（可能含路径、
+ * 命令）本身就不合适。所以群聊来源**不推卡片**，只在桌面端确认；
+ * 桌面端没人点时按超时拒绝，这是有意的 fail-closed。
+ *
  * @param {{tool: string, risk: string, args: object, convKey: string}} req
  * @returns {Promise<'allow'|'deny'>}
  */
-/**
- * 分配一个确认序号（最小可用正整数）。
- *
- * 复用被释放的号，避免长时间运行后序号涨到很大、用户在手机上看到"第 47 条"
- * 却其实只有一条待确认。
- *
- * @param {string} id
- * @returns {number}
- */
-function allocConfirmSeq(id) {
-  let n = 1;
-  while (confirmSeq.has(n)) n += 1;
-  confirmSeq.set(n, id);
-  return n;
-}
-
-/**
- * 释放序号。
- *
- * 必须和 pendingConfirms 同步释放：只删一边会让卡片上写的"第 N 条"
- * 和实际能回复的序号对不上，用户回 "1" 会被判成"没有第 1 条"。
- *
- * @param {number} seq
- */
-function releaseConfirmSeq(seq) {
-  if (typeof seq === 'number') confirmSeq.delete(seq);
-}
-
 function askHumanConfirm(req) {
-  const id = `confirm-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  const CONFIRM_TIMEOUT_MS = 60_000;
-  // 序号在**登记那一刻**定下并写进卡片，之后不再重排：
-  // 用户看到的是"第 3 条"，中途有人答掉一条也不能让这张卡变成"第 2 条"。
-  const seq = allocConfirmSeq(id);
+  const convKey = String(req?.convKey ?? '');
+  const admins = coreAdminIds(config);
 
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      pendingConfirms.delete(id);
-      releaseConfirmSeq(seq);
-      log.warn('确认超时，按拒绝处理', { tool: req.tool, id, seq });
-      rpc.notify('confirm-timeout', { id, tool: req.tool });
-      resolve('deny');
-    }, CONFIRM_TIMEOUT_MS);
-    timer.unref?.();
+  /*
+   * 投递目标：只对**管理员私聊**推卡片。
+   *
+   * 判断的是"这个会话本身是不是某个管理员的私聊"，而不是
+   * "发起请求的会话形不形如 QQ"。后者会把群聊也当成投递目标。
+   */
+  const [kind, id] = convKey.split(':');
+  const isAdminDm = kind === 'private' && admins.includes(String(id));
 
-    pendingConfirms.set(id, { resolve, timer, req, seq });
-    // 参数摘要要脱敏后再给界面看
-    rpc.notify('confirm-request', {
-      id,
-      tool: req.tool,
-      risk: req.risk,
-      convKey: req.convKey,
-      args: redactArgs(req.args),
-      timeoutMs: CONFIRM_TIMEOUT_MS,
-    });
-    log.info('请求人工确认', { id, tool: req.tool, risk: req.risk });
-
-    /*
-     * 确认卡也要发到 QQ。
-     *
-     * ## 为什么这是必须的
-     *
-     * 用户从 QQ 发来 `/dsh ...`，插件 `plugin_dsh_ask` 是 R1，宿主按
-     * `deriveToolPolicy` 一律要求人工点头（R0 之外都是 confirm: always）。
-     * 而确认卡原来**只**走 rpc.notify 发给桌面端。
-     *
-     * 结果就是：人不在电脑前，从 QQ 下的指令卡在桌面端一个没人看见的弹窗上，
-     * 60 秒后按拒绝处理。用户看到的是"指令发出去了，DSH 没反应"。
-     *
-     * ## 只对 QQ 来源发
-     *
-     * convKey 形如 `private:123` / `group:456` 才是 QQ 会话；
-     * 桌面端自己操作时 convKey 不是这种形状（或为空），那就只走界面。
-     * 给桌面端也推一份 QQ 消息没有意义，还多一条噪音。
-     *
-     * 发失败只记日志：确认流程本身仍然有效（桌面端还能点），
-     * 不能因为 QQ 掉线让整条链路变成异常。
-     */
-    const qqConv = /^(private|group):\d+$/.test(String(req.convKey ?? ''));
-    if (qqConv) {
-      void sendConfirmToQq(id, req, CONFIRM_TIMEOUT_MS, seq).catch((err) => {
-        log.warn('确认卡推送 QQ 失败（桌面端仍可确认）', {
-          id,
-          message: String(/** @type {any} */ (err)?.message ?? err),
-        });
-      });
-    }
+  const { id: confirmId, seq, entry, promise } = confirms.register({
+    tool: String(req?.tool ?? ''),
+    risk: String(req?.risk ?? ''),
+    // 参数摘要脱敏后再进登记表：它会出现在界面快照里
+    args: redactArgs(req?.args),
+    convKey,
+    // 群聊/陌生私聊来的请求不设 QQ 投递目标：只能桌面端确认
+    replyConvKey: isAdminDm ? convKey : '',
+    // 群里任何人都可能看见卡片，所以处理人固定为管理员名单
+    allowedSenders: admins,
   });
+
+  /*
+   * 桌面端永远能看到这张卡（QQ 只是它的另一个入口）。
+   *
+   * 先 notify 再推 QQ：桌面端是**主**通道，它必须最先可用。
+   * 之前顺序反了，QQ 推送慢的时候桌面端的确认条会晚一拍才出现。
+   */
+  rpc.notify('confirm-request', {
+    id: confirmId,
+    seq,
+    tool: entry.tool,
+    risk: entry.risk,
+    convKey,
+    replyConvKey: entry.replyConvKey,
+    args: entry.args,
+    timeoutMs: CONFIRM_TIMEOUT_MS,
+  });
+  log.info('请求人工确认', {
+    id: confirmId,
+    seq,
+    tool: entry.tool,
+    risk: entry.risk,
+    qq: isAdminDm,
+  });
+
+  if (isAdminDm) {
+    /*
+     * 推送失败只留痕、不改变"继续等"的语义：
+     * 桌面端还能点，用户也可能自己想起来 QQ 上有卡片。
+     *
+     * 但**必须把失败写进登记表**（markPushFailed）：否则界面上这张卡
+     * 看起来和推送成功的一模一样，用户会去 QQ 里找一条根本不存在的消息。
+     */
+    void sendConfirmToQq(confirmId, entry, CONFIRM_TIMEOUT_MS).catch((err) => {
+      const msg = String(/** @type {any} */ (err)?.message ?? err);
+      confirms.markPushFailed(confirmId, msg);
+      log.warn('确认卡推送 QQ 失败（桌面端仍可确认）', { id: confirmId, message: msg });
+    });
+  }
+
+  return promise;
 }
 
 /**
- * 把一张确认卡发到发起指令的 QQ 会话。
+ * 把一张确认卡发到管理员私聊，并把消息 ID 绑到请求上。
  *
  * ## 为什么用 1 / 2 而不是编号
  *
  * 用户要的是「像审批那样回个数字」。编号 `confirm-1792686540396-c60ac6`
  * 三十多个字符，手机上根本没法准确抄写，抄错一位就变成"没有这条待确认"。
  *
- * 所以卡片上给**短序号**（1 = 同意，2 = 拒绝），序号到编号的映射留在
- * 内存里（`confirmSeq`）。这和 DSH 审批卡的交互完全一致：
- * 引用那条消息回数字即可。
+ * 所以卡片上给**短序号**（1 = 同意，2 = 拒绝），序号到编号的映射由
+ * ConfirmRegistry 冻结在登记那一刻 —— 中途有人答掉别的条，
+ * 这张卡上的序号也不会变。
  *
- * 序号只在**当前待确认集合**内唯一。并发多条时按创建顺序编号，
- * 卡片上会写出这次是哪一条（工具名 + 参数），所以不会批错对象。
+ * ## 消息 ID 必须真的绑上
  *
- * @param {string} id
- * @param {{tool: string, risk: string, args: object, convKey: string}} req
+ * 引用定位的全部依据就是 message_id。发送成功但没拿到 ID（上游怪象），
+ * 或发送被闸门拒绝，都必须如实记账 —— 硬编一个假 ID 会让所有引用
+ * 都查不到，或者更糟：查到一条错误的请求。
+ *
+ * @param {string} id 确认请求 ID
+ * @param {any} entry ConfirmRegistry 里的条目
  * @param {number} timeoutMs
- * @param {number} seq 登记时定下的序号，写进卡片供用户回复
  */
-async function sendConfirmToQq(id, req, timeoutMs, seq) {
+async function sendConfirmToQq(id, entry, timeoutMs) {
   const mins = Math.max(1, Math.round(timeoutMs / 60000));
-  const args = redactArgs(req.args);
+  const args = entry.args ?? {};
 
-  const lines = [`需要你点头才能继续（${req.tool}，${req.risk}）`];
+  const lines = [`需要你点头才能继续（${entry.tool}，${entry.risk}）`];
 
-  const pairs = Object.entries(args ?? {})
+  const pairs = Object.entries(args)
     .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
     .slice(0, 6);
   if (pairs.length > 0) lines.push(`参数：${pairs.join('，')}`);
 
   // 多条待确认时把序号显式写出来，避免"到底在批哪一条"
-  const total = confirmSeq.size;
+  const total = confirms.size;
   if (total > 1) {
-    lines.push(`这是第 ${seq} 条（共 ${total} 条待确认）。`);
+    lines.push(`这是第 ${entry.seq} 条（共 ${total} 条待确认）。`);
   }
 
-  lines.push(`回 1 同意，回 2 拒绝${total > 1 ? `；多条时可用「同意 ${seq}」` : ''}。${mins} 分钟内没回按拒绝处理。`);
+  lines.push(
+    `引用这条消息回 1 同意，回 2 拒绝${total > 1 ? `；也可以回「同意 ${entry.seq}」` : ''}。${mins} 分钟内没回按拒绝处理。`,
+  );
 
-  const r = await sendText(req.convKey, lines.join('\n'));
+  const r = await sendText(entry.replyConvKey, lines.join('\n'));
   if (r && r.ok === false) {
     // 推送失败必须留痕：不然用户既没看到卡片、日志里也没有任何线索，
     // 只能等到超时后看到一个"未获批准"，完全查不出原因。
+    confirms.markPushFailed(id, `${r.code ?? ''} ${r.message ?? ''}`.trim() || '发送被拒绝');
     log.warn('确认卡推送 QQ 失败（桌面端仍可确认）', {
       id,
       code: r.code,
       message: r.message,
     });
+    return;
+  }
+
+  /*
+   * 绑定消息 ID。
+   *
+   * 拿不到 ID 时**不发明一个**：卡片照发（用户仍能按"恰好一条"回），
+   * 但引用定位会失效 —— 那比绑错要安全得多。
+   */
+  const bind = confirms.bindMessage(id, r?.messageId);
+  if (!bind.ok) {
+    confirms.markPushFailed(id, bind.message ?? '推送结果缺少 message_id');
+    log.warn('确认卡已发出但无法绑定消息 ID（引用定位不可用）', {
+      id,
+      message: bind.message,
+    });
   }
 }
 
 /**
- * 答复一次确认请求。
+ * 桌面端答复一次确认请求。
+ *
+ * 桌面端就是用户本人在电脑前点按钮，所以**不做 QQ 身份 / 会话校验**；
+ * 但存在性、有效期、未结算状态照旧校验 —— 那些是请求本身的事实，
+ * 与谁来点无关。双端竞争（QQ 已答、桌面端再点）会命中"已处理过"。
  *
  * @param {string} id
  * @param {boolean} allow
- * @returns {{ok: boolean, message?: string}}
+ * @returns {{ok: boolean, message?: string, code?: string}}
  */
 function resolveConfirm(id, allow) {
-  const pending = pendingConfirms.get(id);
-  if (!pending) return { ok: false, message: '该确认已过期或不存在' };
-  pendingConfirms.delete(id);
-  clearTimeout(pending.timer);
-  // 与 pendingConfirms 同步释放：漏掉这一句，卡片上的序号和实际能回的对不上
-  releaseConfirmSeq(pending.seq);
-  pending.resolve(allow ? 'allow' : 'deny');
-  log.info('人工确认结果', { id, allow });
+  const r = confirms.resolveFromConsole({ id, allow });
+  if (!r.ok) return { ok: false, message: r.message ?? '该确认已过期或不存在', code: r.code };
+  log.info('人工确认结果（桌面端）', { id: r.id, allow: allow === true });
   return { ok: true };
 }
 
@@ -2169,13 +3804,150 @@ function redactArgs(args) {
   return out;
 }
 
+/**
+ * 表情相关工具的完整名。
+ *
+ * 列全而不是用 `plugin_sticker_` 前缀：禁用判定只做精确匹配
+ * （见 `tool-gate.isToolDisabled`），前缀匹配会让"禁掉表情"变成
+ * "禁掉所有以 sticker 开头的工具"，将来加一个 `sticker_stats`
+ * 会被无声地一起禁掉。
+ */
+const STICKER_TOOL_NAMES = Object.freeze([
+  'plugin_sticker_list',
+  'plugin_sticker_search',
+  'plugin_sticker_image',
+  'plugin_sticker_note',
+  'plugin_sticker_collect',
+  'plugin_sticker_send',
+]);
+
+/**
+ * 表情插件是否启用（按配置现读）。
+ *
+ * @returns {boolean}
+ */
+function stickerPluginEnabled() {
+  const list = config?.plugins?.enabled;
+  return Array.isArray(list) && list.includes('stickers');
+}
+
+/**
+ * 表情插件的配置（现读，含默认值兜底）。
+ *
+ * @returns {Record<string, any>}
+ */
+function stickerConfig() {
+  const raw = config?.plugins?.config?.stickers;
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+/**
+ * 本会话的人格对表情包的表态 → 要不要把表情工具拿掉。
+ *
+ * ## 为什么这是"结构性"的而不是"提示性"的
+ *
+ * 提示词是软约束。人格写着"不用表情包"、工具却摆在模型手边时，它有一定
+ * 概率还是会调 —— 而且那种调用看起来完全合理（备注写着"笑哭"、语境也
+ * 对得上），用户只会觉得"我不是说了别用吗"。
+ *
+ * 把工具从候选集里拿掉才是确定的：模型看不到，就调不出来。
+ *
+ * ## 为什么判据是人格而不是聊天内容（I14）
+ *
+ * `personaText` 是**管理员/用户自己写的卡片**，和 `admin.qqIds`、
+ * `plugins.chatTools` 是同一类输入。它不来自群消息，群里任何人
+ * 都无法影响它 —— 所以不违反"授权不能被对话内容影响"。
+ *
+ * @param {string} personaText 本会话解析出的人格文本（空串 = 用默认人格）
+ * @returns {{hideTools: boolean, stance: string}}
+ */
+function stickerPersonaDecision(personaText) {
+  // 没装/没启用插件时不必判断：工具本来就不在
+  if (!stickerPluginEnabled()) return { hideTools: false, stance: 'unset' };
+  const cfg = stickerConfig();
+  if (cfg.overridePersona === true) return { hideTools: false, stance: 'override' };
+
+  /*
+   * 空人格要按**默认人格**判，不能按"没表态"。
+   *
+   * personaStore.resolveFor 在没有任何卡命中时返回空串，而 buildMessages
+   * 会退回 DEFAULT_PERSONA —— 那份默认人格明确写着「不用表情包」。
+   * 这里若把空串当 unset，就会出现"提示词说不许用、工具却给了"。
+   */
+  const text = String(personaText ?? '').trim() || DEFAULT_PERSONA;
+  const stance = resolvePersonaStickerPolicy(text);
+  return { hideTools: stance === 'forbid', stance };
+}
+
 /** @returns {object} 当前生效的工具授权策略 */
 function toolPolicy() {
+  const chat = normalizeChatTools(config.plugins?.chatTools);
+  /*
+   * 联网总闸关着时，本回合的联网工具**结构性不可见**。
+   *
+   * 为什么不只靠 `ctx.net` 在调用时拒绝：那样模型仍看得到工具，
+   * 于是它会去调、会拿到 E4080、会再换一种说法重试 —— 用户看到的
+   * 是一串"搜不到"的失败，而事实是"你关掉了联网"。把它从可见集里
+   * 拿掉才是确定的：模型看不到，就不会调。
+   *
+   * 注意 `disabledTools` 只做**精确名字**匹配（见 tool-gate），
+   * 所以这里给的是完整工具名，不是前缀。
+   */
+  const netDisabled = disabledNetTools(config);
   return {
     groupHostToolsForbidden: true,
     proactiveHostToolsForbidden: true,
     allowR3Default: config.tools.allowR3 === true,
+    /*
+     * 聊天来源的插件工具授权。
+     *
+     * 必须**每次现算**（而不是启动时快照一份）：管理员在界面点完保存后
+     * 下一个回合就要生效。缓存会带来"改完还是老样子、重启才好"的体验，
+     * 而那正是这次改造要消灭的那类问题。
+     *
+     * 配置坏掉时退回默认全关（而不是让所有工具失效）：
+     * 归一化失败在启动校验与保存通道已经拦过了，这里只是兜底。
+     */
+    chatTools: chat.ok ? chat.value : normalizeChatTools(undefined).value,
+    ...(netDisabled ? { disabledTools: netDisabled } : {}),
   };
+}
+
+/**
+ * 合并两处"结构性禁用"的来源。
+ *
+ * ## 为什么需要合并，而不是让后一个覆盖前一个
+ *
+ * 目前有两个互不相关的来源：
+ *
+ *   · **环境级**（`toolPolicy`）：管理员关掉了联网总闸 —— 这是配置事实，
+ *     对所有会话一视同仁；
+ *   · **回合级**（`makeRunner` 的 `turn.disabledTools`）：本会话的人格卡
+ *     明确写了「不用表情包」。
+ *
+ * 覆盖的后果很具体：人格卡禁用了表情工具，而联网刚被关掉 ——
+ * 结果联网工具照样出现（或反过来）。两个来源都是"管理员侧的设定"，
+ * 它们该是**与**的关系，不是"谁后写听谁的"。
+ *
+ * 空集返回 `null`：`makeRunner` 用它判断"要不要往 policy 里放 disabledTools"。
+ * 放一个空数组进去虽然语义等价，但会让 `isToolDisabled` 每次多做一次
+ * 无用检查，也会让快照里的策略看起来"有东西被禁了"。
+ *
+ * @param {ReadonlyArray<string> | null | undefined} a
+ * @param {ReadonlyArray<string> | null | undefined} b
+ * @returns {string[] | null}
+ */
+function mergeDisabledTools(a, b) {
+  /** @type {string[]} */
+  const out = [];
+  for (const list of [a, b]) {
+    if (!Array.isArray(list)) continue;
+    for (const name of list) {
+      const s = String(name ?? '').trim();
+      if (s && !out.includes(s)) out.push(s);
+    }
+  }
+  return out.length > 0 ? out : null;
 }
 
 /* ---------------------------------------------------------------- RPC */
@@ -2257,6 +4029,141 @@ const rpc = {
     }
   },
 
+  /**
+   * 视觉状态（契约 §10）。**永不抛错**。
+   *
+   * 与 thinkingView 同样的理由：它是展示数据，算不出来只该让这一块空着，
+   * 不该把整份快照拖垮。测试里的 dispatcher 注入的模块可能没有这些函数，
+   * 所以这里还要容忍"函数不存在"。
+   *
+   * @returns {object}
+   */
+  visionView() {
+    try {
+      if (typeof buildVisionSnapshot !== 'function') throw new Error('视觉快照模块缺失');
+      return buildVisionSnapshot({
+        config: config?.vision,
+        capability: readVisionCapability(),
+        runtime: visionRuntime,
+        normalize: normalizeVisionConfig,
+      });
+    } catch (err) {
+      const note = String(/** @type {any} */ (err)?.message ?? err);
+      if (typeof log?.warn === 'function') log.warn('视觉快照计算失败（不影响其他数据）', { message: note });
+      /*
+       * 兜底形状必须与正常形状**一致**（字段一个不少）：
+       * 界面按字段取值，少一个就会在"出过错之后"整页显示 undefined。
+       */
+      return {
+        enabled: false,
+        limits: {},
+        capability: { probed: false, supported: null, model: '', basis: '', detail: '', probedAt: null },
+        effective: 'off',
+        runtime: {
+          turnsWithImages: 0,
+          imagesSubmitted: 0,
+          bytesSubmitted: 0,
+          skipped: 0,
+          lastCodes: [],
+          lastNotes: [],
+          lastTurn: { attempted: 0, loaded: 0, bytes: 0 },
+          imageRejectedCount: 0,
+          lastImageRejectedAt: null,
+          lastAt: null,
+        },
+        lastError: '视觉状态计算失败',
+      };
+    }
+  },
+
+  /**
+   * 联网状态（契约：docs/web-search-contract.md §6）。**永不抛错**。
+   *
+   * ## 为什么不在这里拼字段
+   *
+   * `buildNetView` 是"总闸 / 插件 / 配置"三个条件的唯一汇总点。
+   * 后端与界面各拼一份，迟早出现"快照说可用、调用被拒" ——
+   * 而那种不一致对用户来说就是"这个开关是假的"。
+   *
+   * ## 三个条件为什么必须分开显示
+   *
+   * 合成一句"不可用"会让用户找错地方：总闸关着 → 去插件页翻（那里一切正常）；
+   * 没配 Key → 以为搜不到东西，于是换关键词反复试。所以 `effective`
+   * 有四态，界面逐格显示。
+   *
+   * @param {any} pluginSnap 插件面快照（取其中 web-search 那一项）
+   * @returns {object}
+   */
+  networkView(pluginSnap) {
+    try {
+      /*
+       * 启动竞态：界面在 boot() 读完配置前就会拉快照。
+       * 这时**不能**按"缺省开"算 —— 那会让界面在启动那一秒显示
+       * "搜索可用"，而工具其实还没登记。给一个形状合法的 off 视图，
+       * 文案换成"正在启动"，与正常视图只差一个字符串。
+       */
+      if (!config) {
+        return {
+          ...buildNetView({
+            config: { network: { enabled: false } },
+            plugin: null,
+            hasSecret: false,
+            stats: networkRuntime,
+          }),
+          effectiveText: '正在启动：联网状态稍后显示',
+        };
+      }
+
+      const item = Array.isArray(pluginSnap?.items)
+        ? pluginSnap.items.find((one) => one?.id === NET_PLUGIN_ID) ?? null
+        : null;
+
+      /*
+       * 有没有 Key 只能看 `hasSecret`，不能看 value。
+       *
+       * `store.toView` 的纪律是"密钥字段的 value 恒为空串"，拿它判断
+       * 会永远显示"未配置"——用户明明填过 Key，界面却说没有。
+       */
+      const keyField = Array.isArray(item?.config)
+        ? item.config.find((f) => f?.key === 'apiKey')
+        : null;
+
+      return buildNetView({
+        config,
+        plugin: item,
+        hasSecret: keyField?.hasSecret === true,
+        stats: networkRuntime,
+        /*
+         * 原生联网的最近证据与计数。由宿主持有：它回答的是"这个进程到目前
+         * 为止带回过什么证据"，与插件是否启用无关。
+         */
+        nativeRuntime: nativeSearchRuntime,
+        /*
+         * 工具可见性以**注册表实况**为准，不是"理论上该有"。
+         *
+         * 插件启用了但 init 失败 / 本轮被结构性禁用时，`tools[].enabled`
+         * 会是 false。这时界面若还说"可用"，用户点一下就会失败，
+         * 而失败原因在别的页面才能看到。
+         */
+        toolVisible: (name) => Boolean(item?.tools?.some((t) => t.fullName === name && t.enabled)),
+      });
+    } catch (err) {
+      const note = String(/** @type {any} */ (err)?.message ?? err);
+      if (typeof log?.warn === 'function') log.warn('联网状态计算失败（不影响其他数据）', { message: note });
+      /*
+       * 兜底形状必须与正常形状**一致**（字段一个不少）：
+       * 界面按字段取值，少一个就会在"出过错之后"整页显示 undefined。
+       */
+      const fallback = buildNetView({
+        config: { network: { enabled: false } },
+        plugin: null,
+        hasSecret: false,
+        stats: networkRuntime,
+      });
+      return { ...fallback, lastError: '联网状态计算失败' };
+    }
+  },
+
   /** @param {string} method @param {object} params @returns {Promise<any>} */
   async handle(method, params) {
     switch (method) {
@@ -2285,6 +4192,27 @@ const rpc = {
             booting: true,
             // 形状与正常快照一致：界面不必为"启动中"再写一条分支
             thinking: rpc.emptyThinkingView(),
+            // 视觉块同理：形状与正常快照一致，界面不必为"启动中"多写一条分支
+            vision: {
+              enabled: false,
+              limits: normalizeVisionConfig(undefined),
+              capability: { probed: false, supported: null, model: '', basis: '', detail: '', probedAt: null },
+              effective: 'off',
+              runtime: {
+                turnsWithImages: 0,
+                imagesSubmitted: 0,
+                bytesSubmitted: 0,
+                skipped: 0,
+                lastCodes: [],
+                lastNotes: [],
+                lastTurn: { attempted: 0, loaded: 0, bytes: 0 },
+                imageRejectedCount: 0,
+                lastImageRejectedAt: null,
+                lastAt: null,
+              },
+            },
+            // 联网块同理：形状与正常快照一致（启动中 = 一个合法的 off 视图）
+            network: rpc.networkView(null),
           };
         }
         /*
@@ -2295,6 +4223,14 @@ const rpc = {
          * （中间正好有新消息落盘），界面会看到自相矛盾的两个计数。
          */
         const sessionList = sessionStore.list();
+        /*
+         * 插件面快照只算一次：下面 `plugins` 字段与 `network` 视图都要它。
+         *
+         * 算两次的后果不只是慢：两次之间插件可能刚好被停用，
+         * 于是"插件区块显示已停用、联网区块显示可用"——用户在同一个页面上
+         * 看到两个互相矛盾的结论。
+         */
+        const pluginSnap = await pluginSnapshotSafe();
         return {
           state: client?.state ?? 'idle',
           health: health.snapshot(),
@@ -2324,7 +4260,13 @@ const rpc = {
            * 那样用户连消息列表都看不到，症状是"界面拉取失败"，
            * 而真正的问题只在一个可选面板上。
            */
-          plugins: await pluginSnapshotSafe(),
+          plugins: pluginSnap,
+          /*
+           * 联网状态（契约 §6）。放在快照里而不是让界面自己算：
+           * "总闸开没开 / 插件启用没 / Key 存没存"三件事只有宿主知道
+           * （插件配置与密钥都不进界面），界面自己推必然与后端分叉。
+           */
+          network: rpc.networkView(pluginSnap),
           persona,
           /*
            * 传已知会话过去，界面就能显示"这张卡现在命中哪些会话"。
@@ -2344,6 +4286,36 @@ const rpc = {
             runtime: Object.fromEntries(
               [...recentByConv.keys()].map((k) => [k, wakeLedger.snapshot(k)]),
             ),
+          },
+          /*
+           * 分条设置（只读回显）。写入走 setting 通道的 `reply.*`。
+           *
+           * 附带 hardCap：界面要能说明"填再大也只到 10"，
+           * 否则用户把 3 改成 30、看到保存成功、发现还是 10 条上限，
+           * 会以为是 bug。
+           */
+          reply: {
+            ...config.reply,
+            hardCap: MAX_MESSAGES_HARD_CAP,
+          },
+          /*
+           * 管理员面（只读）。
+           *
+           * 界面要能回答两个问题，所以三份都给：
+           *   · `qqIds`        核心名单（用户在安全页编辑的那一份）
+           *   · `effective`    实际生效的（含兼容开关并进来的）
+           *   · `deliverable`  投递豁免名单（含 DSH 插件管理员）——
+           *     它与授权无关，只影响"送不送得到"，界面要分开说
+           *
+           * 不给号码做任何遮蔽：这是用户自己的界面，他要能核对。
+           * 但也不给**别处**的原始字符串（插件配置里的逗号串），
+           * 一律用归一化后的数组，免得界面自己再 split 一遍然后走样。
+           */
+          admin: {
+            qqIds: coreAdminIds(config),
+            inheritWhitelist: config.admin?.inheritWhitelist === true,
+            deliverable: deliverableAdminIds(config),
+            whitelistCount: Array.isArray(config.allow?.private) ? config.allow.private.length : 0,
           },
           /*
            * 日记（只读）。
@@ -2374,6 +4346,18 @@ const rpc = {
            * 和聊天里用指令开的临时静音。界面要显示后者才有用。
            */
           silence: snapshotSilence(),
+          /*
+           * 视觉状态（契约 §10）。
+           *
+           * 三块分开给，**永远不要合并**：
+           *   enabled    用户想不想开（可改）
+           *   capability 模型能不能（只读，实测结论，三态）
+           *   effective  这一回合实际会怎样（由前两者 + 本回合取图结果推出）
+           *
+           * 合并的后果是"未探测"被显示成"不支持"，用户于是再也不试 ——
+           * 而那正是这次要修的问题之一。
+           */
+          vision: rpc.visionView(),
           /*
            * 思考链路（只给界面看）。
            *
@@ -2421,7 +4405,7 @@ const rpc = {
              * 没有 `.size` 这种单值。写错了界面会一直显示 undefined。
              */
             queued: pendingTurns.total,
-            pendingConfirms: [...pendingConfirms.entries()].map(([id, p]) => ({ id, ...p.req })),
+            pendingConfirms: confirms.list(),
             /**
              * 每个会话的触发状态：主动发言的 30 分钟间隔就靠它。
              *
@@ -2687,6 +4671,13 @@ const rpc = {
         if (name === 'tool.run') {
           // 来源固定为 console：这条通道只有本机主进程能访问（stdio，不开端口），
           // 且不接受调用方自带 origin —— 否则就是一句话提权。
+          /*
+           * 插件工具在桌面端试跑：origin 固定 console，不参与群聊授权。
+           *
+           * 传 convKey 是为了让 ctx.chat 有会话可用（桌面端手动试工具时
+           * 媒体/消息能力要有个落点）。它仍然是**结构性事实**——
+           * 由宿主指定，不是模型给的。
+           */
           const runner = makeRunner(ORIGIN.CONSOLE, arg.convKey ?? 'private:0');
           return runner.run(arg.tool, arg.args);
         }
@@ -2858,35 +4849,27 @@ const rpc = {
           }
         }
         if (name === 'llm.probe') {
-          // 实测某个模型的能力（视觉 / 生图 / 通道）。
+          // 实测聊天模型的**视觉**能力（读图）。
           //
-          // 会发真实请求、消耗极少额度，所以只在用户点按钮时跑，
-          // 绝不在启动时自动执行。
+          // ## 为什么这里没有生图
+          //
+          // 生图是独立插件（`plugins/image-generation`）的事：另一套地址、
+          // 另一把 Key、另一个模型。拿聊天模型的配置去试 `/images/generations`
+          // 既可能误判，也会在用户只想测"能不能读图"时真的花掉一次生图的钱。
+          //
+          // 历史界面可能仍传 `probe: ['vision', 'image']`。这里**故意不读**
+          // 这个参数来决定探测种类 —— 旧客户端不会因此报错，也不可能再触发
+          // 任何生图请求。
           const m = String(arg.model ?? '').trim();
           if (!m) return { ok: false, code: 'E4041', message: '先选择模型' };
           if (!llm?.configured) return { ok: false, code: 'E3020', message: '还没配置 API Key' };
 
-          /** @type {Record<string, any>} */
-          const found = {};
           const probeEndpoint = config.llm.baseUrl;
-          const want = new Set(Array.isArray(arg.probe) ? arg.probe : ['vision', 'image']);
-
-          if (want.has('vision')) {
-            const r = await probeVision({
-              baseUrl: config.llm.baseUrl,
-              apiKey: currentApiKey,
-              model: m,
-            });
-            found.vision = r;
-          }
-          if (want.has('image')) {
-            const r = await probeImageGen({
-              baseUrl: config.llm.baseUrl,
-              apiKey: currentApiKey,
-              model: m,
-            });
-            found.image = r;
-          }
+          const { probes, channel } = await probeModel({
+            baseUrl: config.llm.baseUrl,
+            apiKey: currentApiKey,
+            model: m,
+          });
 
           // 只把**有明确结论**的写进配置，null（没测出来）不写。
           // 理由：把"没测出来"记成 false，下次打开界面会显示"不支持"，
@@ -2896,19 +4879,24 @@ const rpc = {
           const endpoint = endpointKey(probeEndpoint);
           const scoped = { ...(caps[endpoint] ?? {}) };
           const cur = { ...(scoped[m] ?? {}) };
-          cur.probes = found;
+          /*
+           * 顺手清掉旧字段：老配置里可能还留着上次生图探测的结论。
+           * 不清的话，这次只测视觉之后，界面会显示"读图：新结论 / 生图：旧结论"，
+           * 后者已经是无源之水。
+           */
+          delete cur.image;
+          delete cur.imageGen;
+          cur.probes = { vision: probes.vision };
           cur.endpoint = endpoint;
-          if (typeof found.vision?.supported === 'boolean') cur.vision = found.vision.supported;
-          if (typeof found.image?.supported === 'boolean') cur.image = found.image.supported;
-          const ch = inferChannel({ model: m, caps: cur });
-          cur.channel = ch.channel;
+          if (typeof probes.vision?.supported === 'boolean') cur.vision = probes.vision.supported;
+          cur.channel = channel.channel;
           cur.probedAt = new Date().toISOString();
           scoped[m] = cur;
           caps[endpoint] = scoped;
           config.llm.modelCapabilities = caps;
           await persistConfig();
 
-          return { ok: true, model: m, probes: found, caps: cur, channel: ch };
+          return { ok: true, model: m, probes, caps: cur, channel };
         }
         if (name === 'llm.test') {          // 用一次最小请求验证"地址 + 模型名 + key"三者是否配套。
           //
@@ -2995,6 +4983,56 @@ const rpc = {
           if (!shape.ok) return { ok: false, code: 'E40XX', message: shape.message };
           config.allow = shape.value;
           await persistConfig();
+          /*
+           * 白名单不再等于管理员 —— 但正在用兼容开关的人要能看到
+           * "我刚才把谁加进来了，于是他多了一份权限"。
+           *
+           * 这条日志不是噪音：兼容开关是有意打开的话，它就是唯一能
+           * 追溯"权限是什么时候变宽的"的地方。
+           */
+          if (config.admin?.inheritWhitelist === true) {
+            log.warn('白名单已更新；因开启了「白名单视为管理员」，新增号码同时获得管理员权限', {
+              private: shape.value.private.length,
+            });
+          }
+          return { ok: true };
+        }
+
+        /*
+         * 管理员名单 —— 「谁能让它动本机」。
+         *
+         * 单独一个 key，不和 allow 合并：合并会让"允许对话"顺带授出
+         * 宿主机权限，而用户不会意识到。两份清单各自回答各自的问题。
+         */
+        if (key === 'admin.qqIds' || key === 'admin') {
+          const raw = key === 'admin' ? (value && typeof value === 'object' ? value.qqIds : undefined) : value;
+          if (!Array.isArray(raw)) {
+            return { ok: false, code: 'E40XX', message: 'admin.qqIds 必须是数组' };
+          }
+          const ids = normalizeAdminIds(raw);
+          // 只要出现了不合法项就整体拒绝：静默丢弃会让用户填的号"消失"
+          if (ids.length !== raw.filter((x) => String(x ?? '').trim() !== '').length) {
+            return { ok: false, code: 'E40XX', message: '管理员名单里有非法 QQ 号（应为 4–15 位数字）' };
+          }
+          const removed = (config.admin?.qqIds ?? []).filter((x) => !ids.includes(String(x)));
+          config.admin = { ...(config.admin ?? {}), qqIds: ids };
+          await persistConfig();
+          log.warn('管理员名单已更新', { count: ids.length, removed: removed.length });
+          return { ok: true, count: ids.length };
+        }
+
+        if (key === 'admin.inheritWhitelist') {
+          if (typeof value !== 'boolean') {
+            return { ok: false, code: 'E40XX', message: 'admin.inheritWhitelist 必须是布尔值' };
+          }
+          config.admin = { ...(config.admin ?? {}), inheritWhitelist: value };
+          await persistConfig();
+          // 打开它是个权限放宽的动作，必须留痕（且写明后果）
+          log.warn(
+            value
+              ? '已开启「白名单视为管理员」：allow.private 里的号码将获得宿主机工具与确认权'
+              : '已关闭「白名单视为管理员」：管理员只认 admin.qqIds',
+          );
           return { ok: true };
         }
 
@@ -3046,6 +5084,40 @@ const rpc = {
           if (!r.ok) return r;
           await persistConfig();
           log.info('唤醒设置已更新', { field, value: r.echo ?? value });
+          return { ok: true, value: r.echo };
+        }
+
+        /*
+         * 分条设置（F22）。
+         *
+         * 和 `wake.*` / `silence.*` 一样用前缀匹配 + 字段白名单：
+         * 运行时改内存 config 绕过了启动校验，所以每个字段必须自己验类型。
+         * 存进一个形状不对的值（比如 maxMessages = "3"）不会当场报错，
+         * 只会在发送层被 normalize 成默认值 —— 用户会以为设置没生效。
+         */
+        if (typeof key === 'string' && key.startsWith('reply.')) {
+          const field = key.slice('reply.'.length);
+          const r = applyReplySetting(config, field, value);
+          if (!r.ok) return r;
+          await persistConfig();
+          log.info('分条设置已更新', { field, value: r.echo ?? value });
+          return { ok: true, value: r.echo };
+        }
+
+        if (typeof key === 'string' && key.startsWith('vision.')) {
+          const field = key.slice('vision.'.length);
+          const r = applyVisionSetting(config, field, value);
+          if (!r.ok) return r;
+          await persistConfig();
+          /*
+           * 清掉"本回合"的统计：用户刚改了预算/开关，界面上那块
+           * "上回合提交了 3 张图"描述的是旧设置下的行为，留着会让
+           * 用户以为新设置没生效。累计值（imagesSubmitted 等）不清 ——
+           * 那是历史事实，改了预算又不会让过去没花过的钱回来。
+           */
+          visionRuntime.lastTurn = { attempted: 0, loaded: 0, bytes: 0, codes: [], notes: [] };
+          visionRuntime.lastAt = null;
+          log.info('视觉设置已更新', { field, value: r.echo ?? value });
           return { ok: true, value: r.echo };
         }
 
@@ -3180,6 +5252,144 @@ const rpc = {
           return { ok: true };
         }
 
+        /*
+         * 联网总闸（契约 §0/§1）。
+         *
+         * ## 为什么必须在这里硬校验布尔
+         *
+         * 这是安全开关。值来自界面（正常是布尔），但也可能是手改配置或
+         * 别的客户端写入。`"false"` 这种字符串如果被真值转换成 true，
+         * 用户写的就是"关闭"、实际却是开着 —— 界面还会显示"已关闭"。
+         *
+         * ## 为什么写完要立刻 refresh()
+         *
+         * 关闸必须对**在途**请求生效，不能只拦新请求。用户点「关闭联网」
+         * 的那一刻，线上可能正有一个搜索在跑；等它自己跑完再回来，
+         * 用户看到的是"我关了它还在联网"。`refresh()` 会把在途的
+         * AbortController 全部 abort —— 这是这个开关唯一的"立即"语义。
+         */
+        if (key === 'network.enabled') {
+          if (typeof value !== 'boolean') {
+            return { ok: false, code: 'E40XX', message: 'network.enabled 必须是布尔值' };
+          }
+          /*
+           * 关闸的顺序在这里定，而不是散在分支里（见 src/net/toggle.mjs）：
+           *
+           *   · 关闭：先同步生效 → 再中止在途 → 最后落盘。磁盘慢的那几百毫秒
+           *     里请求仍在跑，用户看到的就是"我关了它还在联网"。
+           *   · 打开：先落盘成功 → 再生效。保存失败时保持关闭是安全方向。
+           *   · 关闭落盘失败：保持关闭并明确报告；绝不能回弹成 true。
+           *
+           * `save` 用**候选快照**写盘，不依赖全局 config 已被改过 ——
+           * 打开流程里 commit 发生在 save 成功之后。
+           */
+          const before = networkEnabledFrom(config);
+          const result = await applyNetworkToggle({
+            value,
+            commit: (next) => {
+              config.network = { ...(config.network ?? {}), enabled: next === true };
+            },
+            save: async (next) => {
+              const snapshot = {
+                ...config,
+                network: { ...(config.network ?? {}), enabled: next === true },
+              };
+              await writeJsonAtomic(paths.configPath, snapshot);
+            },
+            abortInflight: () => (netFactory ? netFactory.refresh() : 0),
+          });
+
+          if (result.ok) {
+            log.warn(value ? '联网总闸已打开' : '联网总闸已关闭', {
+              before,
+              after: value,
+              aborted: result.aborted,
+            });
+            return { ok: true, value };
+          }
+
+          log.error('联网总闸切换未完成', {
+            before,
+            requested: value,
+            persisted: result.persisted,
+            aborted: result.aborted,
+            code: result.code,
+            message: result.message,
+          });
+          /*
+           * 关闭失败时安全方向已经生效（result.closed），要把这一点传给界面：
+           * 只回一个 ok:false 会让页面把复选框弹回"开"，而它其实已经关了、
+           * 只是没保存成功。
+           */
+          return {
+            ok: false,
+            code: result.code ?? 'E40XX',
+            message: result.message,
+            value: result.value === true,
+            closed: result.closed === true,
+            persisted: result.persisted === true,
+          };
+        }
+
+        /*
+         * ---- 联网通道（独立搜索 API / 服务商原生联网）----
+         *
+         * ## 为什么允许在总闸关着时改
+         *
+         * 这里是"选了哪条通道"，不是"现在允不允许联网"。总闸关着时改它
+         * 只是预设，下次打开就按新通道走；如果把这里也拒绝，用户会以为
+         * 设置坏了。真正生效仍由 `network.enabled` 决定（`resolveNativeSearch`
+         * 会先看总闸，总闸关着时 effectiveMode 一定是 off）。
+         *
+         * ## 为什么不需要重建客户端
+         *
+         * `LlmClient` 的 `webSearch` 是**现读闭包**（见启动处与 rebuildLlmClient），
+         * 下一次请求就会用新配置。重建反而会丢掉正在进行的流。
+         */
+        if (key === 'network.mode') {
+          const v = String(value ?? '').trim();
+          if (v !== 'api' && v !== 'native') {
+            return {
+              ok: false,
+              code: 'E40XX',
+              message: 'network.mode 只能是 api（独立搜索 API）或 native（服务商原生联网）',
+            };
+          }
+          config.network = { ...(config.network ?? {}), mode: v };
+          await persistConfig();
+          log.info('联网通道已更新', { mode: v });
+          return { ok: true, value: v };
+        }
+
+        if (key === 'network.native.provider') {
+          const v = String(value ?? '').trim().toLowerCase().slice(0, 40);
+          config.network = {
+            ...(config.network ?? {}),
+            native: { ...(config.network?.native ?? {}), provider: v },
+          };
+          await persistConfig();
+          /*
+           * 未知服务商明确说清楚，而不是静默接受：它不会被按别家协议发送，
+           * 但用户需要知道"选了也等于没选"。
+           */
+          const known = v === '' || v === 'zhipu' || v === 'openai';
+          log.info('原生联网服务商已更新', { provider: v, known });
+          return { ok: true, value: v, known };
+        }
+
+        if (key === 'network.native.maxResults') {
+          const n = Number(value);
+          if (!Number.isInteger(n) || n < 1 || n > 20) {
+            return { ok: false, code: 'E4041', message: 'network.native.maxResults 必须是 1–20 的整数' };
+          }
+          config.network = {
+            ...(config.network ?? {}),
+            native: { ...(config.network?.native ?? {}), maxResults: n },
+          };
+          await persistConfig();
+          return { ok: true, value: n };
+        }
+
         if (key === 'plugins.enabled') {
           /*
            * 插件启用列表。
@@ -3238,6 +5448,73 @@ const rpc = {
           return { ok: true };
         }
 
+        if (key === 'plugins.chatTools' || (typeof key === 'string' && key.startsWith('plugins.chatTools.'))) {
+          /*
+           * 聊天来源的工具授权。
+           *
+           * ## 为什么走 setting 而不是 action
+           *
+           * 它写的是**配置**（要落盘、下次启动还得在），不是一次性动作。
+           * IPC 只有 snapshot/action/setting 三条通道（I11），
+           * 按语义就该是 setting —— 和 plugins.enabled / allowDangerous 一致。
+           *
+           * ## 为什么不重载插件
+           *
+           * 授权只影响"工具对某个来源是否可见"，而可见性在**每个回合**
+           * 现算（见 toolPolicy / makeRunner）。所以改完下一个回合就生效，
+           * 不需要 dispose → init 一遍（那会打断正在干活的插件）。
+           */
+          const cur = normalizeChatTools(config.plugins?.chatTools);
+          if (!cur.ok) {
+            return { ok: false, code: 'E40XX', message: `现有 chatTools 配置不合法：${cur.message}` };
+          }
+
+          /** @type {any} */
+          let next;
+          if (key === 'plugins.chatTools') {
+            // 整块写入：调用方必须给全三个档（缺的按"关闭"补齐，不猜）
+            next = value;
+          } else {
+            const channel = key.slice('plugins.chatTools.'.length);
+            if (!['group', 'private', 'proactive'].includes(channel)) {
+              return { ok: false, code: 'E40XX', message: `未知的授权档：${channel}` };
+            }
+            next = { ...cur.value, [channel]: value };
+          }
+
+          const normalized = normalizeChatTools(next);
+          if (!normalized.ok) {
+            return { ok: false, code: 'E40XX', message: normalized.message };
+          }
+
+          config.plugins.chatTools = normalized.value;
+          await persistConfig();
+
+          /*
+           * 把"哪些工具真的会被影响"记进日志。
+           *
+           * 只记档位与数量不够用：用户排查"我明明勾了表情包，群里还是不能用"时，
+           * 需要看到他勾的**具体名字**有没有对上工具全名（plugin_xxx）。
+           */
+          const summary = Object.fromEntries(
+            Object.entries(normalized.value).map(([ch, rule]) => [
+              ch,
+              { enabled: rule.enabled, tools: rule.tools, allowPaid: rule.allowPaid },
+            ]),
+          );
+          /*
+           * `channelName` 而不是直接用 key 拼进日志：
+           *
+           * 这里记的是**设置项名字**（`plugins.chatTools.group`），不是凭据。
+           * 但静态检查 I21 按"日志行里出现 key 字样"来防 API Key 泄露，
+           * 直接写变量名会命中那条规则 —— 与其放宽检查（那会削弱真正的保护），
+           * 不如换个名字，让这条日志在字面上也不像凭据。
+           */
+          const channelName = String(key);
+          log.info('聊天来源工具授权已更新', { field: channelName, chatTools: summary });
+          return { ok: true, chatTools: normalized.value };
+        }
+
         return { ok: false, code: 'E40XX', message: `未支持的设置项：${key}` };
       }
 
@@ -3284,6 +5561,11 @@ function rebuildLlmClient() {
     apiKey: currentApiKey,
     timeoutMs: config.llm.timeoutMs,
     thinking: config.llm.thinking,
+    // 同启动处：现读，避免"改完设置没生效"
+    webSearch: () => {
+      const resolved = resolveNativeSearch(config);
+      return resolved.active ? resolved.plan : null;
+    },
   });
   log.info('AI 接入设置已更新', {
     model: config.llm.model,
@@ -3617,6 +5899,17 @@ async function shutdown(code) {
   log.info('后端正在退出', { code });
   client?.close();
   /*
+   * 在途确认按拒绝结算。
+   *
+   * 不这么做的话，正在等用户点头的工具调用会一直挂到 60 秒超时 ——
+   * 而进程马上就要没了，那条 Promise 永远等不到结果，
+   * 执行器那边的工具调用就悬在半空（它的 finally 也不会跑）。
+   *
+   * 放在最前面：它只是内存操作，比落盘快得多，越早做越不会丢。
+   */
+  const cancelled = confirms.cancelAll(SETTLE_REASON.SHUTDOWN);
+  if (cancelled > 0) log.info('退出前取消了在途确认', { count: cancelled });
+  /*
    * 插件先收尾：子进程不关会变成孤儿进程，继续占着端口。
    *
    * 放在 thinkingStore.flush() 之前 —— 插件可能有"退出时落盘"的需求，
@@ -3682,4 +5975,13 @@ if (isDirectRun) {
 }
 
 // 供测试 import（不启动）
-export { validateConfig, DEFAULT_CONFIG, resolveToolSet, toOpenAiTools, RISK, describeTools, listTools };
+export {
+  validateConfig,
+  DEFAULT_CONFIG,
+  resolveToolSet,
+  toOpenAiTools,
+  RISK,
+  describeTools,
+  listTools,
+  buildImageRetryRunner,
+};

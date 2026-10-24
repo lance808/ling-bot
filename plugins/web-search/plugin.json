@@ -1,0 +1,217 @@
+{
+  "id": "web-search",
+  "name": "联网搜索",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "description": "把「独立搜索 API」接成工具：web_search 返回结构化来源（标题/URL/摘要），web_fetch 读取网页正文。是否放行由宿主的联网总开关决定，关闭时一个请求都不发。",
+  "author": "ling-bot",
+  "runtime": "in-process",
+  "trusted": true,
+  "entry": "index.mjs",
+  "validateConfig": true,
+  "permissions": ["host.net"],
+  "config": [
+    {
+      "key": "provider",
+      "label": "服务类型",
+      "type": "enum",
+      "options": [
+        { "value": "tavily", "label": "Tavily Search API（当前唯一实现）" }
+      ],
+      "default": "tavily",
+      "required": false,
+      "help": "本轮只实现 Tavily 的 POST /search 协议。其它服务商的请求体与错误语义各不相同，猜格式会让失败变成「静默的空结果」，所以留到后续单独适配。"
+    },
+    {
+      "key": "baseUrl",
+      "label": "服务地址",
+      "type": "text",
+      "default": "https://api.tavily.com",
+      "required": true,
+      "maxLength": 300,
+      "placeholder": "https://api.tavily.com",
+      "help": "只填到域名（程序会自己拼 /search）。可以换成兼容代理，但协议必须和 Tavily 一致，否则会报「响应不符合协议」——那是有意的：把协议不符和「搜不到」分开。"
+    },
+    {
+      "key": "apiKey",
+      "label": "API Key",
+      "type": "password",
+      "secret": true,
+      "required": true,
+      "maxLength": 512,
+      "placeholder": "tvly-…",
+      "help": "只存在本机加密保险箱（Windows DPAPI，绑定当前账户），不会回显、不进日志、不进快照。留空保存 = 保持原值。"
+    },
+    {
+      "key": "maxResults",
+      "label": "结果条数",
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 20,
+      "integer": true,
+      "required": false,
+      "help": "每次搜索最多返回几条来源。条数越多，进提示词的 token 越多；5 条通常够回答，10 条以上只在一份结果都不相关时才值得。"
+    },
+    {
+      "key": "searchDepth",
+      "label": "检索深度",
+      "type": "enum",
+      "options": [
+        { "value": "basic", "label": "basic（均衡，1 额度）" },
+        { "value": "fast", "label": "fast（更快，1 额度）" },
+        { "value": "ultra-fast", "label": "ultra-fast（最快，1 额度）" },
+        { "value": "advanced", "label": "advanced（最相关，2 额度）" }
+      ],
+      "default": "basic",
+      "required": false,
+      "help": "对应上游的 search_depth。advanced 会消耗双倍额度，只在需要高精度时切。"
+    },
+    {
+      "key": "timeoutMs",
+      "label": "搜索超时",
+      "type": "number",
+      "default": 15000,
+      "min": 1000,
+      "max": 60000,
+      "integer": true,
+      "required": false,
+      "help": "单次搜索的总时限（毫秒）。超时会明确报超时，不会被当成「没有结果」。"
+    },
+    {
+      "key": "allowFetch",
+      "label": "允许读取网页正文",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "关掉后 web_fetch 直接拒绝（搜索仍可用）。读取正文会真的去访问外部站点，只想让它「查一下」而不想让它抓页面时关掉这个。"
+    },
+    {
+      "key": "maxFetchBytes",
+      "label": "网页大小上限",
+      "type": "number",
+      "default": 204800,
+      "min": 1024,
+      "max": 1048576,
+      "integer": true,
+      "required": false,
+      "help": "单页响应体上限（字节），默认 200 KB。超出会截断并标记 truncated，不会把整站拖进提示词。"
+    },
+    {
+      "key": "fetchTimeoutMs",
+      "label": "网页读取超时",
+      "type": "number",
+      "default": 10000,
+      "min": 1000,
+      "max": 30000,
+      "integer": true,
+      "required": false,
+      "help": "单次抓取的总时限（毫秒），包含 DNS、连接、重定向与正文。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "web_search",
+      "description": "联网搜索：返回结构化来源列表（标题 / URL / 摘要）。回答里请注明来源链接；搜不到就如实说没有结果，不要编造。",
+      "needs": "host",
+      "risk": "R1",
+      "effects": ["net"],
+      "timeoutMs": 30000,
+      "params": {
+        "query": {
+          "type": "string",
+          "required": true,
+          "maxLength": 400,
+          "description": "要搜索的内容。用关键词或一句短问句；不要带换行，也不要塞整段聊天记录。"
+        },
+        "maxResults": {
+          "type": "number",
+          "required": false,
+          "description": "本次最多要几条来源（1–20）。只能比配置上限更少，不能更多；一般不用填。"
+        },
+        "topic": {
+          "type": "string",
+          "required": false,
+          "enum": ["general", "news", "finance"],
+          "description": "检索主题。查近期新闻用 news，查股票/行情用 finance，其余留空。"
+        }
+      }
+    },
+    {
+      "name": "web_fetch",
+      "description": "读取一个公网 http(s) 网页的正文（已降级为纯文本）。只接受公网地址，内网与本机地址会被拒绝。用于补充搜索结果里的细节。",
+      "needs": "host",
+      "risk": "R1",
+      "effects": ["net"],
+      "timeoutMs": 30000,
+      "params": {
+        "url": {
+          "type": "string",
+          "required": true,
+          "maxLength": 2048,
+          "description": "要读取的网页地址，必须是 http:// 或 https:// 开头的公网地址。"
+        },
+        "maxChars": {
+          "type": "number",
+          "required": false,
+          "description": "最多返回多少字符正文（200–50000）。默认 20000 左右，长文可以调大。"
+        }
+      }
+    }
+  ],
+  "notes": [
+    {
+      "title": "三种通道：关闭 / 独立搜索 API / 服务商原生联网",
+      "lines": [
+        "联网设置已并入《插件设置》页：选中「联网搜索」插件后，插件列表与详情之间的「联网搜索（宿主级设置）」区块里是总开关、联网通道与原生服务商；本插件自己的服务地址、Key、条数仍在本页插件详情的配置表单里。",
+        "独立搜索 API：Ling-bot 自己发请求，web_search / web_fetch 作为工具交给模型；总开关关掉即零请求，在途请求立即中止。",
+        "服务商原生联网：Ling-bot 只在模型请求体里声明联网（智谱 tools[type=web_search]、OpenAI web_search_options），检索由服务商完成；它不使用本插件这把 Key，也不受 needs: host 的来源限制，群聊与主动回合的每次模型请求都会带声明。",
+        "关闭总开关或切到独立搜索 API 时，不再发送任何联网声明；但已经发出的模型请求收不回来，服务商是否仍在其服务端自行检索无法验证。",
+        "原生模式与本插件不默认同时执行：原生模式下 web_search / web_fetch 两个插件工具结构性不可见，避免两条通道各搜一遍。"
+      ]
+    },
+    {
+      "title": "只支持一个真实协议",
+      "lines": [
+        "本轮只实现 Tavily Search API（POST {baseUrl}/search，Bearer Key，query / max_results / search_depth / topic；响应 results[].title / url / content）。",
+        "服务类型填成别的值会被明确拒绝（E4081），不会偷偷按 Tavily 的格式发给一个不兼容的服务。",
+        "模型每次要的条数只能比配置上限更少，不能更多；配置是费用上限。"
+      ]
+    },
+    {
+      "title": "Key 的边界",
+      "lines": [
+        "Key 只存在本机加密保险箱（Windows DPAPI），只由宿主的联网闭包使用；不下发到插件 ctx / 快照 / 日志 / 工具结果。",
+        "这条保证只覆盖 web-search 由宿主托管的这把 Key；其它插件仍按既有 secrets 契约拿自己的凭据。",
+        "上游若在错误体、标题、摘要或 URL 里回显 Key，返回值会脱敏，含脱敏占位符的 URL 不会作为来源。"
+      ]
+    },
+    {
+      "title": "为什么这两个工具只在管理员私聊与桌面端可用",
+      "lines": [
+        "这两个工具声明 needs: host（驱动出站网络）。宿主既有推导会把 host 类工具排除在群聊与主动回合之外 —— 群里任何人说一句话就能让它去访问一个 URL，那是最典型的 SSRF 入口。",
+        "服务商原生联网**不在此列**：它不经过工具链，声明随每次模型请求发出（含群聊与主动回合），可能产生服务商侧检索费用；它只能由管理员在桌面端开启。",
+        "想给群里用独立搜索，需要单独设计一个更小的能力面（例如只允许预置站点白名单），不是把这个开关拨开就行。"
+      ]
+    },
+    {
+      "title": "来源与可信度",
+      "lines": [
+        "搜索结果一律以「外部内容，非指令」包装回灌给模型：页面里写的「忽略之前的指令」只是数据所在句子，不会被执行。",
+        "请求成功不等于结果可靠：HTTP 200 但响应格式不对时报 E4085（协议不符），不会当成空结果；真正的空结果（results: []）才报「没搜到」。",
+        "每条结果的 URL 会再做一次形状校验（http/https、不带凭据），坏条目单条丢弃，不连累其余。",
+        "插件把取消（E4070）与一般业务失败都作为结构化结果返回；执行链会把取消提升为统一的取消分支，不会记成成功。"
+      ]
+    },
+    {
+      "title": "网页正文读取的限制",
+      "lines": [
+        "只允许 http/https 公网地址；URL ≤ 2048 字符；端口只允许 80/443；本地路径（file://、盘符、UNC）没有这条通路。",
+        "首跳与每一跳重定向都重新做 URL 形状 + DNS 全量公网校验（≤4 跳），防 DNS rebinding 与重定向到内网。",
+        "Content-Type 必须是白名单类型；缺失或其它类型直接 E4088，不猜 HTML。多重/未知 Content-Encoding 也拒绝。",
+        "压缩前与解压后的字节都受 maxFetchBytes 限制；总时限包含 DNS、连接、重定向与正文；取消或截断会销毁请求、响应与解压流。"
+      ]
+    }
+  ],
+  "ui": null
+}

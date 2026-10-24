@@ -7,9 +7,11 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 
 import { parseCommand, parseDuration, formatPendingList } from '../plugins/dsh-bridge/lib/command.mjs';
 import { DshBridge } from '../plugins/dsh-bridge/lib/bridge.mjs';
+import plugin from '../plugins/dsh-bridge/index.mjs';
 
 /* ---------------------------------------------------------------- 时长 */
 
@@ -462,4 +464,193 @@ test('多条待审批合并成一条，不刷屏', () => {
   assert.match(text, /\[2\]/);
   // 一次发送，不是两条消息
   assert.equal(text.includes('\n\n'), true);
+});
+
+/* ---------------------------------------------------------------- 宿主 gate（消息接管边界） */
+
+const GATE_TOKEN = 'gate-test-token';
+const ADMIN_ID = '10001';
+
+/** 起一个真的桥插件（随机空闲端口），并把推送/回执都记下来 */
+async function bootPlugin(t) {
+  /*
+   * 端口用 0 先问系统要一个，再放开给插件：插件配置层不接受 0
+   * （normalizePort 会把 0 当成脏值退默认端口，可能撞上真实桥）。
+   */
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  /** @type {any[]} 插件推给 QQ 的审批消息 */
+  const pushed = [];
+  /** @type {any[]} 回执消息 */
+  const receipts = [];
+  const sendText = async (convKey, text) => {
+    const messageId = `mid-${pushed.length + receipts.length + 1}`;
+    pushed.push({ convKey, text, messageId });
+    return { ok: true, messageId };
+  };
+  const replyText = async (convKey, text) => {
+    receipts.push({ convKey, text });
+    return { ok: true };
+  };
+  const ctx = {
+    config: { token: GATE_TOKEN, admins: ADMIN_ID, port },
+    secrets: {},
+    log: () => {},
+    sendText,
+  };
+  const init = await plugin.init(ctx);
+  assert.equal(init.ok, true, `桥应该能起来：${init.message}`);
+  t.after(async () => {
+    plugin.dispose(ctx).catch(() => {});
+  });
+  return { port, pushed, receipts, ctx, replyText };
+}
+
+/** 直接打插件起的本地桥路由 */
+async function post(port, path, body = {}) {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${GATE_TOKEN}` },
+    body: JSON.stringify(body),
+  });
+  return await res.json();
+}
+
+/** 等一个条件成立 */
+async function waitFor(fn, ms = 2000) {
+  const deadline = Date.now() + ms;
+  while (!fn()) {
+    if (Date.now() > deadline) throw new Error('等待条件超时');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** 管理员私聊事件 */
+function adminEvt(extra = {}) {
+  return {
+    convKey: `private:${ADMIN_ID}`,
+    isGroup: false,
+    sender: { userId: ADMIN_ID },
+    text: '1',
+    ...extra,
+  };
+}
+
+test('★ 宿主 confirmPending 时，不带引用的「1」不得被 DSH 抢走（带引用仍生效）', async (t) => {
+  const app = await bootPlugin(t);
+  const start = await post(app.port, '/dsh/ask', { toolName: 'fs_write', reason: '要写 README' });
+  await waitFor(() => app.pushed.length === 1);
+  const messageId = app.pushed[0].messageId;
+  const id = String(start.id);
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 1);
+
+  /*
+   * 宿主确认卡也在等：这句不带引用的「1」指代不明，必须让宿主接手。
+   * 旧实现会按"恰好一条待回复"把 DSH 这条批掉，宿主的确认卡随后被拒。
+   */
+  const taken = await plugin.handleMessage({
+    evt: adminEvt({ text: '1' }),
+    sendText: app.replyText,
+    ctx: app.ctx,
+    gate: { whitelisted: true, silenced: false, confirmPending: true },
+  });
+  assert.equal(taken, false, 'confirmPending 时不得接管不带引用的确认回复');
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 1, 'DSH 那条必须原样挂着');
+
+  // 带引用 = 已消歧：仍然按 messageId 精确认领，不受 confirmPending 影响
+  const quoted = await plugin.handleMessage({
+    evt: adminEvt({ text: '1', replyTo: { messageId } }),
+    sendText: app.replyText,
+    ctx: app.ctx,
+    gate: { whitelisted: true, silenced: false, confirmPending: true },
+  });
+  assert.equal(quoted, true, '带引用的 DSH 审批必须仍然生效');
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 0, '带引用回答后应结算掉');
+  assert.match(String(app.receipts.at(-1)?.text ?? ''), /允许一次/, `实际回执：${app.receipts.at(-1)?.text}`);
+  assert.equal(String(id).length > 0, true, '审批编号应存在');
+});
+
+test('★ 宿主 silenced / whitelisted=false 时 DSH 一律不接管（哪怕只有一条待审批）', async (t) => {
+  const app = await bootPlugin(t);
+  await post(app.port, '/dsh/ask', { toolName: 'shell' });
+  await waitFor(() => app.pushed.length === 1);
+
+  for (const [why, gate] of [
+    ['静音期', { silenced: true }],
+    ['不在白名单', { whitelisted: false }],
+  ]) {
+    const taken = await plugin.handleMessage({
+      evt: adminEvt({ text: '同意' }),
+      sendText: app.replyText,
+      ctx: app.ctx,
+      gate,
+    });
+    assert.equal(taken, false, `${why}：不得接管`);
+    assert.equal((await post(app.port, '/qq/pending')).items.length, 1, `${why}：待审批不能被悄悄结算`);
+    assert.equal(app.receipts.length, 0, `${why}：不该发任何回执`);
+  }
+
+  // 没有 gate（旧宿主/单测）时维持原行为：恰好一条待审批可省略编号
+  const normal = await plugin.handleMessage({
+    evt: adminEvt({ text: '同意' }),
+    sendText: app.replyText,
+    ctx: app.ctx,
+    gate: null,
+  });
+  assert.equal(normal, true, '没有 gate 限制时应照常接管');
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 0);
+});
+
+test('★ DSH 有多条待审批时，「是」这类确认短句必须提示带编号，不能落到正则/AI', async (t) => {
+  const app = await bootPlugin(t);
+  await post(app.port, '/dsh/ask', { toolName: 'fs_write' });
+  await post(app.port, '/dsh/ask', { toolName: 'shell' });
+  await waitFor(() => app.pushed.length === 2);
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 2);
+
+  /*
+   * 宿主确认表是空的（confirmPending:false），DSH 自己有两条待审批。
+   * 「是」既不是裸编号、parseCommand 也无法判定批哪一条。
+   * 旧实现 return false → 消息落到 regex-reply 口令或 AI 回合，
+   * 用户看到"已回复"、两条审批纹丝不动。
+   */
+  const taken = await plugin.handleMessage({
+    evt: adminEvt({ text: '是' }),
+    sendText: app.replyText,
+    ctx: app.ctx,
+    gate: { whitelisted: true, silenced: false, confirmPending: false },
+  });
+  assert.equal(taken, true, '必须自己收住，不能交给正则/AI');
+  assert.match(String(app.receipts.at(-1)?.text ?? ''), /2 条待处理审批/, `实际提示：${app.receipts.at(-1)?.text}`);
+  assert.match(String(app.receipts.at(-1)?.text ?? ''), /编号|引用/, '提示必须告诉用户怎么回复');
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 2, '提示不能顺手结算任何一条');
+
+  // 宿主有待确认时仍是"宿主优先"：DSH 让路（return false），不抢这句话
+  const hostWins = await plugin.handleMessage({
+    evt: adminEvt({ text: '是' }),
+    sendText: app.replyText,
+    ctx: app.ctx,
+    gate: { whitelisted: true, silenced: false, confirmPending: true },
+  });
+  assert.equal(hostWins, false, '宿主有待确认时 DSH 仍让路');
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 2);
+});
+
+test('恰好一条待审批时「同意」仍按既有语义直接结算（不破坏省略编号）', async (t) => {
+  const app = await bootPlugin(t);
+  await post(app.port, '/dsh/ask', { toolName: 'fs_write' });
+  await waitFor(() => app.pushed.length === 1);
+
+  const taken = await plugin.handleMessage({
+    evt: adminEvt({ text: '同意' }),
+    sendText: app.replyText,
+    ctx: app.ctx,
+    gate: { whitelisted: true, silenced: false, confirmPending: false },
+  });
+  assert.equal(taken, true);
+  assert.match(String(app.receipts.at(-1)?.text ?? ''), /已同意/, `实际回执：${app.receipts.at(-1)?.text}`);
+  assert.equal((await post(app.port, '/qq/pending')).items.length, 0, '应当结算掉那条审批');
 });

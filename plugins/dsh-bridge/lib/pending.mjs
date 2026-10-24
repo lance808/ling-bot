@@ -50,12 +50,41 @@ export class PendingQueue {
     this.entries = new Map();
     /** 自增编号；到 99 回卷，够用且好念 */
     this.nextNo = 1;
+    /**
+     * 两位数编号全部在册时的溢出号。
+     *
+     * 99 个编号同时挂起是极端情况，但一旦发生就**不能**再回卷：
+     * 覆盖掉一个还在等回答的条目，等于两条审批一起坏掉。宁可编号长一点。
+     */
+    this.nextOverflowNo = 100;
   }
 
-  /** 取下一个编号（99 之后回卷到 1） */
+  /**
+   * 取下一个编号（99 之后回卷到 1）。
+   *
+   * ## 为什么必须跳过**当前在册**的编号
+   *
+   * 回卷本身是设计的一部分：编号回收后复用，用户看到的仍是两位数。
+   * 危险的是回卷到一个**还没结算**的编号 —— `enqueue` 会直接
+   * `entries.set(id, newEntry)` 覆盖对方：
+   *
+   *   · 被覆盖那条的 Promise 永远悬着（没人再能 resolve 它）；
+   *   · 它的定时器到点后删掉的是**新**条目的登记，
+   *     于是新卡片在用户还没回答时就被判成超时。
+   *
+   * 编号是否在册是队列自己就知道的事实，所以这里按在册校验，
+   * 而不是指望"用户不会同时挂 98 条"。
+   *
+   * @returns {string}
+   */
   allocId() {
-    const id = String(this.nextNo);
-    this.nextNo = this.nextNo >= 99 ? 1 : this.nextNo + 1;
+    for (let i = 0; i < 99; i += 1) {
+      const id = String(this.nextNo);
+      this.nextNo = this.nextNo >= 99 ? 1 : this.nextNo + 1;
+      if (!this.entries.has(id)) return id;
+    }
+    const id = String(this.nextOverflowNo);
+    this.nextOverflowNo += 1;
     return id;
   }
 

@@ -3,7 +3,7 @@
   "name": "插件模板",
   "version": "1.0.0",
   "apiVersion": "1",
-  "description": "最小可运行插件模板：一个工具 + 三个配置项（text / number / password）。复制整个目录改名即可开始写自己的插件。",
+  "description": "最小可运行插件模板：一个工具 + 三个配置项（text / number / password），并演示 ctx.caller 与 ctx.chat（会话读取与发送）。复制整个目录改名即可开始写自己的插件。",
   "author": "ling-bot",
   "runtime": "process",
   "entry": "index.mjs",
@@ -43,9 +43,10 @@
   "tools": [
     {
       "name": "hello",
-      "description": "把传入的文字带上配置的前缀回显，用来验证插件通道是否工作。",
+      "description": "把传入的文字带上配置的前缀回显，并读一下当前会话最近的几条消息，再发一条回执到当前会话。",
       "needs": "qq",
-      "risk": "R0",
+      "risk": "R1",
+      "effects": ["chat.read", "chat.send"],
       "timeoutMs": 10000,
       "params": {
         "text": {
@@ -63,14 +64,24 @@
       "lines": [
         "把整个目录复制到 <用户数据目录>/plugins/<新 id>/，目录名必须等于 plugin.json 里的 id。",
         "改 plugin.json 的 id / name / description / config / tools，改 index.mjs 的 callTool 逻辑。",
-        "插件页「重新扫描」→ 填配置 → 启用；AI 就能调用 plugin_hello。"
+        "插件页「重新扫描」→ 填配置 → 启用；AI 就能调用 plugin_hello。",
+        "启用后群聊里默认仍然调不到它：还需要把 plugin_hello 写进 config.plugins.chatTools.group.tools 并打开该档（见插件接口文档 §2.6）。"
       ]
     },
     {
       "title": "两条容易踩的规则",
       "lines": [
         "工具名会自动加 plugin_ 前缀：清单里写 hello，模型看到的是 plugin_hello。",
-        "清单里不要写 origins / confirm / run —— 前两个由宿主按 needs 与 risk 推导，执行逻辑必须放在 index.mjs 的 callTool 里。"
+        "清单里不要写 origins / confirm / run —— 前两个由宿主按 needs、risk 与 effects 推导，执行逻辑必须放在 index.mjs 的 callTool 里。"
+      ]
+    },
+    {
+      "title": "为什么这个工具是 R1 而不是 R0",
+      "lines": [
+        "它声明了 effects: [\"chat.read\", \"chat.send\"]：会读当前会话的消息，还会往当前会话发一条消息。",
+        "发消息有外部影响（别人会看见、发出去收不回来），所以 effects 推导出的风险下限是 R1；即使这里硬写 risk: \"R0\"，宿主也会抬到 R1。",
+        "这不是限制作者，而是让「自动执行」不能靠声明换到：把发消息写成 R0，等于把外部影响伪装成只读。",
+        "只想演示纯回显、不碰聊天能力的插件，可以不写 effects 并保持 risk: \"R0\"，那样它才是自动执行的。"
       ]
     }
   ],

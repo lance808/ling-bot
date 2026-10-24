@@ -13,6 +13,8 @@ import path from 'node:path';
 import os from 'node:os';
 
 import { installBuiltinPlugins, BUILTIN_PLUGINS } from '../src/tools/builtin-plugins.mjs';
+import { normalizeManifest } from '../src/plugins/manifest.mjs';
+import { DEFAULT_CONFIG } from '../src/config/schema.mjs';
 
 /** 造一个临时目标目录 */
 async function tempDir() {
@@ -109,10 +111,116 @@ test('目标目录不存在时会自己建', async () => {
   }
 });
 
-test('清单里带默认启用的 dsh-bridge，外加最小示例 echo', () => {
-  // dsh-bridge 是默认启用的内置插件；echo 是随包的示例/验收插件。
-  assert.deepEqual(BUILTIN_PLUGINS, ['dsh-bridge', 'echo']);
+test('清单里带默认启用的 dsh-bridge，外加示例 echo、正则回复、课程表、表情包与联网搜索', () => {
+  // dsh-bridge 是默认启用的内置插件；echo 是随包的示例/验收插件；
+  // regex-reply 是随包的「正则直达回复」插件（默认不启用，避免装上就自动在群里说话）；
+  // course-schedule 是随包的课程表插件（默认不启用，要写按会话隔离的业务数据）；
+  // stickers 是随包的表情包插件（默认不启用，会往 QQ 账号里写收藏）；
+  // web-search 是随包的联网搜索插件（默认不启用，会往外发请求并吃搜索额度）。
+  assert.deepEqual(
+    BUILTIN_PLUGINS,
+    ['dsh-bridge', 'echo', 'regex-reply', 'course-schedule', 'stickers', 'web-search', 'image-generation'],
+  );
   assert.ok(BUILTIN_PLUGINS.includes('dsh-bridge'));
+});
+
+test('★ web-search 随包分发但默认不启用（联网必须由用户主动打开）', () => {
+  /*
+   * 三条同时成立才会有搜索工具：总闸开 + 插件启用 + 插件配了 Key。
+   *
+   * 总闸（network.enabled）缺省是 true，这是既有行为的延续；
+   * 但"缺省开"不等于"装上就联网" —— 插件不在启用列表里，
+   * 工具根本不会登记，也就没有任何出站请求。
+   */
+  assert.ok(BUILTIN_PLUGINS.includes('web-search'), '它必须在内置清单里，否则用户装不到');
+  assert.ok(
+    !DEFAULT_CONFIG.plugins.enabled.includes('web-search'),
+    '它默认不启用：会往外发请求并消耗搜索额度，应由用户主动打开',
+  );
+  assert.equal(DEFAULT_CONFIG.network.enabled, true, '总闸缺省开（旧配置行为不变）');
+});
+
+test('★ stickers 随包分发但默认不启用', () => {
+  /*
+   * 它有两个"装上就生效"的坏处：
+   *   1. 收藏是往 QQ 账号里写（R2、不可撤销、跨会话可见）；
+   *   2. 内置默认人格写着「不用表情包」—— 默认启用会立刻出现
+   *      "提示词说别用、工具却摆着"的分裂状态。
+   */
+  assert.ok(BUILTIN_PLUGINS.includes('stickers'), '它必须在内置清单里，否则用户装不到');
+  assert.ok(
+    !DEFAULT_CONFIG.plugins.enabled.includes('stickers'),
+    '它默认不启用：收藏会改 QQ 账号，应由用户主动打开',
+  );
+});
+
+test('★ regex-reply 随包分发但不默认启用（自动回复要由主人决定开不开）', () => {
+  assert.ok(BUILTIN_PLUGINS.includes('regex-reply'), '它必须在内置清单里，否则装了也没有');
+  // 默认启用列表来自 config schema：那里不该出现它
+  assert.ok(
+    !DEFAULT_CONFIG.plugins.enabled.includes('regex-reply'),
+    '它默认不启用：自动回复会在群里说话，不能装上就开',
+  );
+});
+
+test('★ course-schedule 随包分发但默认不启用', () => {
+  /*
+   * 铺盘 ≠ 启用。不铺过去，插件页里根本看不到这个目录，
+   * 用户也就找不到"在哪启用它"；写上启用列表则等于替用户决定开始攒数据。
+   */
+  assert.ok(BUILTIN_PLUGINS.includes('course-schedule'), '它必须在内置清单里，否则用户装不到');
+  assert.ok(
+    !DEFAULT_CONFIG.plugins.enabled.includes('course-schedule'),
+    '它默认不启用：课程表要写按会话隔离的业务数据，应由用户主动打开',
+  );
+});
+
+test('★ course-schedule 铺过去之后清单与入口对得上、且能被宿主校验通过', async () => {
+  /*
+   * 这条是"声明与行为分离"的落点：清单说它有 8 个工具，入口就必须真的有 callTool。
+   * course-schedule 是 runtime: process 的第三方风格插件，铺盘时最容易漏掉的
+   * 恰恰是 lib/ 下的文件（它必须自包含）。
+   */
+  const dir = await tempDir();
+  const target = path.join(dir, 'plugins');
+  try {
+    const r = await installBuiltinPlugins({ pluginsDir: target });
+    assert.deepEqual(r.failed, []);
+    const pluginDir = path.join(target, 'course-schedule');
+
+    const manifest = JSON.parse(await fs.readFile(path.join(pluginDir, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.id, 'course-schedule');
+    assert.equal(manifest.apiVersion, '1');
+    /*
+     * 这里**不**断言具体 runtime。
+     *
+     * 它改过——最初写 `process`（第三方风格），后来因为当前环境禁止 spawn
+     * 子进程（`spawn EPERM`）改成 `in-process` + `trusted`。运行时是可调整的
+     * 实现细节，铺盘测试该守的是"清单与入口对得上、宿主能校验通过"，
+     * 把 runtime 钉死只会让合法改动变成假红灯。
+     */
+    assert.ok(['process', 'in-process'].includes(manifest.runtime), manifest.runtime);
+    if (manifest.runtime === 'in-process') {
+      assert.equal(manifest.trusted, true, 'in-process 必须显式 trusted');
+    }
+    assert.equal(manifest.tools.length, 8, '清单里声明的 8 个工具');
+
+    // lib 下的实现文件要跟着铺过去，否则插件一 import 就 ENOENT
+    for (const f of ['lib/store.mjs', 'lib/model.mjs', 'lib/time.mjs', 'lib/format.mjs']) {
+      await fs.access(path.join(pluginDir, f));
+    }
+
+    // 入口能导入，且实现的是 callTool（新接口），不是旧的 run
+    const mod = await import(`file://${path.join(pluginDir, 'index.mjs').replace(/\\/g, '/')}`);
+    assert.equal(typeof mod.default?.callTool, 'function');
+    assert.equal(mod.default?.tools, undefined, '入口不再声明 tools（在 plugin.json 里）');
+
+    // 清单必须过宿主校验：这里同时覆盖了 object / 对象数组参数与 data.session
+    const v = normalizeManifest(manifest, { dirName: 'course-schedule' });
+    assert.equal(v.ok, true, v.message);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('不会把 node_modules 拷进去', async () => {

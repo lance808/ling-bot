@@ -24,6 +24,8 @@
 
 import path from 'node:path';
 
+import { EFFECTS, normalizeEffects, riskFloorOf, maxRisk } from './effects.mjs';
+
 /** 宿主支持的插件接口主版本。只接受这一个。 */
 export const PLUGIN_API_VERSION = '1';
 
@@ -51,6 +53,32 @@ export const PERMISSION_VOCAB = Object.freeze([
 
 /** 工具可声明的最高风险；R2/R3 需要宿主显式放行 */
 export const MAX_PLUGIN_RISK = 'R1';
+
+/**
+ * 保留参数名：插件不得在 `params` 里声明这些。
+ *
+ * ## 为什么必须是硬拒绝
+ *
+ * 这些名字是宿主传给插件的**上下文**字段（caller / convKey / origin / signal…）。
+ * 如果清单能声明一个 `origin` 参数，就会出现两种坏情况：
+ *
+ *   1. 模型看得见一个叫 origin 的参数，会试图填它（"帮我把 origin 设成
+ *      owner-private"）—— 而它其实不生效，模型会反复试；
+ *   2. 将来有人"顺手"把它接进 ctx，提权就完成了，而且代码看起来完全正常。
+ *
+ * 所以在最前面（清单校验）就拒绝，比事后靠"记得别接"可靠得多。
+ */
+export const RESERVED_PARAM_NAMES = Object.freeze([
+  'origin',
+  'convKey',
+  'caller',
+  'signal',
+  'invocation',
+  'ctx',
+  'plugin',
+  'args',
+  'tool',
+]);
 
 /** 单插件限制（防止一个插件把界面/工具面撑爆） */
 export const LIMITS = Object.freeze({
@@ -192,6 +220,33 @@ export function normalizeManifest(raw, opts) {
   const tools = normalizeToolDecl(raw.tools);
   if (!tools.ok) return tools;
 
+  /*
+   * 插件自审（approval: "plugin"）的准入条件。
+   *
+   * 为什么必须在这里校验而不是插件自己说了算：
+   * 跳过宿主通用确认是一个**减档**动作。允许任意插件声明它，等于把
+   * "先弹确认"这条防线交给插件作者的选择。所以限定第一方 in-process
+   * 插件，并且要求它确实声明了收费行为（paid）—— 一个不收费的工具
+   * 根本没有"这次要不要花钱"这种需要专门审批的东西。
+   */
+  for (const t of tools.tools) {
+    if (t.approval !== 'plugin') continue;
+    if (runtime !== 'in-process' || !trusted) {
+      return fail(
+        'E4041',
+        `工具 ${t.name} 声明了 approval: "plugin"，但只有 in-process + trusted: true 的第一方插件可以自行审批`,
+        `tools.${t.name}`,
+      );
+    }
+    if (!t.effects.includes('paid')) {
+      return fail(
+        'E4041',
+        `工具 ${t.name} 声明了 approval: "plugin"，但没有 effects: ["paid"]；插件自审只用于收费操作`,
+        `tools.${t.name}`,
+      );
+    }
+  }
+
   // 至少要提供点什么，否则这个插件没有任何可观测的效果
   if (tools.tools.length === 0 && raw.handleMessage !== true) {
     /*
@@ -215,6 +270,86 @@ export function normalizeManifest(raw, opts) {
     }
   }
 
+  /*
+   * ---- messagePriority（可选，默认 normal）----
+   *
+   * ## 它解决的是"两个插件抢同一条消息"
+   *
+   * 原来 `dispatchMessage` 按 `records` 的插入顺序遍历 —— 而插入顺序
+   * 来自磁盘目录扫描顺序。于是"谁先拿到消息"取决于文件名排序，
+   * 那不是一条可以推理的规则：装了一个新插件，可能把 dsh-bridge 的
+   * 审批回复抢走，而症状是"审批有时候没反应"，且换台机器就不复现。
+   *
+   * 所以把"我得在这条消息上排后面"变成清单里的一个**写下来的决定**：
+   * 归属明确的接管者（审批、确认）用默认的 normal；
+   * 兜底类/娱乐类接管者（自动回答、关键词、签到）声明 low。
+   *
+   * ## 为什么只给 in-process 插件
+   *
+   * `process` 插件根本收不到消息（见 docs/plugin-api.md §5.5）。
+   * 允许它声明这个字段，只会让人以为自己配了优先级、实际什么都没发生 ——
+   * 那种"配了没反应"的假开关比不给还糟。所以直接 E4041。
+   */
+  const messagePriority = raw.messagePriority === undefined ? 'normal' : String(raw.messagePriority);
+  if (messagePriority !== 'normal' && messagePriority !== 'low') {
+    return fail('E4041', 'messagePriority 只能是 "normal" 或 "low"', 'messagePriority');
+  }
+  if (messagePriority === 'low') {
+    if (runtime !== 'in-process') {
+      return fail(
+        'E4041',
+        'messagePriority: "low" 只对 in-process 插件有效：process 插件收不到消息，声明它不会有任何效果',
+        'messagePriority',
+      );
+    }
+    if (raw.handleMessage !== true) {
+      return fail(
+        'E4041',
+        '声明 messagePriority: "low" 前必须先声明 handleMessage: true（否则这个字段没有作用对象）',
+        'messagePriority',
+      );
+    }
+  }
+
+  /*
+   * ---- validateConfig（可选，默认 false）----
+   *
+   * ## 它解决的是"保存成功但跑不起来"
+   *
+   * 配置里可以放一段 JSON、一段正则、一组编号。这些值能通过
+   * 类型校验（都是字符串），但语义上可能是坏的。等 init 才报错时，
+   * 用户看到的是两件事：刚才"保存成功"，现在"初始化失败" ——
+   * 中间那层因果关系在界面上看不见。
+   *
+   * 声明它之后，宿主在**写盘之前**问插件"这套配置能用吗"。
+   * 失败就不落盘，用户改的还是改之前那份好配置。
+   *
+   * ## 为什么只给 in-process + trusted
+   *
+   * `process` 运行时要跨进程问一次结论，而保存是个同步语义的操作
+   * （用户点保存，要么存了要么没存）。如果为了保存单独起一个子进程，
+   * 那条路径自己就会因为超时/崩溃变成新的不确定来源。
+   *
+   * 所以只对第一方 in-process 插件开放 —— 这类插件的校验是纯计算，
+   * 毫秒级、不联网，失败模式也只有"抛异常"一种。
+   */
+  const validateConfig = raw.validateConfig === true;
+  if (raw.validateConfig !== undefined && typeof raw.validateConfig !== 'boolean') {
+    return fail('E4041', 'validateConfig 必须是布尔值', 'validateConfig');
+  }
+  if (validateConfig) {
+    if (runtime !== 'in-process') {
+      return fail(
+        'E4041',
+        'validateConfig: true 只对 in-process 插件有效：process 运行时无法在保存时同步给出结论',
+        'validateConfig',
+      );
+    }
+    if (!trusted) {
+      return fail('E4041', 'validateConfig: true 要求 trusted: true（仅限随包内置的第一方插件）', 'validateConfig');
+    }
+  }
+
   // ---- ui（预留边界）----
   const ui = normalizeUiDecl(raw.ui);
 
@@ -235,6 +370,13 @@ export function normalizeManifest(raw, opts) {
       tools: tools.tools,
       /** 是否声明了消息接管（只有 in-process 会真正收到消息） */
       handleMessage: raw.handleMessage === true,
+      /** 消息派发优先级：normal（默认，先跑）/ low（后跑）。见 docs/plugin-api.md §2.7 */
+      messagePriority,
+      /**
+       * 是否在保存配置前请求插件自校验。
+       * 为 true 时宿主会调用入口的 `validateConfig(config)`。见 §2.8
+       */
+      validateConfig,
       notes,
       ui,
       /** 清单里未识别的顶层键（向前兼容：只记录，不报错） */
@@ -243,6 +385,7 @@ export function normalizeManifest(raw, opts) {
           ![
             'id', 'name', 'version', 'apiVersion', 'description', 'author', 'runtime', 'trusted',
             'entry', 'permissions', 'config', 'tools', 'handleMessage', 'notes', 'ui',
+            'messagePriority', 'validateConfig',
           ].includes(k),
       ),
     },
@@ -482,6 +625,42 @@ export function normalizeToolDecl(raw) {
       return fail('E4041', `工具 ${name} 的 risk 非法：${risk}`, `tools.${name}`);
     }
 
+    /*
+     * effects：行为分类（见 effects.mjs 的文件头）。
+     *
+     * 作者声明的是"我需要做什么"，宿主据此推导**风险下限**：
+     *   effects: ['chat.send'] + risk: 'R0'  →  实际按 R1 处理
+     *
+     * 这一条是这次改造的重点之一：不能让"我想自动执行"变成
+     * "把发消息声明成只读无害"。
+     */
+    const eff = normalizeEffects(t.effects);
+    if (!eff.ok) {
+      return fail(eff.code, `工具 ${name} 的 ${eff.message}`, `tools.${name}`);
+    }
+    const floor = riskFloorOf(eff.effects);
+    const effectiveRisk = maxRisk(risk, floor);
+
+    /*
+     * approval：谁来做"这一次要不要花钱"的人工确认。
+     *
+     * 默认（缺省）由宿主弹通用确认卡。`"plugin"` 表示**插件自己**已经有一条
+     * 比通用卡片更具体的审批链路（例如：私信管理员、引用回复 1/2）。
+     * 声明它之后宿主不再弹通用卡 —— 否则一次生图会先出现"是否调用工具"，
+     * 管理员点同意之后又出现"是否同意生图"，两次确认里只要有一次被无脑点掉，
+     * 就等于没有确认。
+     *
+     * 条件在 normalizeManifest 里校验（那里才知道 runtime/trusted）：
+     *   · 仅 in-process + trusted 的第一方插件可用；
+     *   · 工具必须声明 effects: ["paid"]（收费）；
+     *   · 插件仍要自己保证审批不通过就不执行收费请求。
+     * 这**不是**把工具伪装成无副作用：risk/effects 照旧生效、照旧展示。
+     */
+    const approval = t.approval === undefined ? 'host' : String(t.approval);
+    if (approval !== 'host' && approval !== 'plugin') {
+      return fail('E4041', `工具 ${name} 的 approval 只能是 "host" 或 "plugin"`, `tools.${name}`);
+    }
+
     const params = normalizeParams(t.params, name);
     if (!params.ok) return params;
 
@@ -497,6 +676,11 @@ export function normalizeToolDecl(raw) {
       description,
       needs,
       risk,
+      /** effects 推导后的**生效风险**（授权与确认都按它走） */
+      effectiveRisk,
+      effects: eff.effects,
+      /** "host"（默认）或 "plugin"（插件自行审批，见上方说明） */
+      approval,
       timeoutMs,
       params: params.params,
     });
@@ -506,7 +690,184 @@ export function normalizeToolDecl(raw) {
 }
 
 /**
+ * 工具参数的标量/容器类型。
+ *
+ * `object` 与「array 的 items 是 object」是给这类工具用的：一次传一批结构化
+ * 记录（课程表、待办、账单），每个元素有固定的几个字段。没有它，插件只能
+ * 收一个 JSON 字符串（模型经常转义错、也拿不到字段级校验），或者为每个字段
+ * 声明一个顶层参数（`name1` / `name2` …那种谁都不想维护的东西）。
+ */
+const PARAM_TYPES = Object.freeze(['string', 'number', 'boolean', 'array', 'object']);
+
+/**
+ * 参数的 object 嵌套深度上限（含 array 元素里的 object）。
+ *
+ * 为什么要有：schema 是**递归**的，一个手写错的清单（A.properties.b 是 A）
+ * 会让构造 / 校验无限递归，直接爆栈——那属于"清单坏了却把加载器搞崩"。
+ * 深度从顶层参数里的第一个 object 算 1 层，最多 3 层。
+ * course-schedule 的 `courses: array<object>` 是 1 层，patch 也是 1 层。
+ */
+const MAX_PARAM_OBJECT_DEPTH = 3;
+
+/** 单个 object 参数最多声明多少个属性（与顶层参数上限一致） */
+const MAX_PARAM_PROPERTIES = 30;
+
+/** 参数名 / 对象属性名的形状（顶层与嵌套同一口径） */
+const PARAM_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_]{0,40}$/;
+
+/**
+ * 递归校验并规范化**一个**参数声明。
+ *
+ * 返回的 `built` 是宿主内部使用的形状，`tool-gate.toJsonSchema` 与
+ * `validateParams` 都只认它。已有的标量分支必须与改造前逐字段一致：
+ * 旧清单（没有 object/对象数组）经过这里必须得到完全相同的输出。
+ *
+ * @param {any} s 清单里的参数声明
+ * @param {string} path 字段路径（出错时点名用，如 `courses[].weekday`）
+ * @param {number} objectDepth 已经进入的 object 层数
+ * @returns {{ok: true, spec: Record<string, any>} | {ok: false, code: string, message: string, field?: string}}
+ */
+function normalizeParamSpec(s, path, objectDepth) {
+  if (!s || typeof s !== 'object') {
+    return fail('E4041', `${path} 声明必须是对象`, path);
+  }
+  const type = String(s.type ?? '');
+  if (!PARAM_TYPES.includes(type)) {
+    return fail('E4041', `${path} 类型不受支持：${type || '(空)'}`, path);
+  }
+
+  /** @type {Record<string, any>} */
+  const built = { type };
+  if (s.description !== undefined) built.description = String(s.description).slice(0, 300);
+  if (s.required === true) built.required = true;
+
+  if (type === 'string') {
+    if (s.maxLength !== undefined) {
+      const n = Number(s.maxLength);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        return fail('E4041', `${path} 的 maxLength 非法`, path);
+      }
+      built.maxLength = n;
+    }
+    if (s.enum !== undefined) {
+      if (!Array.isArray(s.enum) || s.enum.length === 0 || s.enum.some((v) => typeof v !== 'string')) {
+        return fail('E4041', `${path} 的 enum 必须是字符串数组`, path);
+      }
+      built.enum = s.enum.slice(0, 50);
+    }
+  }
+
+  if (type === 'array') {
+    if (s.maxItems !== undefined) {
+      const n = Number(s.maxItems);
+      if (!Number.isInteger(n) || n < 1 || n > 1000) {
+        return fail('E4041', `${path} 的 maxItems 非法`, path);
+      }
+      built.maxItems = n;
+    }
+    if (s.items !== undefined) {
+      if (!s.items || typeof s.items !== 'object' || Array.isArray(s.items)) {
+        return fail('E4041', `${path} 的 items 声明必须是对象`, path);
+      }
+      const itemType = String(s.items.type ?? '');
+      if (itemType === 'object') {
+        /*
+         * 对象元素。`items.required` 只能是**子属性必填数组**：元素本身没有
+         * "必填/不必填"这个维度（有没有元素由调用方决定、由长度上限兜住）。
+         * 写成布尔值直接拒绝 —— 静默忽略会让作者以为"哦，元素是必填的"，
+         * 而实际什么都没发生。
+         */
+        const itemSpec = { ...s.items };
+        if (typeof itemSpec.required === 'boolean') {
+          return fail('E4041', `${path} 的 items.required 必须是字符串数组（子属性必填）`, `${path}[]`);
+        }
+        const one = normalizeParamSpec(itemSpec, `${path}[]`, objectDepth);
+        if (!one.ok) return one;
+        built.items = one.spec;
+      } else if (['string', 'number', 'boolean'].includes(itemType)) {
+        // 标量元素：与改造前完全一致（只保留 type）
+        built.items = { type: itemType };
+      } else {
+        return fail('E4041', `${path} 的 items.type 非法`, path);
+      }
+    }
+  }
+
+  if (type === 'object') {
+    const depth = objectDepth + 1;
+    if (depth > MAX_PARAM_OBJECT_DEPTH) {
+      return fail(
+        'E4041',
+        `${path} 的对象嵌套超过 ${MAX_PARAM_OBJECT_DEPTH} 层（字段路径：${path}）`,
+        path,
+      );
+    }
+    const subs = s.properties === undefined ? {} : s.properties;
+    if (!subs || typeof subs !== 'object' || Array.isArray(subs)) {
+      return fail('E4041', `${path} 的 properties 必须是对象`, path);
+    }
+    const keys = Object.keys(subs);
+    if (keys.length > MAX_PARAM_PROPERTIES) {
+      return fail('E4041', `${path} 的 properties 最多 ${MAX_PARAM_PROPERTIES} 个`, path);
+    }
+
+    /** @type {Record<string, any>} */
+    const props = {};
+    for (const [pname, sub] of Object.entries(subs)) {
+      if (!PARAM_NAME_RE.test(pname)) {
+        return fail('E4041', `${path} 的属性名非法：${pname}`, `${path}.${pname}`);
+      }
+      /*
+       * 嵌套属性**不做**保留字检查：RESERVED_PARAM_NAMES 防的是"宿主上下文
+       * 被模型从参数里塞进来"，而那只有顶层参数会进入 ctx。嵌套属性只是
+       * 塞进插件自己的对象里，没有那条注入路径。但名字格式仍然校验，
+       * 否则界面和日志里会出现没法引用的键。
+       */
+      const one = normalizeParamSpec(sub, `${path}.${pname}`, depth);
+      if (!one.ok) return one;
+      props[pname] = one.spec;
+    }
+    built.properties = props;
+
+    /*
+     * `required` 在这里有两种含义，必须区分开：
+     *   · `required: true`（布尔）→ 这个参数**本身**必填（上面已处理，
+     *     存放在 `built.required`）；
+     *   · `required: ["a","b"]`（字符串数组）→ 对象里哪几个**属性**必填。
+     *
+     * 数组形式在归一化阶段就**落到子属性的 `required: true` 上**，而不是
+     * 另存一份"父对象上的必填名单"。两份数据会漂移：只更新一份之后，
+     * 模型看到的 schema 与执行层的校验就会给出不同结论，而这种 bug
+     * 只会在"必填字段恰好缺失"时暴露。落下之后，`toJsonSchema` 与
+     * `validateParams` 都只认子属性自己的 required，跟普通参数一条路径。
+     *
+     * 写了数组却引用未声明的属性 = 清单错误：那种"必填一个不存在的字段"
+     * 永远无法满足，工具会稳定失败，而报错信息看起来像是模型没填。
+     */
+    if (Array.isArray(s.required)) {
+      for (const name of s.required) {
+        if (typeof name !== 'string') {
+          return fail('E4041', `${path} 的 required 必须是字符串数组`, path);
+        }
+        if (!Object.prototype.hasOwnProperty.call(props, name)) {
+          return fail('E4041', `${path} 的 required 里有未声明的属性：${name}`, `${path}.${name}`);
+        }
+        props[name].required = true;
+      }
+    } else if (s.required !== undefined && typeof s.required !== 'boolean') {
+      return fail('E4041', `${path} 的 required 必须是布尔值或字符串数组`, path);
+    }
+  }
+
+  return { ok: true, spec: built };
+}
+
+/**
  * 校验工具参数 schema（与内置工具的 params 形状一致）。
+ *
+ * 支持 `string` / `number` / `boolean` / `array` / `object`，其中
+ * `object` 的 `properties` 递归、`array` 的 `items` 可以是标量或对象。
+ * 原有的标量行为逐字段不变。
  *
  * @param {unknown} raw
  * @param {string} toolName
@@ -523,52 +884,28 @@ function normalizeParams(raw, toolName) {
   /** @type {Record<string, any>} */
   const out = {};
   for (const [pname, spec] of Object.entries(raw)) {
-    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,40}$/.test(pname)) {
+    if (!PARAM_NAME_RE.test(pname)) {
       return fail('E4041', `工具 ${toolName} 的参数名非法：${pname}`, `tools.${toolName}`);
+    }
+    if (RESERVED_PARAM_NAMES.includes(pname)) {
+      /*
+       * 保留名硬拒。理由见 RESERVED_PARAM_NAMES 的注释：
+       * 这些是宿主注入的上下文，模型绝不能看到、更不能填。
+       */
+      return fail(
+        'E4041',
+        `工具 ${toolName} 的参数名 ${pname} 是保留字（${RESERVED_PARAM_NAMES.join(' / ')}），宿主会把上下文直接交给插件，不需要也不允许通过参数传递`,
+        `tools.${toolName}`,
+      );
     }
     if (!spec || typeof spec !== 'object') {
       return fail('E4041', `工具 ${toolName} 的参数 ${pname} 声明必须是对象`, `tools.${toolName}`);
     }
-    const s = /** @type {any} */ (spec);
-    const type = String(s.type ?? '');
-    if (!['string', 'number', 'boolean', 'array'].includes(type)) {
-      return fail('E4041', `工具 ${toolName} 的参数 ${pname} 类型不受支持：${type || '(空)'}`, `tools.${toolName}`);
+    const one = normalizeParamSpec(spec, `工具 ${toolName} 的参数 ${pname}`, 0);
+    if (!one.ok) {
+      return { ...one, field: `tools.${toolName}.params.${pname}` };
     }
-    /** @type {Record<string, any>} */
-    const built = { type };
-    if (s.description !== undefined) built.description = String(s.description).slice(0, 300);
-    if (s.required === true) built.required = true;
-    if (type === 'string') {
-      if (s.maxLength !== undefined) {
-        const n = Number(s.maxLength);
-        if (!Number.isInteger(n) || n < 1 || n > 65535) {
-          return fail('E4041', `工具 ${toolName} 的参数 ${pname} 的 maxLength 非法`, `tools.${toolName}`);
-        }
-        built.maxLength = n;
-      }
-      if (s.enum !== undefined) {
-        if (!Array.isArray(s.enum) || s.enum.length === 0 || s.enum.some((v) => typeof v !== 'string')) {
-          return fail('E4041', `工具 ${toolName} 的参数 ${pname} 的 enum 必须是字符串数组`, `tools.${toolName}`);
-        }
-        built.enum = s.enum.slice(0, 50);
-      }
-    }
-    if (type === 'array') {
-      if (s.maxItems !== undefined) {
-        const n = Number(s.maxItems);
-        if (!Number.isInteger(n) || n < 1 || n > 1000) {
-          return fail('E4041', `工具 ${toolName} 的参数 ${pname} 的 maxItems 非法`, `tools.${toolName}`);
-        }
-        built.maxItems = n;
-      }
-      if (s.items !== undefined) {
-        if (!s.items || typeof s.items !== 'object' || !['string', 'number', 'boolean'].includes(String(s.items.type))) {
-          return fail('E4041', `工具 ${toolName} 的参数 ${pname} 的 items.type 非法`, `tools.${toolName}`);
-        }
-        built.items = { type: String(s.items.type) };
-      }
-    }
-    out[pname] = built;
+    out[pname] = one.spec;
   }
   return { ok: true, params: out };
 }
@@ -598,31 +935,65 @@ export function normalizeUiDecl(raw) {
 }
 
 /**
- * 由 needs/risk 推导工具在宿主里的权限形状。
+ * 由 needs/risk/effects 推导工具在宿主里的权限形状。
  *
  * **这是唯一决定权限的地方**：插件在清单里写 origins/confirm 一律无效。
  *
- * @param {{needs: string, risk: string}} tool
- * @returns {{kind: string, origins: string[], risk: string, confirm: string}}
+ * ## 为什么 qq 类工具的 origins 里现在有 group / proactive
+ *
+ * 改造前这里写的是 `['owner-private','owner-group','console']` ——
+ * 也就是说**普通群友和主动回合根本不在候选集里**，"授权给群"这件事
+ * 无论怎么配都不可能生效。
+ *
+ * 现在改成"候选集放宽、实际可见性由管理员配置决定"：
+ *
+ *   · origins 回答「这个工具**最多**能去哪」（qq 类含 group/proactive，
+ *     host 类不含 —— 有宿主机能力的工具永远不进群）；
+ *   · `plugins.chatTools` 回答「管理员**实际**放开了哪一档」。
+ *
+ * 两者是**与**，所以默认（chatTools 全关）等价于改造前的行为，
+ * 而管理员点名之后 group / proactive 才真正生效。
+ *
+ * 为什么不能只靠 chatTools 而不动 origins：`isToolGranted` 的第一步就是
+ * "origin 在不在 origins 里"。少了这一环，后面的授权判定根本走不到。
+ *
+ * @param {{needs: string, risk: string, effectiveRisk?: string, effects?: string[], approval?: string}} tool
+ * @returns {{kind: string, origins: string[], risk: string, confirm: string, approval: string}}
  */
 export function deriveToolPolicy(tool) {
   // needs 决定"这个工具能出现在哪些回合"
   //   host = 需要动本机：只给主人私聊（+ 桌面端本人操作）
-  //   qq   = 只动 QQ：主人私聊 + 主人所在群（+ 桌面端）
+  //   qq   = 只动 QQ：主人私聊 + 主人所在群 + **普通群聊/陌生人私聊/主动回合**
+  //          （后三者还要过 plugins.chatTools 这一关，默认关闭）
   //
   // CONSOLE 与内置工具保持一致：桌面端就是用户本人坐在电脑前，
   // 不给它反而会出现"界面里手动试工具却报没权限"的怪事。
   const origins =
     tool.needs === 'host'
       ? ['owner-private', 'console']
-      : ['owner-private', 'owner-group', 'console'];
+      : ['owner-private', 'owner-group', 'group', 'proactive', 'console'];
+
+  /*
+   * 风险取 effects 推导后的生效值。
+   *
+   * 注意这里**不能**回落到声明值：`effects: ['exec']` 而 risk 写 R0 时，
+   * 按声明走会让一个能执行命令的工具被当成"只读无害"自动执行。
+   */
+  const risk = tool.effectiveRisk ?? tool.risk;
 
   return {
     kind: tool.needs === 'host' ? 'host' : 'qq',
     origins,
-    risk: tool.risk,
-    // R0 自动执行，其余一律要人点头（与内置工具同一套规则）
-    confirm: tool.risk === 'R0' ? 'never' : 'always',
+    risk,
+    // R0 自动执行，其余一律要人点头（与内置工具同一套规则）。
+    // 聊天来源的"已授权免确认"在 executor 里按调用再算一次。
+    confirm: risk === 'R0' ? 'never' : 'always',
+    /*
+     * approval 不改风险、不改可见性，只说明"这次点头由谁问"。
+     * "plugin" 的合法性已在 normalizeManifest 里按 runtime/trusted/paid 校验过；
+     * 这里原样带出去，执行器据此跳过宿主的通用确认卡。
+     */
+    approval: tool.approval === 'plugin' ? 'plugin' : 'host',
   };
 }
 

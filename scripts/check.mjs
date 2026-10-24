@@ -432,19 +432,42 @@ async function checkBehaviorLayerIsConstant() {
 }
 
 async function checkConfirmIsFailClosed() {
-  // 确认通道必须默认拒绝、有超时
-  const file = path.join(repoRoot, 'src/index.mjs');
-  const text = await fs.readFile(file, 'utf8');
+  /*
+   * 确认通道必须默认拒绝、有超时。
+   *
+   * ## 为什么要读两个文件
+   *
+   * 这条不变量原来只读 `src/index.mjs` —— 那时超时、序号、结算全挤在
+   * 那个文件里。现在结算逻辑收进了 `src/guard/confirm.mjs`
+   * （唯一结算入口，超时/取消/双端竞争都走它），所以：
+   *
+   *   · `index.mjs` 负责**注入超时值**（CONFIRM_TIMEOUT_MS = 60_000）
+   *   · `confirm.mjs` 负责**按时落 deny**
+   *
+   * 只检查其中一个，就会在"逻辑搬家"时给出假红灯（或更糟：假绿灯）。
+   * 两处都验，才真的钉住"超时即拒绝"。
+   */
+  const indexText = await fs.readFile(path.join(repoRoot, 'src/index.mjs'), 'utf8');
+  const registryText = await fs.readFile(path.join(repoRoot, 'src/guard/confirm.mjs'), 'utf8');
+
   const bad = [];
-  if (!/CONFIRM_TIMEOUT_MS\s*=\s*60_000/.test(text)) bad.push('缺 60s 确认超时');
-  if (!/resolve\(['"]deny['"]\)/.test(text)) bad.push('超时没有落在 deny');
+  if (!/CONFIRM_TIMEOUT_MS\s*=\s*60_000/.test(indexText)) bad.push('缺 60s 确认超时');
+  if (!/timeoutMs:\s*CONFIRM_TIMEOUT_MS/.test(indexText)) {
+    bad.push('超时值没有传进确认登记表（配了也不生效）');
+  }
+  // 超时必须落在 deny：定时器回调与惰性清理两条路径都要
+  const denyOnTimeout = /#settle\(\s*entry,\s*'deny',\s*SETTLE_REASON\.TIMEOUT/.test(registryText);
+  if (!denyOnTimeout) bad.push('超时没有落在 deny');
 
   // 只在**代码**里找"始终允许"（注释里提到它是在说明为什么不提供，不算违规）
-  const code = text
-    .split('\n')
-    .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
-    .join('\n');
-  if (/始终允许|alwaysAllow/.test(code)) bad.push('代码里出现了"始终允许"（一次确认只能管一次）');
+  const strip = (text) =>
+    text
+      .split('\n')
+      .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+      .join('\n');
+  if (/始终允许|alwaysAllow/.test(strip(indexText) + strip(registryText))) {
+    bad.push('代码里出现了"始终允许"（一次确认只能管一次）');
+  }
 
   if (bad.length) failures.push(`I17 确认通道不符合 fail-closed：${bad.join('；')}`);
   else passes.push('I17 确认通道 fail-closed（超时即拒绝，无"始终允许"）');
@@ -559,7 +582,61 @@ async function checkSourceEncoding() {
   else passes.push('I20 源文件编码统一（UTF-8 无 BOM）');
 }
 
+/* ---------------------------------------------------------------- 确认路由 */
+
+/**
+ * 确认回复的路由归属 —— 跑真实链路自检。
+ *
+ * ## 为什么把它接进 check 而不是留一个独立脚本
+ *
+ * `scripts/verify-confirm-route.mjs` 从**原始 OneBot JSON** 开始，
+ * 走真实的 normalizeEvent → 归属判定 → 结算。它能抓到单测抓不到的一类问题：
+ * 字段名读错（DECISIONS K33 就是 `evt.replyToMessageId` 不存在，
+ * 而所有单测都构造了正确字段，全绿）。
+ *
+ * 这类回归的代价很高：卡片发出去、用户回了、什么也没发生，
+ * 而且日志里看起来一切正常。所以它必须**每次 check 都跑**，
+ * 而不是"想起来的时候手动跑一下"。
+ */
+async function checkConfirmRoute() {
+  try {
+    const { stdout } = await execFileAsync(process.execPath, [path.join(repoRoot, 'scripts', 'verify-confirm-route.mjs')], {
+      cwd: repoRoot,
+      env: { ...process.env },
+    });
+    const m = stdout.match(/(\d+) 通过 \/ (\d+) 失败/);
+    passes.push(`确认回复路由自检通过（${m ? m[1] : '?'} 项，含真实 OneBot 事件）`);
+  } catch (err) {
+    failures.push(`确认回复路由自检失败：\n${String(err.stdout ?? err.message).split('\n').slice(-20).join('\n')}`);
+  }
+}
+
 /* ---------------------------------------------------------------- 测试 */
+
+/**
+ * 分条链路自检 —— 跑真实的解析 / 拆分 / 串行 / 记账模块，只有 send 是假的。
+ *
+ * ## 为什么这条也要进 check
+ *
+ * 单测各自 mock 得很干净，而真正出问题时往往是**接线**错了
+ * （比如把 split 的结果喂给了错的参数）。那种错误在"每个函数都对"
+ * 的单测里看不见，但会在真实链路上把回复发成碎片或整段丢失。
+ *
+ * 它不碰网络、不发 QQ、不调模型，所以每次 check 都跑得起。
+ */
+async function checkReplySplitRoute() {
+  try {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [path.join(repoRoot, 'scripts', 'verify-reply-split.mjs')],
+      { cwd: repoRoot, env: { ...process.env } },
+    );
+    const ok = (stdout.match(/✓/g) ?? []).length;
+    passes.push(`分条链路自检通过（${ok} 项：解析 / 拆分 / 串行 / 记账）`);
+  } catch (err) {
+    failures.push(`分条链路自检失败：\n${String(err.stdout ?? err.message).split('\n').slice(-20).join('\n')}`);
+  }
+}
 
 async function runTests() {
   // Node 24 的 --test 需要文件 glob，传目录会被当模块解析
@@ -600,6 +677,8 @@ async function main() {
   await checkBehaviorLayerIsConstant();
   await checkConfirmIsFailClosed();
   await checkProactiveGuardrails();
+  await checkConfirmRoute();
+  await checkReplySplitRoute();
   await checkNoSecrets();
   await checkKeyNeverPlaintext();
   await checkSourceEncoding();

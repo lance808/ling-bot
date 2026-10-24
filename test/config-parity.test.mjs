@@ -41,6 +41,31 @@ function keyPaths(obj, prefix = '') {
   return out;
 }
 
+/**
+ * 动态字典节点：键**由用户数据决定**，不是固定的配置项。
+ *
+ * 本测试的职责是"发现示例里写了 DEFAULT_CONFIG 不认识的键"（用户照抄会
+ * 启动失败）。但 `plugins.config` 的性质不是"配置项"，而是"每个插件的
+ * 普通配置"——键是插件 id，值由插件清单声明。`mergeStrict` 会把整块接受
+ * （见 schema.mjs 的 DYNAMIC_MAPS），所以这些键**天然不在** DEFAULT_CONFIG
+ * 里，也不该在。
+ *
+ * 不跳过它们的话，示例里每加一个插件的默认配置就会让这条测试变红，
+ * 而真正的信号（拼错的键）会被噪音淹没。口径与 schema 的 DYNAMIC_MAPS
+ * 保持一致。
+ */
+const DYNAMIC_PREFIXES = ['plugins.config'];
+
+/**
+ * 某个路径是否落在动态字典下面（含节点本身）。
+ *
+ * @param {string} p
+ * @returns {boolean}
+ */
+function isDynamicPath(p) {
+  return DYNAMIC_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}.`));
+}
+
 test('★ config.example.json 的每个键都在 DEFAULT_CONFIG 里（防写出无人认识的键）', async () => {
   const raw = await fs.readFile(path.join(ROOT, 'config.example.json'), 'utf8');
   const example = JSON.parse(raw);
@@ -48,6 +73,7 @@ test('★ config.example.json 的每个键都在 DEFAULT_CONFIG 里（防写出�
   const known = new Set(keyPaths(DEFAULT_CONFIG));
   const missing = [];
   for (const p of keyPaths(example)) {
+    if (isDynamicPath(p)) continue;
     if (!known.has(p)) missing.push(p);
   }
 
@@ -55,6 +81,32 @@ test('★ config.example.json 的每个键都在 DEFAULT_CONFIG 里（防写出�
     missing,
     [],
     `config.example.json 里有 DEFAULT_CONFIG 不认识的键，用户照抄示例就会启动失败：${missing.join(', ')}`,
+  );
+});
+
+test('★ 示例里的动态字典只允许出现在 plugins.config 下', async () => {
+  /*
+   * 反过来守一遍：动态字典是**豁免**，豁免范围必须写死。
+   * 如果哪天有人把 `llm` 之类也加进 DYNAMIC_PREFIXES，这条会立刻变红，
+   * 提醒"你放宽的不是插件配置，而是任意未知键"。
+   */
+  const raw = await fs.readFile(path.join(ROOT, 'config.example.json'), 'utf8');
+  const example = JSON.parse(raw);
+  const known = new Set(keyPaths(DEFAULT_CONFIG));
+  const unknownOutsideDynamic = keyPaths(example).filter(
+    (p) => !known.has(p) && !isDynamicPath(p),
+  );
+  assert.deepEqual(unknownOutsideDynamic, []);
+  /*
+   * 插件配置块本身必须是允许的（否则上面那条豁免就没意义了）。
+   *
+   * 注意判的是**嵌套路径** example.plugins.config，不是顶层字面键名 ——
+   * `'plugins.config' in example` 查的是顶层有没有一个叫 "plugins.config"
+   * 的键（永远为 false），这条断言会被它自己骗过去。
+   */
+  assert.ok(
+    example?.plugins && typeof example.plugins.config === 'object' && example.plugins.config !== null,
+    '示例里应给出一个插件配置的写法',
   );
 });
 

@@ -1,5 +1,5 @@
 /**
- * 模型设置页 —— 按接入顺序组织：提供商 → Key → 读模型 → 选模型 → 探能力
+ * 模型设置页 —— 按接入顺序组织：提供商 → Key → 读模型 → 选模型 → 探视觉能力
  *
  * ## 为什么按这个顺序
  *
@@ -21,6 +21,13 @@
  * 把"没测出来"显示成"不支持"是很容易犯的错：
  * 超时和网络错误都会导致探测失败，但模型本身可能完全支持。
  * 用户看到"不支持"就不会再试了，问题被永久掩盖。
+ *
+ * ## 本页只探测视觉（读图）
+ *
+ * 聊天接口没有生图能力，生图是**另一套东西**：模型、地址与 Key 全部由
+ * 独立插件 `plugins/image-generation`（插件页名「独立文生图」）管理。
+ * 所以这里只探测视觉，能力卡底部只放一条去插件页配置的引导 ——
+ * 在本页探测生图除了白花额度，还会给出一个用户没法验证的结论。
  */
 
 import { el, card, kv, pill } from '../render.mjs';
@@ -59,13 +66,18 @@ const PROVIDERS = [
 const PROBE_LABEL = { none: '未探测', ok: '已探测', fail: '探测失败' };
 const PROBE_TONE = { none: 'dim', ok: 'ok', fail: 'err' };
 
-/** 通道标签的配色 */
+/**
+ * 通道标签的配色。
+ *
+ * `other` = 看起来不像对话模型（典型是图像类模型名）。它必须能显示，
+ * 否则这类模型会掉回默认的 text 标签，看着像"能聊天"，反而误导。
+ */
 const CHANNEL_TONE = {
   multimodal: 'ok',
-  imageGen: 'ok',
   text: 'dim',
   embedding: 'dim',
   audio: 'dim',
+  other: 'dim',
 };
 
 /**
@@ -571,12 +583,17 @@ export function renderModelSettings(snap, ctx) {
     if (!saved?.probedAt) return 'none';
     /*
      * 落了盘也算"探过"，但要看结论：
-     * 视觉或生图任一有明确布尔值 = 拿到了结论；否则只说明请求跑过、
+     * 视觉有明确布尔值 = 拿到了结论；否则只说明请求跑过、
      * 没测出来（E3012 / E404 之类），那仍然是"探测失败"。
+     *
+     * **只认 `probes.vision`**，不遍历所有 probe：旧配置可能残留
+     * `probes.image`（生图探测时代的产物）。若遍历全部，一个只有生图
+     * 结论的条目会显示成"已探测"，而本页根本没测过读图，那个结论
+     * 也无从验证。后端启动时也会清掉旧字段，这里是第二道防线。
      */
-    const latest = saved.probes ? Object.values(saved.probes) : [];
-    if (latest.length) return latest.some((p) => typeof p?.supported === 'boolean') ? 'ok' : 'fail';
-    return typeof saved.vision === 'boolean' || typeof saved.image === 'boolean' ? 'ok' : 'fail';
+    const visionProbe = saved.probes?.vision;
+    if (visionProbe) return typeof visionProbe.supported === 'boolean' ? 'ok' : 'fail';
+    return typeof saved.vision === 'boolean' ? 'ok' : 'fail';
   };
 
   /** 探测失败时的原因，取自最近一次结果或落盘的明细 */
@@ -586,7 +603,7 @@ export function renderModelSettings(snap, ctx) {
     const saved = capsAll[modelId];
     const p = saved?.probes;
     if (!p) return '';
-    const first = p.vision?.detail || p.image?.detail || '';
+    const first = p.vision?.detail || '';
     return first ? String(first).slice(0, 120) : '';
   };
 
@@ -676,7 +693,7 @@ export function renderModelSettings(snap, ctx) {
         class: 'btn',
         type: 'button',
         text: '探测模型',
-        title: '会发一次极小的真实请求（一张 64×64 图片 / 一次 1 张生图），消耗极少额度',
+        title: '会发一次极小的真实请求（一张 64×64 图片），消耗极少额度',
         onclick: async () => {
           const model = current();
           if (!model) return say('先填模型名，再点「探测模型」', 'err mono');
@@ -745,7 +762,6 @@ export function renderModelSettings(snap, ctx) {
       const flags = [];
       if (caps.vision === true) flags.push('读图✓');
       if (caps.vision === false) flags.push('读图✗');
-      if (caps.image === true) flags.push('生图✓');
       const st = probeStateOf(m.id);
       if (st === 'fail') flags.push('探测失败');
       const tail = flags.length ? ` · ${flags.join(' ')}` : '';
@@ -801,7 +817,7 @@ export function renderModelSettings(snap, ctx) {
       class: 'btn',
       type: 'button',
       text: '探测模型',
-      title: '会发一次极小的真实请求（一张 64×64 图片 / 一次 1 张生图），消耗极少额度',
+      title: '会发一次极小的真实请求（一张 64×64 图片），消耗极少额度',
       onclick: async () => {
         const model = select.value;
         if (!model) return say('先选一个模型', 'err mono');
@@ -845,7 +861,7 @@ export function renderModelSettings(snap, ctx) {
           msgLine ? el('div', { class: 'field-hint err', text: msgLine }) : null,
           el('div', {
             class: 'field-hint',
-            text: '先选模型，再点「探测模型」—— 探测前不知道它能不能读图 / 生图。',
+            text: '先选模型，再点「探测模型」—— 探测前不知道它能不能读图。',
           }),
         ]),
       ]),
@@ -865,7 +881,14 @@ export function renderModelSettings(snap, ctx) {
     /** @type {any} */
     let r = null;
     try {
-      r = await ctx.onProbe(modelId, ['vision', 'image']);
+      /*
+       * 只探视觉。
+       *
+       * 以前这里还要一次生图探测（真发一张 1 张图的生图请求）。
+       * 聊天接口本来就没有生图能力，那一路只会白花额度，还给出一个
+       * 用户没法验证的结论 —— 生图已经整体归 plugins/image-generation。
+       */
+      r = await ctx.onProbe(modelId, ['vision']);
     } catch (err) {
       r = { ok: false, code: 'E50XX', message: String(/** @type {any} */ (err)?.message ?? err) };
     }
@@ -880,12 +903,8 @@ export function renderModelSettings(snap, ctx) {
       local.selectDraft = modelId;
 
       const v = r.probes?.vision;
-      const g = r.probes?.image;
-      const known = typeof v?.supported === 'boolean' || typeof g?.supported === 'boolean';
-      const reason = [v, g]
-        .filter((x) => x && x.supported !== true && x.detail)
-        .map((x) => String(x.detail).slice(0, 120))
-        .join('；');
+      const known = typeof v?.supported === 'boolean';
+      const reason = v && v.supported !== true && v.detail ? String(v.detail).slice(0, 120) : '';
 
       local.probeStatus[modelId] = {
         state: known ? 'ok' : 'fail',
@@ -898,7 +917,7 @@ export function renderModelSettings(snap, ctx) {
       const fmt = (x) => (x?.supported === true ? '✓ 支持' : x?.supported === false ? '✗ 不支持' : '没测出来');
       say(
         known
-          ? `✓ 已探测 ${modelId}｜读图：${fmt(v)}｜生图：${fmt(g)}｜通道：${r.channel?.label ?? '-'}`
+          ? `✓ 已探测 ${modelId}｜读图：${fmt(v)}｜通道：${r.channel?.label ?? '-'}`
           : `探测失败：没能得到结论（${reason || '超时或网络错误'}）。请检查接口地址与 API Key`,
         known ? 'ok mono' : 'err mono',
       );
@@ -926,6 +945,42 @@ export function renderModelSettings(snap, ctx) {
 
   const capabilityHost = el('div', {});
 
+  /**
+   * 「生图」引导块。
+   *
+   * 生图能力已整体搬到独立插件 `plugins/image-generation`（插件页名
+   * 「独立文生图」）。聊天模型页不再探测、也不展示它 —— 但用户一定会
+   * 在这一页找"生图在哪配"，所以必须给出一个明确出口：
+   * 只说"不在这儿"等于把问题丢掉。
+   *
+   * 插件状态只在快照里**确实能看到**这个插件时才显示（见
+   * `imagePluginState`），看不到就只留引导文案，不编造状态。
+   */
+  const imagePluginGuide = () => {
+    const st = imagePluginState(snap);
+    return el('div', { class: 'step-gap' }, [
+      el('div', { class: 'step-title', text: '生图（独立插件）' }),
+      el('div', { class: 'list' }, [
+        kv('生图探测', pill('本页不探测', 'dim')),
+        st ? kv('插件状态', pill(st.loaded ? '已加载' : '未加载', st.loaded ? 'ok' : 'dim')) : null,
+      ]),
+      el('div', {
+        class: 'field-hint',
+        text:
+          '聊天模型只负责读图（视觉），不探测也不展示生图能力。\n' +
+          '生图模型、API 地址与 Key 由「插件设置 → 独立文生图（image-generation）」管理，和这里的聊天模型是两套配置。',
+      }),
+      el('div', { class: 'row' }, [
+        el('button', {
+          class: 'btn',
+          type: 'button',
+          text: '去插件设置',
+          onclick: () => ctx.gotoPage?.('plugins'),
+        }),
+      ]),
+    ]);
+  };
+
   const renderCapabilityDetail = (modelId) => {
     const p = local.probes[modelId];
     const caps = p?.caps ?? capsAll[modelId] ?? {};
@@ -949,7 +1004,7 @@ export function renderModelSettings(snap, ctx) {
       st === 'none'
         ? el('div', { class: 'field-hint' }, [
             el('strong', { text: `还没探测 ${modelId}。` }),
-            el('span', { text: '点上方「探测模型」才知道它到底能不能读图 / 生图。' }),
+            el('span', { text: '点上方「探测模型」才知道它到底能不能读图。' }),
           ])
         : null;
 
@@ -958,7 +1013,6 @@ export function renderModelSettings(snap, ctx) {
       kv('通道', pill(ch.label, CHANNEL_TONE[ch.channel] ?? 'dim')),
       kv('判断依据', el('span', { class: 'muted', text: ch.basis })),
       kv('读图（视觉）', tri(caps.vision, '✓ 支持', '✗ 不支持')),
-      kv('生图', tri(caps.image, '✓ 支持', '✗ 不支持')),
     ];
 
     if (caps.probedAt) {
@@ -967,7 +1021,7 @@ export function renderModelSettings(snap, ctx) {
 
     // 探测失败的具体原因要看得到，否则"没测出来"等于没说
     const detailLines = [];
-    for (const [k, label] of [['vision', '读图'], ['image', '生图']]) {
+    for (const [k, label] of [['vision', '读图']]) {
       const r = (p?.probes ?? caps.probes)?.[k];
       if (r && r.supported !== true && r.detail) {
         detailLines.push(`${label}：${r.detail}`);
@@ -989,6 +1043,7 @@ export function renderModelSettings(snap, ctx) {
             '能力只能实测，不能按名字猜：同一个模型名在不同中转站可能完全不同。\n' +
             '「未测」不等于「不支持」——超时或网络错误也会导致没结论。',
         }),
+        imagePluginGuide(),
       ]),
     );
   };
@@ -1005,6 +1060,7 @@ export function renderModelSettings(snap, ctx) {
     capabilityHost.replaceChildren(
       card('模型能力', [
         el('div', { class: 'muted', text: '先读取模型列表（或手填模型名）并选中一个模型，再点「探测模型」。' }),
+        imagePluginGuide(),
       ]),
     );
   }
@@ -1202,7 +1258,7 @@ export function renderModelSettings(snap, ctx) {
    * ## 现在的判据
    *
    * 先检查 Key、模型、地址，再采用当前配置最近一次文本对话测试。
-   * 切换模型、地址或凭据后需要重新验证；图像能力结论只用于能力标签。
+   * 切换模型、地址或凭据后需要重新验证；视觉（读图）结论只用于能力标签。
    * 没有匹配的文本测试结果时显示「未验证」。
    *
    * 第 4 种必须单独一态：什么都没试过就显示"可以"正是这个 bug 的来源，
@@ -1222,7 +1278,7 @@ export function renderModelSettings(snap, ctx) {
       return { label: '缺少地址', tone: 'warn', why: '先在第 1 步填接口地址' };
     }
 
-    // 图像能力结论不证明文本对话可用。只采用当前配置的真实对话测试。
+    // 视觉探测结论不证明文本对话可用。只采用当前配置的真实对话测试。
     const verified = currentTest();
     if (verified) {
       return verified.ok
@@ -1344,18 +1400,64 @@ export function renderModelSettings(snap, ctx) {
 
 /* ------------------------------------------------------------------ 小工具 */
 
-/** 前端侧的通道推断（与后端 inferChannel 保持一致的口径） */
+/** 独立生图插件的 id（插件页名「独立文生图」） */
+const IMAGE_PLUGIN_ID = 'image-generation';
+
+/** 插件条目 → id。`loaded` 里是老形状 `{ name }`，`skipped` 里直接是字符串 */
+const pluginIdOf = (item) =>
+  typeof item === 'string' ? item : String(item?.id ?? item?.name ?? '');
+
+/**
+ * 从快照里看独立生图插件（`plugins/image-generation`）的加载状态。
+ *
+ * ## 为什么可能返回 null
+ *
+ * 快照不一定带插件面（启动早期、或者更旧的后端），插件列表里也可能
+ * 根本没有这个插件。这时说"未加载"就是**编造**，用户会照着错的状态排查。
+ * 所以：只有确实看到这个插件时才给结论，看不到就返回 null，
+ * 界面只显示引导文案。
+ *
+ * @param {any} snap
+ * @returns {{ loaded: boolean } | null}
+ */
+function imagePluginState(snap) {
+  const plugins = snap?.plugins;
+  if (!plugins || typeof plugins !== 'object') return null;
+
+  // items 最准：它带 status（ready / disabled / error / missing …）
+  if (Array.isArray(plugins.items) && plugins.items.length > 0) {
+    const item = plugins.items.find((x) => pluginIdOf(x) === IMAGE_PLUGIN_ID);
+    if (!item) return null; // 列表里没有它 —— 是没装还是没扫到都说不准，不编造
+    return { loaded: item.status === 'ready' };
+  }
+
+  const find = (list) => Array.isArray(list) && list.some((x) => pluginIdOf(x) === IMAGE_PLUGIN_ID);
+  if (find(plugins.loaded)) return { loaded: true };
+  if (find(plugins.skipped)) return { loaded: false };
+  return null;
+}
+
+/**
+ * 前端侧的通道推断（与后端 inferChannel 保持一致的口径）。
+ *
+ * 这里**不判生图**：聊天接口本身不能生图，生图能力由独立插件管理。
+ * 名字像图像类模型的只给「疑似非对话模型」—— 提醒用户别拿它当聊天模型，
+ * 而不是替它认定一项本页根本探测不了的能力。
+ */
 function inferChannelLabel(model, caps) {
   const id = String(model ?? '').toLowerCase();
   if (caps?.vision === true) return { channel: 'multimodal', label: '多模态', basis: '已实测：可读图' };
-  if (caps?.image === true) return { channel: 'imageGen', label: '生图', basis: '已实测：可生图' };
 
   // 实测否定过视觉的，名字再像也不能判成多模态
   const visionKnownFalse = caps?.vision === false;
 
   if (/embed|rerank/.test(id)) return { channel: 'embedding', label: '向量', basis: '名字含 embed/rerank' };
-  if (/(dall-e|dalle|sdxl|flux|imagen|kolors)/.test(id)) {
-    return { channel: 'imageGen', label: '生图', basis: '名字像生图模型' };
+  if (/(dall-e|dalle|sdxl|flux|imagen|kolors|(^|[-_.])sd([-_.]|$))/.test(id)) {
+    return {
+      channel: 'other',
+      label: '疑似非对话模型',
+      basis: '模型名像图像类模型；生图能力归独立插件，不按名字认定',
+    };
   }
   if (/whisper|tts|audio|speech/.test(id)) return { channel: 'audio', label: '音频', basis: '名字像音频模型' };
   if (!visionKnownFalse && /-vl-|-vision-|(^|[-_])vl($|[-_])/.test(id)) {

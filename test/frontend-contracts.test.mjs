@@ -323,6 +323,99 @@ renderTest('思考链路：只有 hasMore 没有游标时不认为可翻页（�
   assert.equal(older.title, '没有更早的记录了');
 });
 
+/* ------------------------------------------- 管理员卡片（授权来源） */
+
+renderTest('★ 安全页把管理员与白名单分开显示（白名单不等于管理员）', async () => {
+  const { renderSecurity } = await import('../ui/src/views/security.mjs');
+  const root = renderSecurity(
+    {
+      registry: { tools: [] },
+      config: { allow: { groups: [], private: ['100000002'] }, deny: { groups: [], private: [] } },
+      admin: {
+        qqIds: ['100000001'],
+        inheritWhitelist: false,
+        deliverable: ['100000001', '100000004'],
+        whitelistCount: 1,
+      },
+    },
+    {},
+  );
+  const body = text(root);
+  assert.match(body, /管理员（L2 授权）/, '要有独立的管理员卡片');
+  assert.match(body, /白名单不等于管理员/, '要写明两者不同');
+  // 核心管理员出现在卡片里
+  assert.match(body, /100000001/);
+  // 投递名单单独列，且点明不代表能批宿主机操作
+  assert.match(body, /投递豁免/, '要把投递名单单独说清楚');
+  assert.match(body, /不代表他们能批准宿主机操作/, '不能让用户误以为 DSH 管理员也有本机权限');
+});
+
+renderTest('★ 安全页：没有管理员时要警告当前谁都没有权限', async () => {
+  const { renderSecurity } = await import('../ui/src/views/security.mjs');
+  const root = renderSecurity(
+    {
+      registry: { tools: [] },
+      config: { allow: { groups: [], private: [] }, deny: { groups: [], private: [] } },
+      admin: { qqIds: [], inheritWhitelist: false, deliverable: [], whitelistCount: 0 },
+    },
+    {},
+  );
+  assert.match(text(root), /还没有管理员/, '空名单必须明确警告');
+});
+
+renderTest('★ 安全页：老后端没有 admin 块时不能崩（升级兼容）', async () => {
+  const { renderSecurity } = await import('../ui/src/views/security.mjs');
+  const root = renderSecurity(
+    {
+      registry: { tools: [] },
+      config: { allow: { groups: [], private: [] }, deny: { groups: [], private: [] } },
+    },
+    {},
+  );
+  // 降级成"没有管理员"，而不是抛错或显示 undefined
+  assert.match(text(root), /管理员（L2 授权）/);
+  assert.doesNotMatch(text(root), /undefined/);
+});
+
+renderTest('★ 安全页：加管理员走 admin.qqIds 这个 key', async () => {
+  const { renderSecurity } = await import('../ui/src/views/security.mjs');
+  /** @type {any[]} */
+  const calls = [];
+  const root = renderSecurity(
+    {
+      registry: { tools: [] },
+      config: { allow: { groups: [], private: [] }, deny: { groups: [], private: [] } },
+      admin: { qqIds: [], inheritWhitelist: false, deliverable: [], whitelistCount: 0 },
+    },
+    {
+      onSaveSetting: async (key, value) => {
+        calls.push([key, value]);
+        return { ok: true };
+      },
+      rerender: () => {},
+    },
+  );
+  /*
+   * 页面上有多个「添加」按钮（白名单群/私聊、黑名单群/私聊、管理员）。
+   * 管理员卡片在最后，所以取**最后一个** —— 按下标取而不是按文案找，
+   * 否则会点到白名单那个，测试就变成在验证另一件事了。
+   */
+  const adders = nodes(root).filter((n) => n.tagName === 'BUTTON' && n.textContent === '添加');
+  assert.ok(adders.length >= 5, `期望至少 5 个添加按钮，实际 ${adders.length}`);
+  const adminAdd = adders[adders.length - 1];
+
+  const inputs = nodes(root).filter((n) => n.tagName === 'INPUT' && n.type === 'text');
+  const adminInput = inputs[inputs.length - 1];
+  assert.ok(adminInput, '要有管理员输入框');
+  adminInput.value = '100000005';
+
+  await adminAdd.listeners.click();
+  // submit 是 async 的，点击回调不是 —— 让出一次事件循环等它跑完
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.deepEqual(calls[0], ['admin.qqIds', ['100000005']], '必须写到 admin.qqIds，不能写进 allow');
+});
+
 renderTest('editing a persona is distinct from setting its global default', async () => {
   const { renderPersona } = await import('../ui/src/views/persona.mjs');
   const calls = [];

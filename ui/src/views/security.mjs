@@ -68,20 +68,28 @@ export function renderSecurity(snap, ctx = {}) {
   const allow = snap?.config?.allow ?? { groups: [], private: [] };
   const deny = snap?.config?.deny ?? { groups: [], private: [] };
   const allowAllWhenEmpty = snap?.config?.allowAllWhenEmpty === true;
-  /**
-   * 管理员列表现在住在插件配置里（`plugins.config['dsh-bridge'].admins`）。
+
+  /*
+   * 管理员面（快照的 `admin` 块）。
    *
-   * 这里以前读 `config.dsh.admins` —— 那是迁移前的旧位置，迁移后永远是空数组，
-   * 于是下面那条"管理员私聊也能收到审批推送"的提示**再也不会显示**，
-   * 用户会以为审批推送坏了。保留旧位置兜底：万一迁移还没跑到。
+   * ## 为什么不从 `config.allow.private` 推
+   *
+   * 那正是这次要拆开的东西。白名单回答"谁能跟它说话"，管理员回答
+   * "谁能让它动本机"。拿前者推后者，等于加个白名单就顺带授了权。
+   *
+   * 也**不再**从 `plugins.config['dsh-bridge'].admins` 或旧 `config.dsh.admins`
+   * 推：那两个是 DSH 插件自己的收件人名单，和宿主机管理员是两件事。
+   * 后端已经把两者算成 `deliverable`（投递并集）单独给出，界面直接用，
+   * 不要在这里再 split 一遍 —— 两处解析迟早会走样。
+   *
+   * `deliverable` 与 `qqIds` 分开显示：前者是投递豁免（含 DSH 插件管理员），
+   * 后者才是授权。混在一起会让用户以为"DSH 管理员也能批宿主机操作"。
    */
-  const adminRaw =
-    snap?.config?.plugins?.config?.['dsh-bridge']?.admins ?? snap?.config?.dsh?.admins ?? '';
-  const admins = Array.isArray(adminRaw)
-    ? adminRaw
-    : String(adminRaw ?? '')
-        .split(/[,，、\s]+/)
-        .filter(Boolean);
+  const adminView = snap?.admin ?? {};
+  const adminQqIds = Array.isArray(adminView.qqIds) ? adminView.qqIds : [];
+  const deliverable = Array.isArray(adminView.deliverable) ? adminView.deliverable : [];
+  const inheritWhitelist = adminView.inheritWhitelist === true;
+  const whitelistCount = Number(adminView.whitelistCount ?? (allow.private?.length ?? 0));
 
   const hostTools = tools.filter((t) => t.kind === 'host');
   const qqTools = tools.filter((t) => t.kind !== 'host');
@@ -266,13 +274,24 @@ export function renderSecurity(snap, ctx = {}) {
         : null;
 
     /**
-     * 白名单特有的提示：管理员私聊即使不在名单里也能收到审批。
+     * 白名单特有的提示：审批推送的收件人**不由这张表决定**。
      *
-     * 这条不写清楚，用户会以为"审批推送坏了"。
+     * 原来写的是"管理员私聊即使不在名单里也能收到审批" —— 而那时
+     * "管理员"就是白名单本身，这句话等于"白名单里的人总能收到"，
+     * 是同义反复，还**掩盖**了真正的问题：把某人加进白名单并不代表
+     * 他能收到审批（依据是下面的管理员卡片 + DSH 插件的名单）。
+     *
+     * 两者拆开之后，这条提示必须明确说"这张表管不着审批收件人"，
+     * 否则用户会以为加个白名单就能收到卡片。
      */
     const adminNote =
-      which === 'allow' && admins.length > 0
-        ? el('div', { class: 'field-hint', text: `管理员私聊（${admins.length} 个）即使不在白名单里，也能收到审批推送。` })
+      which === 'allow' && deliverable.length > 0
+        ? el('div', {
+            class: 'field-hint',
+            text:
+              '白名单只决定"谁能跟它说话"，不决定"审批送给谁"。' +
+              `当前审批收件人 ${deliverable.length} 个，见下面的「管理员」卡片。`,
+          })
         : null;
 
     return card(copy.title, [
@@ -312,6 +331,191 @@ export function renderSecurity(snap, ctx = {}) {
     ]);
   };
 
+  /* ============================================================ 管理员 */
+
+  /**
+   * 管理员卡片 —— 「谁能让它动本机」。
+   *
+   * ## 为什么必须单独一张卡
+   *
+   * 它和白名单回答的是两个问题：
+   *
+   *   · 白名单：**允许谁跟它说话**（L1 准入）
+   *   · 管理员：**谁能让它动本机**（L2 授权）
+   *
+   * 以前两者是一张表，于是"把某人加进白名单"这个动作会**悄悄**
+   * 授予他宿主机工具与高风险操作的确认权。拆开之后要能一眼看出
+   * 这两个数字不一样，所以这张卡必须写出"白名单不等于管理员"。
+   *
+   * ## 为什么还要显示「投递名单」
+   *
+   * 那是发送闸门用的并集（核心管理员 + DSH 插件管理员），只决定
+   * "消息送不送得到"，不影响授权。不单独说明的话，用户会看到
+   * DSH 的号出现在这里，误以为它也拥有宿主机权限。
+   */
+  const adminCard = () => {
+    /** @param {string} qq */
+    const adminChip = (qq) =>
+      el('span', { class: 'chip' }, [
+        el('span', { class: 'mono', text: qq }),
+        el('button', {
+          type: 'button',
+          class: 'chip-x',
+          text: '×',
+          title: `移除管理员 ${qq}`,
+          onclick: async () => {
+            const next = adminQqIds.filter((x) => x !== qq);
+            ui.lastSave.admin = { ok: true, text: '保存中…' };
+            ctx.rerender?.();
+            const r = await ctx.onSaveSetting?.('admin.qqIds', next);
+            ui.lastSave.admin = r?.ok
+              ? { ok: true, text: `已移除 ${qq}，立刻生效` }
+              : { ok: false, text: `保存失败：${r?.message ?? r?.code ?? '接口未返回成功结果'}` };
+            ctx.rerender?.();
+          },
+        }),
+      ]);
+
+    const input = /** @type {HTMLInputElement} */ (
+      el('input', {
+        type: 'text',
+        class: 'text-input grow',
+        placeholder: 'QQ 号，多个用逗号分隔',
+        inputmode: 'numeric',
+        autocomplete: 'off',
+      })
+    );
+
+    const prev = ui.hint['admin'];
+    const say = el('div', {
+      class: prev ? (prev.tone === 'ok' ? 'ok' : prev.tone === 'err' ? 'err' : 'field-hint') : 'field-hint',
+      text: prev ? prev.text : '',
+    });
+
+    const submit = async () => {
+      const raw = input.value.trim();
+      if (!raw) return;
+      const parts = raw.split(/[\s,，;；]+/).filter(Boolean);
+      /** @type {string[]} */
+      const bad = [];
+      /** @type {string[]} */
+      const next = [...adminQqIds];
+      for (const p of parts) {
+        // 形状在界面就挡住：混进非法值会让后端的字符串比较永远不成立
+        if (!/^\d{4,15}$/.test(p)) {
+          bad.push(p);
+          continue;
+        }
+        if (!next.includes(p)) next.push(p);
+      }
+      input.value = '';
+      if (bad.length > 0) {
+        ui.hint.admin = { tone: 'err', text: `已忽略 ${bad.join('、')}：不是有效的 QQ 号（4–15 位数字）` };
+        ctx.rerender?.();
+        return;
+      }
+      ui.lastSave.admin = { ok: true, text: '保存中…' };
+      ctx.rerender?.();
+      const r = await ctx.onSaveSetting?.('admin.qqIds', next);
+      ui.lastSave.admin = r?.ok
+        ? { ok: true, text: `✓ 已保存 ${next.length} 个管理员，立刻生效` }
+        : { ok: false, text: `保存失败：${r?.message ?? r?.code ?? '接口未返回成功结果'}` };
+      ui.hint.admin = { tone: 'ok', text: `已加入 ${parts.length - bad.length} 个` };
+      ctx.rerender?.();
+    };
+
+    input.addEventListener('keydown', (e) => {
+      if (/** @type {any} */ (e).key === 'Enter') void submit();
+    });
+
+    const last = ui.lastSave.admin;
+
+    // 兼容开关：打开它等于把白名单里的人全部提成管理员
+    const inheritBox = /** @type {HTMLInputElement} */ (
+      el('input', { type: 'checkbox', class: 'checkbox' })
+    );
+    inheritBox.checked = inheritWhitelist;
+    inheritBox.addEventListener('change', async () => {
+      const on = inheritBox.checked;
+      // 打开是放宽权限：先让用户确认一次，避免手滑
+      const r = await ctx.onSaveSetting?.('admin.inheritWhitelist', on);
+      ui.lastSave.admin = r?.ok
+        ? { ok: true, text: on ? '已打开：白名单里的私聊也能拿到管理员权限' : '已关闭：管理员只认上面的名单' }
+        : { ok: false, text: `保存失败：${r?.message ?? r?.code ?? '接口未返回成功结果'}` };
+      ctx.rerender?.();
+    });
+
+    const emptyWarn =
+      adminQqIds.length === 0 && !inheritWhitelist
+        ? el('div', { class: 'hint' }, [
+            el('div', {
+              text:
+                '还没有管理员。现在**任何人**都拿不到宿主机工具，高风险操作也没人能批准 ——' +
+                '（这是 fail-closed 的方向，但通常你会希望至少填上自己。）',
+            }),
+          ])
+        : null;
+
+    return card('管理员（L2 授权）', [
+      el('div', {
+        class: 'muted',
+        text:
+          '只有这里列出的私聊能拿到宿主机工具、并批准高风险操作。' +
+          '**白名单不等于管理员**：白名单只决定谁能跟它说话。',
+      }),
+      el('div', { class: 'spacer-10' }),
+
+      el('div', { class: 'field' }, [
+        el('label', { class: 'field-label', text: `管理员（${adminQqIds.length}）` }),
+        el('div', { class: 'field-control' }, [
+          adminQqIds.length === 0
+            ? el('div', { class: 'muted', text: '还没有管理员。在下面输入 QQ 号添加。' })
+            : el('div', { class: 'chips' }, adminQqIds.map(adminChip)),
+        ]),
+      ]),
+
+      el('div', { class: 'field' }, [
+        el('label', { class: 'field-label', text: '添加管理员' }),
+        el('div', { class: 'field-control' }, [
+          el('div', { class: 'row' }, [
+            el('div', { class: 'grow' }, [input]),
+            el('button', { type: 'button', class: 'btn btn-sm', text: '添加', onclick: () => void submit() }),
+          ]),
+          say,
+        ]),
+      ]),
+
+      el('div', { class: 'spacer-12' }),
+      el('div', { class: 'field' }, [
+        el('label', { class: 'row' }, [
+          inheritBox,
+          el('span', { class: 'field-label', text: '白名单视为管理员（兼容旧配置）' }),
+        ]),
+        el('div', {
+          class: 'field-hint',
+          text:
+            `打开后，白名单里的 ${whitelistCount} 个私聊也拥有管理员权限。` +
+            '升级前的版本就是这么算的 —— 如果你原来的白名单里填的就是自己，打开它可保持原行为。' +
+            '但这也意味着以后每往白名单加一个人，就同时给了他宿主机权限。',
+        }),
+      ]),
+
+      last ? el('div', { class: last.ok ? 'ok' : 'err', text: last.text }) : null,
+      emptyWarn,
+
+      el('div', { class: 'spacer-12' }),
+      el('div', { class: 'field-label', text: `能收到审批推送的号（投递豁免，${deliverable.length}）` }),
+      el('div', {
+        class: 'field-hint',
+        text:
+          deliverable.length === 0
+            ? '还没有。审批卡与确认卡只会送到管理员私聊，名单为空时它们发不出去。'
+            : `${deliverable.join('、')}。这份名单只决定消息送不送得到（含 DSH 插件的管理员），` +
+              '**不代表他们能批准宿主机操作** —— 那只看上面那份。',
+      }),
+    ].filter(Boolean));
+  };
+
   return el('div', {}, [
     listCard('allow', {
       title: '白名单（L1 准入）',
@@ -334,6 +538,8 @@ export function renderSecurity(snap, ctx = {}) {
       emptyGroup: '黑名单为空。要拦某个群就在下面加。',
       emptyPrivate: '黑名单为空。要拦某个人就在下面加。',
     }),
+
+    adminCard(),
 
     /*
      * 四层防线。

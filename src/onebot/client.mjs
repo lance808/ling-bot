@@ -213,6 +213,26 @@ export class OneBotClient {
     return this.sendAction('get_status');
   }
 
+  /**
+   * 按缓存名向网关取一张图的信息（`file` / `url` / `base64` 三选一）。
+   *
+   * ## 为什么单独开一个方法，而不是入口里直接 sendAction
+   *
+   * `sendAction` 是**所有动作**的唯一出口，而"发送"这条通路的唯一性
+   * 由静态检查守着（I4 / ui-shell 的断言：`client.sendAction(` 只允许
+   * 出现一次）。在入口文件里再写一次 `client.sendAction(...)`，那条
+   * 纪律就名存实亡了 —— 后来的人无法一眼看出"哪一次是发送、哪一次只是读图"。
+   *
+   * 所以读图能力跟 getLoginInfo / getStatus 一样，收在客户端里。
+   * 它的返回**不经过**发送闸门：这里只读网关缓存，不发任何东西给任何人。
+   *
+   * @param {{file: string}} params
+   * @returns {Promise<any>}
+   */
+  async getImage(params) {
+    return this.sendAction('get_image', params);
+  }
+
   close() {
     // 先立旗标，再关连接：onClose 回调会同步检查它，
     // 否则关闭动作本身会被当成"意外掉线"而排一次重连。

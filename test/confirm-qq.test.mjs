@@ -7,6 +7,9 @@
  *
  * 第二条故障：回执发了但被闸门吞掉（sendText resolve {ok:false} 而非 reject），
  * 用户点了确认却什么回信都没有，日志里也查不到。
+ *
+ * 这个文件只做**结构断言**（函数在、文案对、路径通）。
+ * 真正的行为（身份、会话、并发、过期、双端竞争）见 confirm-routing.test.mjs。
  */
 
 import assert from 'node:assert/strict';
@@ -17,94 +20,101 @@ import path from 'node:path';
 const root = path.resolve(import.meta.dirname, '..');
 const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
 
+/** 取一个顶层函数的函数体（到下一个顶格 function / async function 为止） */
+function fnBody(src, name, maxLen = 6000) {
+  const start = src.indexOf(name);
+  assert.ok(start > 0, `找不到 ${name}`);
+  const after = src.slice(start + name.length);
+  const next = after.search(/\n(?:async )?function |\n\/\*\*/);
+  return after.slice(0, next > 0 ? next : maxLen);
+}
+
 test('★ QQ 来源的确认要真的推到 QQ，而不是只留在桌面端', () => {
   const src = read('src/index.mjs');
 
   assert.match(src, /function askHumanConfirm/, '确认入口还在');
   assert.match(src, /sendConfirmToQq/, '要有推 QQ 的路径');
-  assert.match(src, /\(private\|group\):/, '只对 QQ 会话形状的 convKey 推');
   assert.match(src, /确认卡推送 QQ 失败/, '失败要有日志但不能炸');
 });
 
-test('★ 确认卡用 1 / 2 回复，与审批卡一致', () => {
+test('★ 确认卡只投管理员私聊（群里可见就等于谁都能批）', () => {
   const src = read('src/index.mjs');
-  const i = src.indexOf('async function sendConfirmToQq');
-  const block = src.slice(i, i + 1500);
+  const body = fnBody(src, 'function askHumanConfirm');
 
-  assert.match(block, /回 1 同意，回 2 拒绝/, '要明确告诉用户回数字');
+  // 投递目标必须是"会话本来就是某个管理员的私聊"，不是"形状像 QQ 会话"
+  assert.match(body, /isAdminDm/, '要算出这张卡能不能投到 QQ');
+  assert.match(body, /kind === 'private'/, '只认私聊');
+  assert.match(body, /admins\.includes/, '会话主人必须在管理员名单里');
+  assert.match(body, /replyConvKey: isAdminDm \? convKey : ''/, '群聊不设 QQ 投递目标');
+});
+
+test('★ 确认卡用 1 / 2 回复，并要求引用定位', () => {
+  const src = read('src/index.mjs');
+  const body = fnBody(src, 'async function sendConfirmToQq', 2000);
+
+  assert.match(body, /回 1 同意，回 2 拒绝/, '要明确告诉用户回数字');
   // 长编号不能出现在文案里当回复指令 —— 人抄不动
+  assert.ok(!/回复「同意 confirm-/.test(body), '不能再让用户抄 confirm-xxx 长编号');
+  assert.match(body, /分钟内没回按拒绝处理/, '要说清超时后果');
+  // 并发时必须要求引用，否则"回 1"会落到不知道哪一条上
+  assert.match(body, /引用这条消息/, '要教用户引用那条卡片');
+});
+
+test('★ 卡片上的序号在登记时定下，且推送失败/成功都要记账', () => {
+  const src = read('src/index.mjs');
+  const body = fnBody(src, 'async function sendConfirmToQq', 2000);
+
+  assert.match(body, /entry\.seq/, '序号来自登记那一刻，不能现数');
+  assert.match(body, /confirms\.bindMessage/, '推送成功必须绑定 message_id');
+  assert.match(body, /confirms\.markPushFailed/, '推送失败/拿不到 ID 必须留痕');
+});
+
+test('★ 绑定失败时不能发明一个假消息 ID', () => {
+  const src = read('src/index.mjs');
+  const body = fnBody(src, 'async function sendConfirmToQq', 2600);
+  // 允许"失败分支记日志"，但不允许出现赋值一个假 id 的写法
   assert.ok(
-    !/回复「同意 confirm-/.test(block),
-    '不能再让用户抄 confirm-xxx 长编号',
+    !/bindMessage\(id,\s*[`'"]/.test(body),
+    '不能把字符串常量当 messageId 绑上去（引用会全部查不到）',
   );
-  assert.match(block, /分钟内没回按拒绝处理/, '要说清超时后果');
-});
-
-test('★ 裸数字 1 / 2 必须被认成同意 / 拒绝', () => {
-  const src = read('src/index.mjs');
-  const i = src.indexOf('async function tryHandleConfirmReply');
-  const block = src.slice(i, i + 3000);
-
-  assert.match(block, /text === '1' \|\| text === '2'/, '要识别裸数字');
-  assert.match(block, /allow = text === '1'/, '1 = 同意');
-  // 带序号的写法也要认
-  assert.match(block, /同意\|拒绝\|允许\|取消/, '文字写法仍要认');
-});
-
-test('★ 没有待确认时，裸数字不能被抢走', () => {
-  const src = read('src/index.mjs');
-  const i = src.indexOf('async function tryHandleConfirmReply');
-  const block = src.slice(i, i + 3000);
-
-  // "2 点了" 这种闲聊不该被当成"拒绝"
-  assert.match(block, /if \(text === '1' \|\| text === '2'\) return false/);
-});
-
-test('★ 多条待确认时，不带序号的回复必须被拒绝而不是猜', () => {
-  const src = read('src/index.mjs');
-  const i = src.indexOf('async function tryHandleConfirmReply');
-  const block = src.slice(i, i + 3000);
-
-  assert.match(block, /all\.length > 1/);
-  assert.match(block, /请带上序号回复/, '要明确要求带序号');
-  const multiIdx = block.indexOf('all.length > 1');
-  const resolveIdx = block.indexOf('resolveConfirm(id, allow)');
-  assert.ok(resolveIdx > multiIdx, '拒绝多条猜测的分支要先于结算');
+  assert.match(body, /引用定位不可用/, '失败要说清后果');
 });
 
 test('★ 回执发送必须检查返回值（闸门会 resolve {ok:false}）', () => {
   const src = read('src/index.mjs');
 
   assert.match(src, /function sendConfirmReply/, '要有统一的回执发送函数');
-  const i = src.indexOf('async function sendConfirmReply');
-  const block = src.slice(i, i + 700);
-  assert.match(block, /r\.ok === false/, '必须检查 ok，否则被闸门吞掉也不知道');
-  assert.match(block, /确认回执未能送达/, '失败要留日志');
+  const body = fnBody(src, 'async function sendConfirmReply', 900);
+  assert.match(body, /r\.ok === false/, '必须检查 ok，否则被闸门吞掉也不知道');
+  assert.match(body, /确认回执未能送达/, '失败要留日志');
 });
 
-test('★ 序号必须在登记时定下，并在结算/超时时释放', () => {
+test('★ 只要认领了就必须回一句（点了头却什么都没收到是最糟的失败）', () => {
   const src = read('src/index.mjs');
-
-  assert.match(src, /function allocConfirmSeq/, '要有序号分配');
-  assert.match(src, /function releaseConfirmSeq/, '要有序号释放');
-
-  // 登记时分配
-  const ask = src.indexOf('function askHumanConfirm');
-  const askBlock = src.slice(ask, ask + 700);
-  assert.match(askBlock, /allocConfirmSeq\(id\)/, '登记时就要定下序号');
-
-  // 超时分支要释放
-  assert.match(askBlock, /releaseConfirmSeq\(seq\)/, '超时也要释放，否则泄漏');
-
-  // 结算分支要释放
-  const rc = src.indexOf('function resolveConfirm');
-  const rcBlock = src.slice(rc, rc + 600);
-  assert.match(rcBlock, /releaseConfirmSeq\(pending\.seq\)/, '结算要释放');
+  const body = fnBody(src, 'async function reportConfirmResult', 900);
+  assert.match(body, /describeOutcome/, '成功要回放行/拒绝');
+  assert.match(body, /r\?\.message/, '失败要回原因');
 });
 
 test('★ 确认超时仍然是拒绝（fail-closed 不能被破坏）', () => {
   const src = read('src/index.mjs');
-  const i = src.indexOf('function askHumanConfirm');
-  const block = src.slice(i, i + 900);
-  assert.match(block, /resolve\('deny'\)/, '超时默认拒绝');
+  const guard = read('src/guard/confirm.mjs');
+
+  // 超时值仍然落在宿主入口（静态检查 I17 读这里）
+  assert.match(src, /CONFIRM_TIMEOUT_MS\s*=\s*60_000/, '缺 60s 确认超时');
+  // 真正的超时结算在登记表里，必须落 deny
+  assert.match(guard, /this\.#settle\(entry, 'deny', SETTLE_REASON\.TIMEOUT/, '超时默认拒绝');
+});
+
+test('★ 退出时必须把在途确认按拒绝结算', () => {
+  const src = read('src/index.mjs');
+  const start = src.indexOf('async function shutdown(');
+  const body = src.slice(start, start + 800);
+  assert.match(body, /confirms\.cancelAll/, '否则等待中的工具调用悬在半空');
+});
+
+test('★ 确认卡超时要通知桌面端（否则确认条永远挂着）', () => {
+  const src = read('src/index.mjs');
+  assert.match(src, /onTimeout/, '登记表要支持超时回调');
+  assert.match(src, /confirm-timeout/, '要推给界面');
 });

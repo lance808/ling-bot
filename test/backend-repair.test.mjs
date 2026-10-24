@@ -9,7 +9,7 @@ import { ThinkingStore } from '../src/llm/thinking.mjs';
 import { PersonaStore } from '../src/llm/persona.mjs';
 import { normalizeDsh } from '../src/config/dsh.mjs';
 import { clearApiKey } from '../src/config/credentials.mjs';
-import { probeVision, probeImageGen, judgeVisionAnswer, endpointKey, endpointCapabilities } from '../src/llm/capability.mjs';
+import { probeVision, judgeVisionAnswer, endpointKey, endpointCapabilities } from '../src/llm/capability.mjs';
 
 async function temp(t) { const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ling-backend-')); t.after(async () => { await fs.rm(dir, { recursive: true, force: true }); }); return dir; }
 test('complete journal ranges exceed both recent limits and preserve cache coverage', async t => {
@@ -43,10 +43,10 @@ test('credential deletion errors and environment source never report cleared suc
  const fail=await clearApiKey({config,vaultPath:'fictional',unlink:async()=>{throw Object.assign(new Error(),{code:'EACCES'});},persist:async()=>calls.push(1)});assert.equal(fail.ok,false);assert.equal(calls.length,0);
  const env=await clearApiKey({config,vaultPath:'fictional',unlink:async()=>{},persist:async c=>calls.push(c),envKey:'fictional-env'});assert.equal(env.ok,false);assert.equal(env.source,'env');assert.equal(env.config.llm.apiKey,'');assert.equal(config.llm.apiKey,'fictional-value');
 });
-test('probes use mocked fetch: service failures unknown, text/empty images no success, endpoint isolated',async t=>{
+test('probes use mocked fetch: service failures unknown, text answers no false positive, endpoint isolated',async t=>{
  const original=globalThis.fetch;t.after(()=>globalThis.fetch=original);
- for(const status of [401,403,429,500]){globalThis.fetch=async()=>new Response(JSON.stringify({error:{message:'unsupported request'}}),{status});assert.equal((await probeVision({baseUrl:'https://fake.invalid',apiKey:'fictional',model:'fake'})).supported,null);assert.equal((await probeImageGen({baseUrl:'https://fake.invalid',apiKey:'fictional',model:'fake'})).supported,null);}
+ for(const status of [401,403,429,500]){globalThis.fetch=async()=>new Response(JSON.stringify({error:{message:'unsupported request'}}),{status});assert.equal((await probeVision({baseUrl:'https://fake.invalid',apiKey:'fictional',model:'fake'})).supported,null);}
  assert.equal(judgeVisionAnswer({choices:[{message:{content:'hello'}}]}).supported,null);assert.equal(judgeVisionAnswer({choices:[{message:{content:'红色'}}]}).supported,true);
- globalThis.fetch=async()=>new Response(JSON.stringify({choices:[{message:{images:[],content:[{type:'text',text:'fake'}]}}]}),{status:200});assert.notEqual((await probeImageGen({baseUrl:'https://fake.invalid',apiKey:'fictional',model:'fake'})).supported,true);
+ assert.equal(judgeVisionAnswer({choices:[{message:{images:[],content:[{type:'text',text:'fake'}]}}]}).supported,null);
  const all={[endpointKey('https://a.invalid')]:{fake:{vision:true}}};assert.deepEqual(endpointCapabilities(all,'https://b.invalid'),{});assert.equal(endpointKey('https://a.invalid/v1/'),endpointKey('https://a.invalid'));
 });

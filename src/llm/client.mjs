@@ -414,17 +414,31 @@ export class LlmClient {
       ...resolveThinkingBody(this.#opts.thinking),
     };
     /*
+     * 普通 function tools 必须**先**写进请求体。
+     *
+     * 这里曾经漏掉这一步：只有原生联网计划存在时才写 `body.tools`，
+     * 于是没有开原生联网时，插件工具（生图、课程表、表情包……）虽然
+     * 通过了授权、也传到了 `llm.chat({ tools })`，却没有进入 HTTP 请求体。
+     * 模型看不到工具，只会回答"我没有这个能力"，而且日志里没有任何报错。
+     *
+     * 空数组仍然不写：多数中转让 `tools: []` 的行为不一致，保持旧请求体。
+     */
+    const functionTools = Array.isArray(req.tools) ? req.tools : [];
+    if (functionTools.length > 0) body.tools = functionTools;
+    /*
      * 原生联网：**只在请求体上追加字段/工具**，不覆盖既有的 function tools。
      *
-     * `body.tools` 原本是整体赋值；直接写会丢掉插件工具（模型再也调不了
-     * 课程表/表情包），所以这里是数组合并。原生搜索工具本身是服务端工具
-     * （智谱的 web_search 不是 function），不会进入 agent-loop 的工具循环。
+     * 原生搜索工具本身是服务端工具（智谱的 web_search 不是 function），
+     * 不会进入 agent-loop 的工具循环。`plan.bodyPatch` 可能包含协议字段，
+     * 所以合并后要再补一次 function tools，避免被计划里的 tools 覆盖掉。
      */
     if (plan) {
       Object.assign(body, plan.bodyPatch ?? {});
       const nativeTools = Array.isArray(plan.tools) ? plan.tools : [];
       if (nativeTools.length > 0) {
-        body.tools = [...(req.tools ?? []), ...nativeTools];
+        body.tools = [...functionTools, ...nativeTools];
+      } else if (functionTools.length > 0) {
+        body.tools = functionTools;
       }
     }
     /*

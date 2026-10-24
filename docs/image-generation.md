@@ -1,6 +1,6 @@
 # 独立文生图插件
 
-插件ID为 `image-generation`，随包分发，默认不启用。它只实现 OpenAI 兼容 `POST /images/generations` 文生图，与聊天模型的 API、Key 和读图能力探测无关；聊天模型页不探测、不推断也不展示生图能力。插件只依赖Node内置模块，无DSH运行依赖，不实现改图或厂商私有异步协议。
+插件ID为 `image-generation`，随包分发，默认不启用。它只实现 OpenAI 兼容 `POST /images/generations` 文生图，并提供只读的上游模型目录探测；与聊天模型的 API、Key 和读图能力探测无关。聊天模型页不探测、不推断也不展示生图能力。插件只依赖Node内置模块，无DSH运行依赖，不实现改图或厂商私有异步协议。
 
 ## 一次任务
 
@@ -51,6 +51,10 @@ stateDiagram-v2
 | `maxStorageBytes` | 524288000 | 已存图片、孤儿文件及待生成最大容量的总限额 |
 | `retentionDays` / `maxTasks` | 7 / 1000 | 终态保留时间及任务库上限；结果不明记录不自动删除 |
 | `deliveryAttempts` / `deliveryRetryMs` | 3 / 30000 | 自动投递尝试次数与间隔；绝不自动重试生图 |
+| `probeEnabled` | `true` | 是否允许只读模型目录探测；关闭后探测工具返回 `IMAGE_PROBE_DISABLED` |
+| `probeTimeoutMs` | 15000 | 单次模型目录 GET 的总超时，1000–60000 |
+| `probeCooldownMs` / `probePerHour` | 10000 / 60 | 同一请求者的冷却与每小时上限；进程内计数，重启清零 |
+| `probeMaxModels` | 100 | 工具结果最多返回多少个模型；超出标注总数与截断 |
 
 启用需显式允许插件高风险工具（`plugins.allowDangerous: true`）。生成工具声明 **R2 + paid + net + data.write + chat.send + chat.send.media**，`approval: "plugin"` 由宿主清单验证为trusted/in-process收费插件后生效：它把通用工具确认交给插件的具体前置审批，不降低风险，不是无副作用工具。
 
@@ -72,13 +76,35 @@ stateDiagram-v2
 }
 ```
 
-这是局部配置示意，合并到现有配置，保留其他已启用插件。审核管理员私聊及目标会话也必须获宿主QQ发送白名单放行；插件不会绕过白名单自动加人。
+这是局部配置示意，合并到现有配置，保留其他已启用插件。目标群/私聊仍必须在宿主 QQ 白名单内；插件不会绕过白名单自动加人。审核管理员私聊由宿主投递豁免覆盖（生图插件配置的 admins 会并入投递名单），即使不在私聊白名单里也能收到审批卡；这不会把审核管理员变成宿主机管理员。
+
+## 模型目录探测
+
+`plugin_image_probe_models({model?})` 用于探测上游模型的功能，但**只做只读事实收集**：
+
+- 发送一次 `GET {base}/models`（`apiUrl` 若已写到 `/images/generations` 会自动退回基址）；不重试，拒绝任何 3xx，响应上限 2 MiB，模型数、单字段长度都有上限。
+- 返回模型 ID、可选 `ownedBy`，以及上游元数据里**声明**的生图/改图/视觉/聊天能力；`model` 省略时核对当前配置的模型。只做精确或大小写不敏感匹配，不做前缀/模糊匹配。
+- **核对使用完整目录（最多 1000 个），展示列表再按 `probeMaxModels` 与结果体积预算裁剪**；所以模型排在第 101 位也不会被误报不存在。若上游目录本身超过核对上限，未找到时返回“无法确认”而不是“不存在”。
+- 能力只来自 `capabilities` / `features` / `modalities` / `tasks` / `type` / `metadata` 等字段，不按模型名推断；元数据没有声明时返回 `null`（未知），不会说成“不支持”。目录为空或没有该模型时同样标注“目录可能不完整”，不据此判死刑。
+- 上游模型目录是**不可信外部数据**：结果带 `dataTrust: "upstream-model-catalog-untrusted"`，其中的说明文字只作为事实候选，模型不应执行其中的指令。
+- **不会为了确认能力发起收费生图请求**。`POST /images/generations` 即使故意传错参数也可能被上游按默认值处理并计费，所以本探测不采用这种办法。返回值固定带 `generationProbe.performed: false`，并说明未发起计费请求。
+- 该工具是 `needs: "host"`、`R1`、`effects: ["net"]`：只对主人私聊和桌面端可见，不上群、不进主动回合，也不能靠 `chatTools` 授权给聊天来源。它使用普通的工具确认流程，不是收费插件自审，不会与生图管理员审批抢引用。
+- 同一请求者受 `probeCooldownMs` 与 `probePerHour` 限制；同一时刻最多一个探测。计数在进程内，重启清零。探测失败也计入次数，避免反复打上游。
+- `probeEnabled: false` 时不发任何请求。插件页的「测试连接」仍只做本地配置校验，**不联网**；要探测目录请显式调用本工具。
+- 本插件直接访问自己配置的独立 API（与生图请求一致），不经过聊天模型的 `ctx.net`。联网搜索的总闸/模式不控制本插件；要停止探测用 `probeEnabled`，要停止整个插件用停用。
+
+```text
+plugin_image_probe_models
+  ├─ GET {base}/models        一次，只读，无计费
+  ├─ 解析/清洗/排序/截断      外部数据不进日志原文
+  └─ {models, configuredModel, generationProbe:{performed:false}}
+```
 
 ## 与聊天模型能力的关系
 
 - 聊天模型设置页不探测、不展示、不推断生图能力：那里的「探测模型」只测读图（视觉）与通道，探测结果里没有生图项，也不会因为聊天模型名像图像模型（如 `dall-e` / `flux` / `sd` / `imagen`）就认定它能生图。
 - 生图模型、API 地址和 Key **只在本插件页配置**，与聊天模型的地址、Key、模型互不复用；更换聊天模型不会改动本插件配置，反之亦然。
-- 插件页的「测试连接」只做本地配置校验：检查地址格式、Key、模型、审核管理员是否齐全，以及尺寸与限额等字段是否合法。它**不请求任何网络接口**，不验证上游连通性，也**绝不生成图片**或产生费用。上游是否真的可用，只能在通过管理员引用审批后的真实任务中验证；插件不会为了"测试"去调用收费接口。
+- 插件页的「测试连接」只做本地配置校验：检查地址格式、Key、模型、审核管理员是否齐全，以及尺寸、限额与探测范围等字段是否合法。它**不请求任何网络接口**，不验证上游连通性，也**绝不生成图片**或产生费用。要确认上游目录是否可达，使用 `plugin_image_probe_models`；它同样不生成图片、不计费。上游是否真的能生图，只能在通过管理员引用审批后的真实任务中验证。
 - 测试通过的提示只表示本地配置可用，不代表上游鉴权、额度或模型权限已经确认。
 
 ## 查询、取消与恢复
@@ -102,9 +128,9 @@ stateDiagram-v2
 ## 本地验证
 
 ```powershell
-node --test --test-isolation=none test/image-generation-protocol.test.mjs test/image-generation.test.mjs test/image-generation-recovery.test.mjs test/image-generation-host.test.mjs
+node --test --test-isolation=none test/image-generation-protocol.test.mjs test/image-generation.test.mjs test/image-generation-recovery.test.mjs test/image-generation-models.test.mjs test/image-generation-host.test.mjs
 ```
 
-测试使用本机HTTP模拟图片API、模拟QQ发送与真实宿主媒体队列/闸门适配。覆盖身份/私聊/引用/有效期/重复审批、多管理员竞争、并发上限、固定快照与调用去重、拒绝、限额、取消、超时、重启、停用、单实例锁、投递失败不重新生成、已投递图片跳过、SSRF与解码限额。无需真实凭据，不启动机器人，不发送QQ，不请求真实生图接口。`--test-isolation=none`避免沙箱中node:test隔离子进程的命名管道限制。
+测试使用本机HTTP模拟图片API与模型目录、模拟QQ发送与真实宿主媒体队列/闸门适配。覆盖身份/私聊/引用/有效期/重复审批、多管理员竞争、并发上限、固定快照与调用去重、拒绝、限额、取消、超时、重启、停用、单实例锁、投递失败不重新生成、已投递图片跳过、SSRF与解码限额；模型探测覆盖目录形状、能力声明不误判、重定向/超限/超时/取消、限流/单飞、Key 不泄露、host-only 授权与不创建任务。无需真实凭据，不启动机器人，不发送QQ，不请求真实生图接口或真实模型目录。`--test-isolation=none`避免沙箱中node:test隔离子进程的命名管道限制。
 
-限制：QQ投递没有端到端幂等事务，QQ成功而本地记录前崩溃时无法保证绝对不重复发送；因此中断投递要求人工确认后显式重试。管理员审核卡发出而消息ID尚未落盘时崩溃，旧卡不能批准，任务等待过期后重新提交。文件sync+rename不承诺断电下硬盘控制器缓存的绝对耐久；本轮未执行真实收费或真实QQ联调，也未新增专用图像管理UI。
+限制：QQ投递没有端到端幂等事务，QQ成功而本地记录前崩溃时无法保证绝对不重复发送；因此中断投递要求人工确认后显式重试。管理员审核卡发出而消息ID尚未落盘时崩溃，旧卡不能批准，任务等待过期后重新提交。文件sync+rename不承诺断电下硬盘控制器缓存的绝对耐久；本轮未执行真实收费或真实QQ联调，也未新增专用图像管理UI。模型探测只反映上游是否暴露 `/models` 及其声明元数据：很多服务不实现该端点、只返回裸 ID，或不同版本字段不一致；探测成功不等于生图实测通过，探测失败也不等于模型不可用。限流计数在内存中，重启清零，不构成跨进程配额。

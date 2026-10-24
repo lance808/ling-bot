@@ -3393,7 +3393,8 @@ async function requestOneBotAction(action, params = {}) {
  *
  *   1. 核心管理员 `config.admin.qqIds`（见 guard/admin.mjs）
  *   2. DSH 插件配置 `plugins.config['dsh-bridge'].admins`
- *   3. 旧字段 `config.dsh.admins`（迁移没跑到时的兜底）
+ *   3. 生图插件配置 `plugins.config['image-generation'].admins`
+ *   4. 旧字段 `config.dsh.admins`（迁移没跑到时的兜底）
  *
  * ## 为什么不能拿 `allow.private` 当管理员
  *

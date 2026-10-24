@@ -33,6 +33,7 @@ import { DEFAULT_CONFIG, validateConfig } from '../src/config/schema.mjs';
 const ME = '100000001';
 const OTHER = '100000002';
 const DSH_ADMIN = '100000003';
+const IMAGE_ADMIN = '100000005';
 
 /** 造一份经过 schema 校验的完整配置 */
 function cfg(over = {}) {
@@ -107,23 +108,35 @@ test('★ 默认配置里管理员名单是空的（fail-closed）', () => {
 
 /* ---------------------------------------------------------- 投递豁免 */
 
-test('★ 投递名单 = 核心管理员 + DSH 插件管理员 + 旧字段', () => {
+test('★ 投递名单 = 核心管理员 + DSH 插件管理员 + 生图审批管理员 + 旧字段', () => {
   const c = cfg({
     admin: { qqIds: [ME] },
-    plugins: { config: { 'dsh-bridge': { admins: DSH_ADMIN } } },
+    plugins: {
+      config: {
+        'dsh-bridge': { admins: DSH_ADMIN },
+        'image-generation': { admins: IMAGE_ADMIN },
+      },
+    },
   });
   const list = deliverableAdminIds(c);
   assert.ok(list.includes(ME), '核心管理员要能收到');
   assert.ok(list.includes(DSH_ADMIN), 'DSH 审批推送不能被这次拆分打断');
+  assert.ok(list.includes(IMAGE_ADMIN), '生图收费前置审批卡也要能送到');
 });
 
 test('★ 投递名单不会反过来变成授权', () => {
   const c = cfg({
     admin: { qqIds: [ME] },
-    plugins: { config: { 'dsh-bridge': { admins: DSH_ADMIN } } },
+    plugins: {
+      config: {
+        'dsh-bridge': { admins: DSH_ADMIN },
+        'image-generation': { admins: IMAGE_ADMIN },
+      },
+    },
   });
-  // 关键：DSH 管理员能收到推送，但不是宿主机操作的管理员
+  // 关键：审批管理员能收到推送，但不是宿主机操作的管理员
   assert.equal(isCoreAdmin(c, DSH_ADMIN), false, 'DSH 管理员不该获得本机权限');
+  assert.equal(isCoreAdmin(c, IMAGE_ADMIN), false, '生图管理员不该获得本机权限');
   assert.equal(isCoreAdmin(c, ME), true);
 });
 

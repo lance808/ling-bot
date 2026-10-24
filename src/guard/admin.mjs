@@ -102,10 +102,15 @@ export function isCoreAdmin(cfg, qq) {
  * 投递豁免用的管理员并集。
  *
  * 只用于发送闸门（白名单豁免 + 限流豁免），**不参与授权判定**。
- * 引用的三个来源都是有意的：
+ * 引用的来源都是有意的：
  *   1. 核心管理员 —— 确认卡要能送到；
  *   2. DSH 插件配置里的 admins —— 既有审批推送到他们；
- *   3. 旧 `config.dsh.admins` —— 迁移没跑到时的兜底（冷启动第一轮）。
+ *   3. 生图插件配置里的 admins —— 收费前置审批卡也要送到；
+ *   4. 旧 `config.dsh.admins` —— 迁移没跑到时的兜底（冷启动第一轮）。
+ *
+ * 生图管理员可能不在私聊白名单里；审批卡送不到时任务会安全失败，
+ * 但用户会看到“审批卡发送失败”。把这里补全只放宽**投递**，不改变
+ * 谁有权批准、也不把插件管理员变成宿主机管理员。
  *
  * @param {any} cfg
  * @returns {string[]}
@@ -121,6 +126,7 @@ export function deliverableAdminIds(cfg) {
   };
 
   merge(cfg?.plugins?.config?.['dsh-bridge']?.admins);
+  merge(cfg?.plugins?.config?.['image-generation']?.admins);
   merge(cfg?.dsh?.admins);
   return out;
 }

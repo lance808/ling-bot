@@ -6,6 +6,8 @@ export const DEFAULTS = Object.freeze({
   requestsPerHour: 10, imagesPerDay: 30, maxImageBytes: 10485760,
   maxStorageBytes: 524288000, retentionDays: 7, maxTasks: 1000,
   deliveryAttempts: 3, deliveryRetryMs: 30000,
+  probeEnabled: true, probeTimeoutMs: 15000, probeCooldownMs: 10000,
+  probePerHour: 60, probeMaxModels: 100,
 });
 export function parseAdmins(raw) {
   return [...new Set(String(raw ?? '').split(/[,，、\s]+/).filter((s) => /^\d{4,15}$/.test(s)))];
@@ -19,9 +21,12 @@ export function normalizeConfig(raw = {}) {
     ['requestsPerHour',1,100], ['imagesPerDay',1,1000], ['maxImageBytes',1024,10485760],
     ['maxStorageBytes',1048576,2147483648], ['retentionDays',1,90], ['maxTasks',20,10000],
     ['deliveryAttempts',1,10], ['deliveryRetryMs',100,3600000],
+    ['probeTimeoutMs',1000,60000], ['probeCooldownMs',0,600000],
+    ['probePerHour',1,600], ['probeMaxModels',1,500],
   ]) {
     if (!Number.isInteger(c[key]) || c[key] < min || c[key] > max) throw new Error(`${key} 必须为 ${min}–${max} 的整数`);
   }
+  if (typeof c.probeEnabled !== 'boolean') throw new Error('probeEnabled 必须为布尔值');
   c.apiUrl = String(c.apiUrl ?? '').trim().replace(/\/+$/, '');
   if (c.apiUrl) {
     const u = new URL(c.apiUrl);

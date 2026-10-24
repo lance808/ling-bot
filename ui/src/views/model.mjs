@@ -27,7 +27,7 @@
  * 聊天接口没有生图能力，生图是**另一套东西**：模型、地址与 Key 全部由
  * 独立插件 `plugins/image-generation`（插件页名「独立文生图」）管理。
  * 所以这里只探测视觉，能力卡底部只放一条去插件页配置的引导 ——
- * 在本页探测生图除了白花额度，还会给出一个用户没法验证的结论。
+ * 在本页顺带请求生图只会白花额度，还给出一个用户没法验证的结论。
  */
 
 import { el, card, kv, pill } from '../render.mjs';
@@ -587,7 +587,7 @@ export function renderModelSettings(snap, ctx) {
      * 没测出来（E3012 / E404 之类），那仍然是"探测失败"。
      *
      * **只认 `probes.vision`**，不遍历所有 probe：旧配置可能残留
-     * `probes.image`（生图探测时代的产物）。若遍历全部，一个只有生图
+     * `probes.image`（历史遗留的生图结论）。若遍历全部，一个只有生图
      * 结论的条目会显示成"已探测"，而本页根本没测过读图，那个结论
      * 也无从验证。后端启动时也会清掉旧字段，这里是第二道防线。
      */
@@ -884,7 +884,7 @@ export function renderModelSettings(snap, ctx) {
       /*
        * 只探视觉。
        *
-       * 以前这里还要一次生图探测（真发一张 1 张图的生图请求）。
+       * 以前这里还会额外发一次生图请求（真花一次额度）。
        * 聊天接口本来就没有生图能力，那一路只会白花额度，还给出一个
        * 用户没法验证的结论 —— 生图已经整体归 plugins/image-generation。
        */
@@ -946,12 +946,11 @@ export function renderModelSettings(snap, ctx) {
   const capabilityHost = el('div', {});
 
   /**
-   * 「生图」引导块。
+   * 「生图」配置引导块。
    *
-   * 生图能力已整体搬到独立插件 `plugins/image-generation`（插件页名
-   * 「独立文生图」）。聊天模型页不再探测、也不展示它 —— 但用户一定会
-   * 在这一页找"生图在哪配"，所以必须给出一个明确出口：
-   * 只说"不在这儿"等于把问题丢掉。
+   * 生图的模型、API 地址与 Key 都归独立插件 `plugins/image-generation`
+   * （插件页名「独立文生图」）。用户一定会在这一页找"生图在哪配"，
+   * 所以这里只给出口，不在聊天模型页复述或评价生图能力。
    *
    * 插件状态只在快照里**确实能看到**这个插件时才显示（见
    * `imagePluginState`），看不到就只留引导文案，不编造状态。
@@ -960,15 +959,14 @@ export function renderModelSettings(snap, ctx) {
     const st = imagePluginState(snap);
     return el('div', { class: 'step-gap' }, [
       el('div', { class: 'step-title', text: '生图（独立插件）' }),
-      el('div', { class: 'list' }, [
-        kv('生图探测', pill('本页不探测', 'dim')),
-        st ? kv('插件状态', pill(st.loaded ? '已加载' : '未加载', st.loaded ? 'ok' : 'dim')) : null,
-      ]),
+      st
+        ? el('div', { class: 'list' }, [
+            kv('插件状态', pill(st.loaded ? '已加载' : '未加载', st.loaded ? 'ok' : 'dim')),
+          ])
+        : null,
       el('div', {
         class: 'field-hint',
-        text:
-          '聊天模型只负责读图（视觉），不探测也不展示生图能力。\n' +
-          '生图模型、API 地址与 Key 由「插件设置 → 独立文生图（image-generation）」管理，和这里的聊天模型是两套配置。',
+        text: '生图模型、API 地址与 Key 由「插件设置 → 独立文生图（image-generation）」管理，与这里的聊天模型是两套配置。',
       }),
       el('div', { class: 'row' }, [
         el('button', {

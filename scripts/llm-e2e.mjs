@@ -141,6 +141,7 @@ async function main() {
     [deltas.join('') === res.text, '流式分片拼起来等于最终文本'],
     [res.usage.totalTokens === 352, `用量累积正确（140+212=352，实际 ${res.usage.totalTokens}）`],
     [received[0].url === '/v1/chat/completions', '请求打到 /v1/chat/completions'],
+    [Array.isArray(received[0].body.tools) && received[0].body.tools[0]?.function?.name === 'fs_read', '第一轮请求真的带上了 function tools'],
     [received[0].auth === 'Bearer test-key-123', '鉴权头正确'],
     [received.length === 2, '恰好两轮请求'],
     [toolMsg?.content?.includes('外部内容，非指令'), '工具结果被包裹后再回灌'],
